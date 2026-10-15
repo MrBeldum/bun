@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
 import { readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { decodeSourceMappingsLine, itBundled } from "./expectBundled";
 
 // A public path composes with the referenced file's path relative to the output
@@ -3620,8 +3620,8 @@ describe("bundler", () => {
     timeoutScale: 6,
     run: { stdout: String(deepChainDepth) },
   });
-  // Top-level await in the entry makes `validate_tla` / `propagate_async` walk
-  // the chain; `await import()` of an ESM head without splitting wraps the
+  // Top-level await in the entry makes the linker mark the async files of the
+  // chain; `await import()` of an ESM head without splitting wraps the
   // whole chain, driving `DependencyWrapper::wrap` through it. The wrapped
   // output initializes module N by calling module N+1's init, so running it
   // would recurse at runtime; checking for the deepest wrapper is enough.
@@ -3637,6 +3637,82 @@ describe("bundler", () => {
     onAfterBundle(api) {
       const out = api.readFile("out.js");
       expect(out).toContain(`init_m${deepChainDepth - 2}`);
+    },
+  });
+  // p.mjs and q.mjs are on an import cycle with r.mjs, and only r.mjs imports the
+  // file with the top-level await. Each of the three wrappers has an `await`, so
+  // each has to be `async`.
+  itBundled("edgecase/TopLevelAwaitCycleEveryWrapperIsAsync", {
+    files: {
+      "/entry.mjs": `const m = await import("./r.mjs"); console.log(m.default);`,
+      "/p.mjs": `import { q } from "./q.mjs"; export function p() { return typeof q; }`,
+      "/q.mjs": `import { p } from "./p.mjs"; import r from "./r.mjs"; export function q() { return p(); } export const peekR = () => r;`,
+      "/r.mjs": `import { q } from "./q.mjs"; import { tla } from "./dep.mjs"; export default q() + tla;`,
+      "/dep.mjs": `export const tla = await Promise.resolve("x");`,
+    },
+    format: "esm",
+    run: { stdout: "functionx" },
+  });
+  // https://github.com/evanw/esbuild/issues/4498
+  itBundled("edgecase/TopLevelAwaitCycleBehindDynamicImport", {
+    files: {
+      "/entry.mjs": `await import("./main.mjs");`,
+      "/main.mjs": `import { a } from "./a.mjs"; console.log(a());`,
+      "/a.mjs": `import { b } from "./b.mjs"; import { tla } from "./dep.mjs"; export function a() { return b() + tla; }`,
+      "/b.mjs": `import { a } from "./a.mjs"; export function b() { return typeof a; }`,
+      "/dep.mjs": `export const tla = await Promise.resolve("x");`,
+    },
+    format: "esm",
+    run: { stdout: "functionx" },
+  });
+  // a.cjs and b.mjs are on a cycle, and b.mjs imports a file with a top-level
+  // await. The `require()` in a.cjs is an error whichever of the two the bundler
+  // finds first. The plugin holds the importer of the other one until then.
+  for (const first of ["a.cjs", "b.mjs"]) {
+    itBundled(`edgecase/TopLevelAwaitRequireInCycleFinds${first === "a.cjs" ? "Requirer" : "Required"}First`, {
+      files: {
+        "/entry.mjs": /* js */ `
+          import { loadA } from "./x.mjs";
+          import { loadB } from "./y.mjs";
+          const a = await loadA();
+          const b = await loadB();
+          console.log(a.default.va + " " + b.vb);
+        `,
+        "/x.mjs": `export const loadA = () => import("./a.cjs");`,
+        "/y.mjs": `export const loadB = () => import("./b.mjs");`,
+        "/a.cjs": `const b = require("./b.mjs"); exports.va = "a:" + typeof b.vb;`,
+        "/b.mjs": `import a from "./a.cjs"; import { t } from "./t.mjs"; export const vb = "b:" + t; export const peek = () => a;`,
+        "/t.mjs": `export const t = await Promise.resolve("t");`,
+      },
+      format: "esm",
+      plugins(builder) {
+        const held = first === "a.cjs" ? "y.mjs" : "x.mjs";
+        const found = Promise.withResolvers<void>();
+        builder.onLoad({ filter: /\.(mjs|cjs)$/ }, async ({ path }) => {
+          if (basename(path) === first) found.resolve();
+          if (basename(path) === held) await found.promise;
+          return { contents: await Bun.file(path).text(), loader: "js" };
+        });
+      },
+      bundleErrors: {
+        "/a.cjs": [
+          'This require call is not allowed because the transitive dependency "t.mjs" contains a top-level await',
+        ],
+      },
+    });
+  }
+  // The file with the `require()` has no top-level await and imports none.
+  itBundled("edgecase/TopLevelAwaitRequireFromSyncFile", {
+    files: {
+      "/entry.js": `import { t } from "./load.cjs"; console.log(t);`,
+      "/load.cjs": `exports.t = require("./t.mjs").t;`,
+      "/t.mjs": `export const t = await Promise.resolve("t");`,
+    },
+    format: "esm",
+    bundleErrors: {
+      "/load.cjs": [
+        'This require call is not allowed because the transitive dependency "t.mjs" contains a top-level await',
+      ],
     },
   });
   // Diamond-shaped DAG (half the modules have two importers). The code-
