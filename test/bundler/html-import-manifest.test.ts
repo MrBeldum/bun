@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { tempDir } from "harness";
 import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { SourceMapConsumer } from "source-map";
 import { type BundlerTestBundleAPI, itBundled } from "./expectBundled";
 
@@ -523,6 +523,123 @@ console.log("About manifest:", aboutHtml);
       expect(home.files.filter(file => file.loader === "css").map(file => file.path)).toEqual([homeHref]);
       expect(about.files.filter(file => file.loader === "css").map(file => file.path)).toEqual([aboutHref]);
     },
+  });
+
+  // The pages of one build are numbered in the order that the server code
+  // imports them in, so the first of them names the stylesheet that they share.
+  const sharedStylesheet = {
+    "home.html": `<!DOCTYPE html><html><head><link rel="stylesheet" href="./shared.css"></head><body>home</body></html>`,
+    "about.html": `<!DOCTYPE html><html><head><link rel="stylesheet" href="./shared.css"></head><body>about</body></html>`,
+    "shared.css": `body { margin: 0; }`,
+  };
+  /** Per manifest: the page and the `[name]` of each of its stylesheets. */
+  function stylesheets(manifests: Manifest[]) {
+    return manifests.map(manifest =>
+      manifest.files
+        .filter(file => file.loader === "css")
+        .map(file => ({ input: file.input, name: basename(file.path).replace(/-[^-]+$/, "") })),
+    );
+  }
+
+  // Two files import one page each. The plugin holds one of them until the page
+  // of the other one is in the graph, so the pages are found in either order.
+  for (const found of ["home", "about"]) {
+    itBundled(`html-import/shared-css-chunk-is-named-for-the-first-import-when-${found}-is-found-first`, {
+      outdir: "out/",
+      target: "bun",
+      chunkNaming: "[name]-[hash].[ext]",
+      entryPoints: ["/server.js"],
+      files: {
+        "/server.js": `
+          import { home } from "./routes/home.js";
+          import { about } from "./routes/about.js";
+          console.log(home.index, about.index);
+        `,
+        "/routes/home.js": `import home from "../home.html"; export { home };`,
+        "/routes/about.js": `import about from "../about.html"; export { about };`,
+        ...Object.fromEntries(Object.entries(sharedStylesheet).map(([name, contents]) => ["/" + name, contents])),
+      },
+      plugins(builder) {
+        const held = found === "home" ? "about.js" : "home.js";
+        const page = Promise.withResolvers<void>();
+        builder.onLoad({ filter: /\.(js|html)$/ }, async ({ path }) => {
+          if (basename(path) === found + ".html") page.resolve();
+          if (basename(path) === held) await page.promise;
+          return undefined;
+        });
+      },
+      onAfterBundle(api) {
+        expect(stylesheets(readManifests(api, "out/server.js"))).toEqual([
+          [{ input: "home.html", name: "home" }],
+          [{ input: "home.html", name: "home" }],
+        ]);
+      },
+    });
+  }
+
+  // One file imports both pages. The directory of the project does not decide
+  // which page is first.
+  test("html-import/shared-css-chunk-is-named-for-the-first-import-in-every-directory", async () => {
+    const directories = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const project = {
+      "server.js": `
+        import home from "./home.html";
+        import about from "./about.html";
+        console.log(home.index, about.index);
+      `,
+      ...sharedStylesheet,
+    };
+    using dir = tempDir(
+      "html-import-directories",
+      Object.fromEntries(
+        directories.flatMap(directory =>
+          Object.entries(project).map(([name, contents]) => [directory + "/" + name, contents]),
+        ),
+      ),
+    );
+    const names: string[][] = [];
+    for (const directory of directories) {
+      const build = await Bun.build({
+        entrypoints: [join(dir, directory, "server.js")],
+        outdir: join(dir, directory, "out"),
+        target: "bun",
+        naming: { chunk: "[name]-[hash].[ext]" },
+      });
+      names.push(
+        build.outputs.filter(output => output.path.endsWith(".css")).map(output => basename(output.path).split("-")[0]),
+      );
+    }
+    expect(names).toEqual(directories.map(() => ["home"]));
+  });
+
+  // The manifest module is a module like any other: `import()` gives its
+  // namespace and `require()` gives the manifest, as they do when Bun runs the
+  // server code without a build.
+  itBundled("html-import/dynamic-import-of-a-page", {
+    outdir: "out/",
+    target: "bun",
+    entryPoints: ["/server.js"],
+    files: {
+      "/server.js": `
+        const page = await import("./page.html");
+        console.log(page.default.index, Array.isArray(page.default.files));
+      `,
+      "/page.html": `<!DOCTYPE html><html><body>page</body></html>`,
+    },
+    run: { stdout: "./page.html true" },
+  });
+  itBundled("html-import/require-of-a-page", {
+    outdir: "out/",
+    target: "bun",
+    entryPoints: ["/server.js"],
+    files: {
+      "/server.js": `
+        const page = require("./page.html");
+        console.log(page.index, Array.isArray(page.files), typeof page.default);
+      `,
+      "/page.html": `<!DOCTYPE html><html><body>page</body></html>`,
+    },
+    run: { stdout: "./page.html true undefined" },
   });
 
   // Past 127 entry points the entry bits switch to a heap-allocated bitset.

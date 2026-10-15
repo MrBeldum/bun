@@ -2351,7 +2351,7 @@ pub mod bv2_impl {
             let all_targets = self.graph.ast.items_target();
 
             let mut visitor = ReachableFileVisitor {
-                reachable: Vec::with_capacity(self.graph.entry_points.len() + 1),
+                reachable: Vec::with_capacity(self.graph.entry_points().len() + 1),
                 visited: DynamicBitSet::init_empty(self.graph.input_files.len())?,
                 redirects: self.graph.ast.items_redirect_import_record_index(),
                 all_import_records,
@@ -2374,15 +2374,29 @@ pub mod bv2_impl {
             // imported and weird things will happen
             visitor.visit::<false>(Index::RUNTIME, false);
 
-            if self.transpiler.options.code_splitting {
-                for entry_point in self.graph.entry_points.iter().copied() {
-                    visitor.visit::<true>(entry_point, false);
+            let code_splitting = self.transpiler.options.code_splitting;
+            let visit_entry_points = |visitor: &mut ReachableFileVisitor,
+                                      entry_points: &[Index]| {
+                for &entry_point in entry_points {
+                    if code_splitting {
+                        visitor.visit::<true>(entry_point, false);
+                    } else {
+                        visitor.visit::<false>(entry_point, false);
+                    }
                 }
+            };
+            visit_entry_points(&mut visitor, self.graph.entry_points());
+
+            // A page that server code imports is an entry point of the browser build.
+            // The scan does not add it: the order that parse tasks finish in would
+            // then number the entry points.
+            let pages = if self.graph.html_imports.server_source_indices.is_empty() {
+                None
             } else {
-                for entry_point in self.graph.entry_points.iter().copied() {
-                    visitor.visit::<false>(entry_point, false);
-                }
-            }
+                let pages = self.graph.server_imported_pages(&visitor.reachable)?;
+                visit_entry_points(&mut visitor, &pages.new_entry_points);
+                Some(pages)
+            };
 
             if bun_core::env::IS_DEBUG && ReachableFiles.is_visible() {
                 bun_core::scoped_log!(
@@ -2432,6 +2446,11 @@ pub mod bv2_impl {
                         content_hashes[index] = 0;
                     }
                 }
+            }
+
+            if let Some(pages) = pages {
+                self.graph.html_imports.html_source_indices = pages.html_source_indices;
+                self.graph.add_derived_entry_points(pages.new_entry_points);
             }
 
             Ok(reachable.into_boxed_slice())
@@ -2498,7 +2517,7 @@ pub mod bv2_impl {
 
         /// Callers require an entry point, so none after parsing means one was dropped without an error.
         fn fail_if_no_entry_points(&self) -> Result<(), Error> {
-            if !self.graph.entry_points.is_empty() {
+            if !self.graph.entry_points().is_empty() {
                 return Ok(());
             }
             self.transpiler.log_mut().add_error(
@@ -2529,7 +2548,7 @@ pub mod bv2_impl {
             let mut is_named = vec![false; sources.len()];
             // A page that a server imports is in the graph like one that is an entry point.
             let pages = (0..sources.len()).filter(|&index| loaders[index] == Loader::Html);
-            let entry_points = self.graph.entry_points.iter();
+            let entry_points = self.graph.entry_points().iter();
             let mut pending: Vec<usize> = (entry_points.map(|it| it.get() as usize))
                 .chain(pages)
                 .collect();
@@ -3219,8 +3238,7 @@ pub mod bv2_impl {
             }
 
             self.graph
-                .entry_points
-                .push(bun_ast::Index::init(source_index.get()));
+                .add_user_entry_point(bun_ast::Index::init(source_index.get()));
 
             Ok(Some(source_index.get()))
         }
@@ -3255,13 +3273,8 @@ pub mod bv2_impl {
                 owned_client_transpiler: None,
                 ssr_transpiler: ssr_alias,
                 framework: None,
-                graph: Graph {
-                    pool: bun_ptr::BackRef::dangling(), // set below
-                    heap,
-                    kit_referenced_server_data: false,
-                    kit_referenced_client_data: false,
-                    ..Graph::new(heap)
-                },
+                // `pool` is set below.
+                graph: Graph::new(heap),
                 linker: LinkerContext {
                     r#loop: event_loop,
                     graph: LinkerGraph::default(),
@@ -3540,7 +3553,7 @@ pub mod bv2_impl {
 
             // Setup entry points
             let num_entry_points = data.len();
-            self.graph.entry_points.reserve(num_entry_points);
+            self.graph.reserve_entry_points(num_entry_points);
             self.graph
                 .input_files
                 .ensure_unused_capacity(num_entry_points)?;
@@ -3603,7 +3616,7 @@ pub mod bv2_impl {
             debug_assert!(self.dev_server.is_some());
 
             let num_entry_points = files.set.count();
-            self.graph.entry_points.reserve(num_entry_points);
+            self.graph.reserve_entry_points(num_entry_points);
             self.graph
                 .input_files
                 .ensure_unused_capacity(num_entry_points)?;
@@ -3737,7 +3750,7 @@ pub mod bv2_impl {
             self.reserve_source_indexes_for_bake()?;
 
             let num_entry_points = data.files.count();
-            self.graph.entry_points.reserve(num_entry_points);
+            self.graph.reserve_entry_points(num_entry_points);
             self.graph
                 .input_files
                 .ensure_unused_capacity(num_entry_points)?;
@@ -4441,7 +4454,7 @@ pub mod bv2_impl {
 
                 this.process_files_to_copy(&reachable_files)?;
 
-                this.add_server_component_boundaries_as_extra_entry_points()?;
+                this.add_server_component_boundaries_as_extra_entry_points(&reachable_files)?;
 
                 this.clone_ast()?;
 
@@ -4452,9 +4465,7 @@ pub mod bv2_impl {
                 // overlapping `&mut`.
                 let mut chunks = unsafe {
                     let bundle_ptr: *mut BundleV2 = &raw mut *this;
-                    // `Graph::entry_points: Vec<Index>` and `link()` takes `&[Index]` —
-                    // both are `crate::Index` (= `bun_ast::Index`), so no cast is needed.
-                    let ep = (*bundle_ptr).graph.entry_points.as_slice();
+                    let ep = (*bundle_ptr).graph.entry_points();
                     // `this.graph.server_component_boundaries` must stay intact for
                     // `StaticRouteVisitor` (generateChunksInParallel) to read via
                     // `parse_graph`. Borrow — do NOT `take`, which would empty the
@@ -4605,7 +4616,7 @@ pub mod bv2_impl {
 
                 this.process_files_to_copy(&reachable_files)?;
 
-                this.add_server_component_boundaries_as_extra_entry_points()?;
+                this.add_server_component_boundaries_as_extra_entry_points(&reachable_files)?;
 
                 this.clone_ast()?;
 
@@ -4614,7 +4625,7 @@ pub mod bv2_impl {
                 // from `this.linker`.
                 let mut chunks = unsafe {
                     let bundle_ptr: *mut BundleV2 = &raw mut *this;
-                    let ep = (*bundle_ptr).graph.entry_points.as_slice();
+                    let ep = (*bundle_ptr).graph.entry_points();
                     // Value-copy (original preserved for `StaticRouteVisitor`).
                     // Borrow — do NOT `take` (see `generate_from_cli`).
                     let scbs = &(*bundle_ptr).graph.server_component_boundaries;
@@ -4642,6 +4653,7 @@ pub mod bv2_impl {
 
         pub(crate) fn add_server_component_boundaries_as_extra_entry_points(
             &mut self,
+            reachable_files: &[Index],
         ) -> Result<(), Error> {
             // Prepare server component boundaries. Each boundary turns into two
             // entry points, a client entrypoint and a server entrypoint.
@@ -4649,24 +4661,8 @@ pub mod bv2_impl {
             // TODO: This should be able to group components by the user specified
             // entry points. This way, using two component files in a route does not
             // create two separate chunks. (note: bake passes each route as an entrypoint)
-            {
-                let scbs = self.graph.server_component_boundaries.slice();
-                self.graph.entry_points.reserve(scbs.list.len() * 2);
-                debug_assert_eq!(
-                    scbs.list.items_source_index().len(),
-                    scbs.list.items_ssr_source_index().len()
-                );
-                for (original_index, ssr_index) in scbs
-                    .list
-                    .items_source_index()
-                    .iter()
-                    .zip(scbs.list.items_ssr_source_index().iter())
-                {
-                    for idx in [*original_index, *ssr_index] {
-                        self.graph.entry_points.push(bun_ast::Index::init(idx));
-                    }
-                }
-            }
+            self.graph
+                .add_server_component_boundaries_as_entry_points(reachable_files);
             Ok(())
         }
 
@@ -5434,8 +5430,7 @@ pub mod bv2_impl {
                     if let Some(source_index) = out_source_index {
                         if resolve.import_record.kind == ImportKind::EntryPointBuild {
                             this.graph
-                                .entry_points
-                                .push(bun_ast::Index::init(source_index.get()));
+                                .add_user_entry_point(bun_ast::Index::init(source_index.get()));
 
                             // Store the original entry point name for virtual entries
                             // This preserves the original name for output file naming
@@ -5647,13 +5642,13 @@ pub mod bv2_impl {
 
             self.process_files_to_copy(&reachable_files)?;
 
-            self.add_server_component_boundaries_as_extra_entry_points()?;
+            self.add_server_component_boundaries_as_extra_entry_points(&reachable_files)?;
 
             // SAFETY: see `generate_from_cli` — repr(transparent) Index slice cast +
             // raw-ptr borrow sidestep for `&mut self.linker` / `&mut *self`.
             let mut chunks = unsafe {
                 let bundle_ptr: *mut BundleV2 = self;
-                let ep = (*bundle_ptr).graph.entry_points.as_slice();
+                let ep = (*bundle_ptr).graph.entry_points();
                 // Value-copy (original preserved for `StaticRouteVisitor`).
                 // Borrow — do NOT `take` (see `generate_from_cli`).
                 let scbs = &(*bundle_ptr).graph.server_component_boundaries;
@@ -5995,7 +5990,7 @@ pub mod bv2_impl {
                 // failed files do not remember their loader, and plugins can
                 // asynchronously decide a file is CSS.
                 let css = asts.items_css();
-                for entry_point in &self.graph.entry_points {
+                for entry_point in self.graph.entry_points() {
                     if css[entry_point.get() as usize].is_some() {
                         start.css_entry_points.put(
                             Index::init(entry_point.get()),
@@ -6036,7 +6031,7 @@ pub mod bv2_impl {
             // are `#[repr(transparent)]` u32 — see `generate_from_cli` for the slice cast.
             unsafe {
                 let bundle_ptr: *mut BundleV2 = self;
-                let ep = (*bundle_ptr).graph.entry_points.as_slice();
+                let ep = (*bundle_ptr).graph.entry_points();
                 // Value-copy (original preserved). Borrow — do NOT `take`.
                 let scbs = &(*bundle_ptr).graph.server_component_boundaries;
                 // Project `.linker` via `bundle_ptr` so no `&mut *self` reborrow
@@ -7176,10 +7171,6 @@ pub mod bv2_impl {
                     continue;
                 }
 
-                if is_html_entrypoint {
-                    import_record.kind = ImportKind::HtmlManifest;
-                }
-
                 let resolve_entry = resolve_queue.get_or_put(path.text).expect("oom");
                 if resolve_entry.found_existing {
                     // SAFETY: arena-allocated `ParseTask` stored in the queue; arena outlives the pass.
@@ -7201,7 +7192,7 @@ pub mod bv2_impl {
                 // SAFETY: arena outlives the bundle pass.
                 let resolve_task: &mut ParseTask = self.arena_create(resolve_task_val);
 
-                resolve_task.known_target = if import_record.kind == ImportKind::HtmlManifest {
+                resolve_task.known_target = if is_html_entrypoint {
                     Target::Browser
                 } else {
                     target
@@ -7323,9 +7314,6 @@ pub mod bv2_impl {
 
                     if is_html_entrypoint {
                         self.ensure_client_transpiler();
-                        self.graph
-                            .entry_points
-                            .push(bun_ast::Index(new_source_index));
                     }
 
                     if self.enqueue_on_load_plugin_if_needed(new_task) {

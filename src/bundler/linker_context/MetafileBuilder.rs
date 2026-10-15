@@ -243,13 +243,10 @@ pub(crate) fn generate(c: &mut LinkerContext, chunks: &mut [Chunk]) -> crate::Re
         }
     }
 
-    // Write inputs
-    let mut source_index: u32 = 0;
-    while (source_index as usize) < sources.len() {
-        // (defer-style increment moved to end of loop body)
-        let si = source_index;
-        source_index += 1;
-        let source_index = si;
+    // Write inputs. Every one of them is a reachable file, and that list has an
+    // order that follows from the sources. Source indices do not.
+    for source_index in c.graph.reachable_files.slice() {
+        let source_index = source_index.get();
 
         if !seen_sources.is_set(source_index as usize) {
             continue;

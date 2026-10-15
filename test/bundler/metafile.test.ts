@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { tempDir } from "harness";
 import { statSync } from "node:fs";
+import { basename } from "node:path";
 
 // Type definitions for metafile structure
 interface MetafileImport {
@@ -863,6 +864,55 @@ describe("Bun.build metafile option variants", () => {
 
 // CLI tests for --metafile-md
 import { bunEnv, bunExe, isWindows } from "harness";
+
+describe("metafile order", () => {
+  // Each entry point imports a stylesheet of its own. The plugin holds one entry
+  // point until the stylesheet of the other one is in the graph, so the two
+  // builds number the stylesheets in opposite orders.
+  test("inputs and outputs are listed in the order of the imports, whichever file is parsed first", async () => {
+    using dir = tempDir("metafile-order", {
+      "e1.js": `import "./x.css"; console.log("e1");`,
+      "e2.js": `import "./y.css"; console.log("e2");`,
+      "x.css": `.x { color: red; }`,
+      "y.css": `.y { color: blue; }`,
+    });
+
+    async function build(found: "x.css" | "y.css") {
+      const held = found === "x.css" ? "e2.js" : "e1.js";
+      const stylesheet = Promise.withResolvers<void>();
+      const result = await Bun.build({
+        entrypoints: [`${dir}/e1.js`, `${dir}/e2.js`],
+        outdir: `${dir}/out-${found}`,
+        metafile: true,
+        plugins: [
+          {
+            name: "hold",
+            setup(builder) {
+              builder.onLoad({ filter: /\.(js|css)$/ }, async ({ path }) => {
+                if (basename(path) === found) stylesheet.resolve();
+                if (basename(path) === held) await stylesheet.promise;
+                return undefined;
+              });
+            },
+          },
+        ],
+      });
+      const metafile = result.metafile as Metafile;
+      return {
+        inputs: Object.keys(metafile.inputs).map(key => basename(key)),
+        outputs: Object.keys(metafile.outputs),
+        artifacts: result.outputs.map(output => basename(output.path)),
+      };
+    }
+
+    const expected = {
+      inputs: ["x.css", "e1.js", "y.css", "e2.js"],
+      outputs: ["./e1.js", "./e2.js", "./e1.css", "./e2.css"],
+      artifacts: ["e1.js", "e2.js", "e1.css", "e2.css"],
+    };
+    expect([await build("x.css"), await build("y.css")]).toEqual([expected, expected]);
+  });
+});
 
 describe("bun build --metafile-md", () => {
   test("generates markdown metafile with default name", async () => {
