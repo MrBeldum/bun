@@ -301,7 +301,9 @@ impl BunxCommand {
             && strings::index_of_char(name, b'\\').is_none()
     }
 
-    /// Returns the package's bin named `preferred` if it has one, and otherwise its first bin.
+    /// Returns the package's bin named `preferred` if it has one, and otherwise its first bin: the
+    /// first entry of `bin`, or the first file of `directories.bin` by name. npx doesn't choose a
+    /// first bin: it refuses when the bins are several files and none is named like the package.
     fn get_bin_from_subpath(
         transpiler: &mut Transpiler,
         dir_fd: Fd,
@@ -379,17 +381,27 @@ impl BunxCommand {
             let _close_bin_dir = bun_sys::CloseOnDrop::new(bin_dir);
             let mut iterator = bun_sys::dir_iterator::iterate(bin_dir);
             let bin_in_dir = |name: &[u8]| package_bin(name, &[dir_name, b"/", name].concat());
-            let mut first: Option<PackageBin> = None;
+            // Take the first file by name, because file systems list a directory in different
+            // orders. A dot-file is never that file: `.DS_Store` in a linked package would win.
+            let mut first: Option<Box<[u8]>> = None;
             while let Ok(Some(current)) = iterator.next() {
-                if current.kind == bun_sys::EntryKind::File && !current.name.slice().is_empty() {
-                    if current.name.slice_u8() == preferred {
+                let name = current.name.slice_u8();
+                if current.kind == bun_sys::EntryKind::File && !name.is_empty() {
+                    if name == preferred {
                         return Ok(bin_in_dir(preferred));
                     }
-                    first.get_or_insert_with(|| bin_in_dir(current.name.slice_u8()));
+                    if name[0] != b'.'
+                        && first
+                            .as_deref()
+                            .is_none_or(|first| strings::order(name, first).is_lt())
+                    {
+                        first = Some(name.into());
+                    }
                 }
             }
-            if let Some(bin) = first {
-                return Ok(bin);
+            if let Some(name) = first {
+                let file = [dir_name, b"/", &*name].concat().into_boxed_slice();
+                return Ok(PackageBin { name, file });
             }
         }
 
