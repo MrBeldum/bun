@@ -2982,12 +2982,26 @@ bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Default)]
     pub struct ParserOpts: u8 {
         const CSS_MODULES = 0b1;
+        /// Turns off each rule that leaves a relative color for the browser. `Bun.color()` has no form for an unresolved value.
+        const MUST_FOLD = 0b10;
+        /// Set inside the origin of a relative color and the operands of `color-mix()`: a color that is not painted as it is.
+        const INNER_COLOR = 0b100;
     }
 }
 impl ParserOpts {
     #[inline]
     pub(crate) fn css_modules(self) -> bool {
         self.contains(Self::CSS_MODULES)
+    }
+
+    #[inline]
+    pub(crate) fn must_fold(self) -> bool {
+        self.contains(Self::MUST_FOLD)
+    }
+
+    #[inline]
+    pub(crate) fn inner_color(self) -> bool {
+        self.contains(Self::INNER_COLOR)
     }
 }
 
