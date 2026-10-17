@@ -649,9 +649,9 @@ test.skipIf(isWindows)(
 );
 
 // A workspace that other packages depend on under a second name is linked into
-// node_modules under both names, and the hoisted linker walks the packages
-// nested inside it once per name. The second walk finds the first one's result
-// already sitting at the final path.
+// node_modules under both names, and the hoisted linker has a tree for each name.
+// Both are the one node_modules of the workspace: a package nested inside it is
+// installed once, and is there under both names.
 const aliasLinkDirs = {
   hoisted: "node_modules/inner-alias",
   isolated: "packages/second/node_modules/inner-alias",
@@ -707,30 +707,25 @@ for (const [linker, aliasLinkDir] of Object.entries(aliasLinkDirs)) {
   );
 }
 
-// In that layout a lifecycle script of the nested package starts as soon as the
-// first walk is done, so it is running when the second walk installs the package
-// again. The script runs once per walk; the first run waits for the second to
-// start (the deadline only keeps it from hanging should there be no second run),
-// then checks that it still is where the package lives.
-const keepsItsDirectory = [
+// In that layout the lifecycle script of the nested package runs once, in the
+// directory where the package lives. A second run would make the second marker.
+const runsOnceInItsDirectory = [
   `if mkdir "$STAGING_TEST_MARKERS/first" 2>/dev/null`,
-  `then deadline=$(($(date +%s) + 3))`,
-  `until [ -d "$STAGING_TEST_MARKERS/second" ] || [ "$(date +%s)" -ge "$deadline" ]; do :; done`,
-  `[ "$(pwd -P)" = "$STAGING_TEST_DEP_DIR" ]`,
+  `then [ "$(pwd -P)" = "$STAGING_TEST_DEP_DIR" ]`,
   `else mkdir "$STAGING_TEST_MARKERS/second"`,
   `fi`,
 ].join("; ");
 
 // The script is POSIX sh; on Windows lifecycle scripts run in bun's own shell.
 test.concurrent.skipIf(isWindows)(
-  "hoisted linker: the second install of a doubly aliased package leaves a running lifecycle script its directory",
+  "hoisted linker: the lifecycle script of a doubly aliased package runs once, in its directory",
   async () => {
     const depTarball = await new Bun.Archive(
       {
         "package/package.json": JSON.stringify({
           name: "dep",
           version: "1.0.0",
-          scripts: { postinstall: keepsItsDirectory },
+          scripts: { postinstall: runsOnceInItsDirectory },
         }),
       },
       { compress: "gzip" },
@@ -767,9 +762,790 @@ test.concurrent.skipIf(isWindows)(
     });
     expect(stderr).not.toContain("error");
     expect(exitCode).toBe(0);
-    expect(readdirSync(join(root, "markers")).sort()).toEqual([".keep", "first", "second"]);
+    expect(readdirSync(join(root, "markers")).sort()).toEqual([".keep", "first"]);
   },
 );
+
+// A workspace has one node_modules, and so has the project. The hoisted linker has a tree for
+// each dependency that links to one, so two trees can be the same folder: a second name for the
+// workspace, a link to the project, a link below another workspace. Each lists the packages that
+// are nested in that folder. They are placed there, and their scripts run, once.
+describe("hoisted linker: a node_modules that two dependencies lead to", () => {
+  // A line for each run, in a file that no install replaces.
+  const countsItsRuns = { postinstall: `echo ran >> "$STAGING_TEST_RUNS"` };
+  const bunfig = ({ root }: { root: string }) =>
+    Bun.TOML.stringify({ install: { cache: join(root, ".bun-cache"), linker: "hoisted" } });
+  const json = (value: object) => JSON.stringify(value);
+  const pack = (name: string, version: string, more: object = {}) =>
+    new Bun.Archive({ "package/package.json": json({ name, version, ...more }) }, { compress: "gzip" }).bytes();
+
+  // `held` is nested in `packages/b`: the root's own `dep` keeps its name at the root.
+  const files = (more: Record<string, string | Buffer> = {}) => ({
+    "package.json": json({
+      name: "app",
+      workspaces: ["packages/*"],
+      dependencies: { bb: "workspace:packages/b", dep: "file:./other" },
+      trustedDependencies: ["dep"],
+    }),
+    "packages/b/package.json": json({ name: "b", version: "1.0.0", dependencies: { dep: "file:../../held" } }),
+    "held/package.json": json({ name: "held", version: "1.0.0", scripts: countsItsRuns }),
+    "other/package.json": json({ name: "other", version: "1.0.0" }),
+    "bunfig.toml": bunfig,
+    ...more,
+  });
+
+  async function run(root: string, args: string[] = [], env: Record<string, string> = {}) {
+    const runs = join(root, "runs.txt");
+    rmSync(runs, { force: true });
+    const { stdout, stderr, exitCode } = await install(root, args, { ...installEnv, STAGING_TEST_RUNS: runs, ...env });
+    return { stdout, stderr, exitCode, runs: existsSync(runs) ? readFileSync(runs, "utf8").trim().split(/\r?\n/) : [] };
+  }
+  // What is at `dir`: a link there would be a folder of another package.
+  const placed = (root: string, dir: string) => ({
+    isDirectory: lstatSync(join(root, dir)).isDirectory(),
+    name: JSON.parse(readFileSync(join(root, dir, "package.json"), "utf8")).name,
+  });
+  const held = { isDirectory: true, name: "held" };
+  const dep = "packages/b/node_modules/dep";
+  const versionAt = (root: string, dir: string) =>
+    JSON.parse(readFileSync(join(root, dir, "package.json"), "utf8")).version;
+  // One folder is one error, whatever the number of names that lead to it.
+  const errors = (stderr: string) => stderr.split(/\r?\n/).filter(line => line.includes("error"));
+  const couldNotFindHeld = 'error: Could not find folder "file:held" for dependency "dep"';
+
+  test.concurrent("a second name: fresh, from bun.lock, without the root's node_modules, --force, warm", async () => {
+    using dir = tempDir("two-names", files());
+    const root = String(dir);
+
+    const steps: [string, string[], () => void][] = [
+      ["fresh", [], () => {}],
+      [
+        "from bun.lock",
+        [],
+        () => ["node_modules", "packages/b/node_modules"].forEach(at => rmSync(join(root, at), { recursive: true })),
+      ],
+      ["without the root's node_modules", [], () => rmSync(join(root, "node_modules"), { recursive: true })],
+      ["--force", ["--force"], () => {}],
+    ];
+    for (const [step, args, prepare] of steps) {
+      prepare();
+      const { stderr, exitCode, runs } = await run(root, args);
+      expect({ step, stderr }).toEqual({ step, stderr: expect.not.stringContaining("error") });
+      expect({
+        step,
+        dep: placed(root, dep),
+        nodeModules: readdirSync(join(root, "packages/b/node_modules")),
+        runs,
+      }).toEqual({ step, dep: held, nodeModules: ["dep"], runs: ["ran"] });
+      expect({ step, exitCode }).toEqual({ step, exitCode: 0 });
+    }
+
+    // Nothing to do: the script does not run again.
+    const warm = await run(root);
+    expect(warm.stdout).toContain("(no changes)");
+    expect({ dep: placed(root, dep), runs: warm.runs, exitCode: warm.exitCode }).toEqual({
+      dep: held,
+      runs: [],
+      exitCode: 0,
+    });
+
+    // Without the folder it is the error of any `file:` dependency, and no script is queued.
+    for (const gone of ["held", "node_modules", "packages/b/node_modules"]) {
+      rmSync(join(root, gone), { recursive: true });
+    }
+    const missing = await run(root);
+    expect(errors(missing.stderr)).toEqual([couldNotFindHeld]);
+    expect(missing.stdout).toContain("Failed to install 1 package\n");
+    expect({ dep: existsSync(join(root, dep)), runs: missing.runs, exitCode: missing.exitCode }).toEqual({
+      dep: false,
+      runs: [],
+      exitCode: 1,
+    });
+  });
+
+  test.concurrent.each([
+    ["workspace:<path>", "workspace:packages/b"],
+    ["workspace:<name>@<range>", "workspace:b@*"],
+    ["npm:<name>@<version>", "npm:b@1.0.0"],
+    ["file:<path>", "file:packages/b"],
+  ])("a second name written as %s", async (_, second) => {
+    using dir = tempDir("two-names-spelling", files());
+    const root = String(dir);
+    const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    packageJson.dependencies.bb = second;
+    await Bun.write(join(root, "package.json"), json(packageJson));
+
+    const { stderr, exitCode, runs } = await run(root);
+    expect(stderr).not.toContain("error");
+    expect({
+      dep: placed(root, dep),
+      second: realpathSync(join(root, "node_modules/bb")) === realpathSync(join(root, "packages/b")),
+      runs,
+    }).toEqual({ dep: held, second: true, runs: ["ran"] });
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent("a second name that another workspace gives it", async () => {
+    using dir = tempDir(
+      "two-names-member",
+      files({
+        "package.json": json({
+          name: "app",
+          workspaces: ["packages/*"],
+          dependencies: { dep: "file:./other" },
+          trustedDependencies: ["dep"],
+        }),
+        "packages/a/package.json": json({ name: "a", version: "1.0.0", dependencies: { bb: "workspace:../b" } }),
+      }),
+    );
+    const root = String(dir);
+
+    const { stderr, exitCode, runs } = await run(root);
+    expect(stderr).not.toContain("error");
+    expect({ dep: placed(root, dep), runs }).toEqual({ dep: held, runs: ["ran"] });
+    expect(exitCode).toBe(0);
+  });
+
+  // With --filter the root's own entry for `b` is left out, and the tree of its node_modules is
+  // named by the dependency of `a`.
+  test.concurrent.each([
+    ["its own name", { b: "workspace:*" }, "b"],
+    ["a second name", { bb: "workspace:../b" }, "bb"],
+  ])("--filter reaches the workspace through another one, under %s", async (_, dependencies, link) => {
+    using dir = tempDir(
+      "two-names-filter",
+      files({
+        "package.json": json({
+          name: "app",
+          workspaces: ["packages/*"],
+          dependencies: { dep: "file:./other" },
+          trustedDependencies: ["dep"],
+        }),
+        "packages/a/package.json": json({ name: "a", version: "1.0.0", dependencies }),
+      }),
+    );
+    const root = String(dir);
+
+    const { stderr, exitCode, runs } = await run(root, ["--filter", "./packages/a"]);
+    expect(stderr).not.toContain("error");
+    expect({ dep: placed(root, dep), nodeModules: readdirSync(join(root, "node_modules")).sort(), runs }).toEqual({
+      dep: held,
+      nodeModules: ["a", link],
+      runs: ["ran"],
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  // The root's `b` is another package, so the workspace is linked below `a` only, and its own
+  // tree starts at `packages/b`.
+  test.concurrent("a workspace whose name the root gives to another package", async () => {
+    using dir = tempDir(
+      "two-names-shadowed",
+      files({
+        "package.json": json({
+          name: "app",
+          workspaces: ["packages/*"],
+          dependencies: { b: "file:./b-9.9.9.tgz", dep: "file:./other" },
+          trustedDependencies: ["dep"],
+        }),
+        "packages/a/package.json": json({ name: "a", version: "1.0.0", dependencies: { b: "workspace:*" } }),
+        "b-9.9.9.tgz": Buffer.from(await pack("b", "9.9.9")),
+      }),
+    );
+    const root = String(dir);
+
+    const { stderr, exitCode, runs } = await run(root);
+    expect(stderr).not.toContain("error");
+    expect({
+      dep: placed(root, dep),
+      root: JSON.parse(readFileSync(join(root, "node_modules/b/package.json"), "utf8")).version,
+      below: realpathSync(join(root, "node_modules/a/node_modules/b")) === realpathSync(join(root, "packages/b")),
+      runs,
+    }).toEqual({ dep: held, root: "9.9.9", below: true, runs: ["ran"] });
+    expect(exitCode).toBe(0);
+  });
+
+  // `packages/b/held` is where the dependency's path leads from the link to `b`.
+  test.concurrent("a folder at the dependency's path inside the workspace is not taken for it", async () => {
+    using dir = tempDir(
+      "two-names-decoy",
+      files({ "packages/b/held/package.json": json({ name: "decoy", version: "9.9.9" }) }),
+    );
+    const root = String(dir);
+
+    const { stderr, exitCode, runs } = await run(root);
+    expect(stderr).not.toContain("error");
+    expect({ dep: placed(root, dep), decoy: readdirSync(join(root, "packages/b/held")), runs }).toEqual({
+      dep: held,
+      decoy: ["package.json"],
+      runs: ["ran"],
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent.each([
+    ["file:.", { self: "file:." }],
+    ["workspace:*", { app: "workspace:*" }],
+  ])("the project as its own dependency, %s", async (_, self) => {
+    using dir = tempDir("two-names-self", {
+      "package.json": json({
+        name: "app",
+        version: "1.0.0",
+        dependencies: { ...self, dep: "file:./held" },
+        trustedDependencies: ["dep"],
+      }),
+      "held/package.json": json({ name: "held", version: "1.0.0", scripts: countsItsRuns }),
+      "bunfig.toml": bunfig,
+    });
+    const root = String(dir);
+
+    const { stderr, exitCode, runs } = await run(root);
+    expect(stderr).not.toContain("error");
+    expect({ dep: placed(root, "node_modules/dep"), source: readdirSync(join(root, "held")), runs }).toEqual({
+      dep: held,
+      source: ["package.json"],
+      runs: ["ran"],
+    });
+    expect(exitCode).toBe(0);
+
+    for (const gone of ["held", "node_modules"]) rmSync(join(root, gone), { recursive: true });
+    const missing = await run(root);
+    expect(errors(missing.stderr)).toEqual([couldNotFindHeld]);
+    expect(missing.stdout).toContain("Failed to install 1 package\n");
+    expect({
+      dep: existsSync(join(root, "node_modules/dep")),
+      runs: missing.runs,
+      exitCode: missing.exitCode,
+    }).toEqual({ dep: false, runs: [], exitCode: 1 });
+  });
+
+  // The tree of the link is the project's `node_modules` only if the link leads there. A row
+  // whose own path has no entry is not counted as placed.
+  test.concurrent("a folder where the link to the project was gets what is nested in it", async () => {
+    using dir = tempDir("two-names-self-folder", {
+      "package.json": json({ name: "app", version: "1.0.0", dependencies: { self: "file:.", dep: "file:./held" } }),
+      "held/package.json": json({ name: "held", version: "1.0.0" }),
+      "bunfig.toml": bunfig,
+    });
+    const root = String(dir);
+    const fresh = await run(root);
+    expect(fresh.stderr).not.toContain("error");
+    expect(realpathSync(join(root, "node_modules/self"))).toBe(realpathSync(root));
+    expect(fresh.exitCode).toBe(0);
+
+    rmSync(join(root, "node_modules/self"), { recursive: true });
+    mkdirSync(join(root, "node_modules/self"));
+    const { stderr, exitCode } = await run(root);
+    expect(stderr).not.toContain("error");
+    expect({ nested: placed(root, "node_modules/self/node_modules/dep"), exitCode }).toEqual({
+      nested: held,
+      exitCode: 0,
+    });
+    const again = await run(root);
+    expect(again.stdout).toContain("(no changes)");
+    expect(again.exitCode).toBe(0);
+  });
+
+  describe("a nested tarball", () => {
+    const tarballFiles = async (scripts: Record<string, string>, more: Record<string, string | Buffer> = {}) => ({
+      ...files(more),
+      "packages/b/package.json": json({
+        name: "b",
+        version: "1.0.0",
+        dependencies: { dep: "file:../../dep-1.0.0.tgz" },
+      }),
+      "dep-1.0.0.tgz": Buffer.from(await pack("dep", "1.0.0", { scripts })),
+    });
+    const nested = { isDirectory: true, name: "dep" };
+
+    test.concurrent("is placed once: fresh, --force", async () => {
+      using dir = tempDir("two-names-tarball", await tarballFiles(countsItsRuns));
+      const root = String(dir);
+
+      for (const args of [[], ["--force"]]) {
+        const { stderr, exitCode, runs } = await run(root, args);
+        expect({ args, stderr }).toEqual({ args, stderr: expect.not.stringContaining("error") });
+        expect({ args, dep: placed(root, dep), runs }).toEqual({ args, dep: nested, runs: ["ran"] });
+        expect({ args, exitCode }).toEqual({ args, exitCode: 0 });
+      }
+    });
+
+    // The script starts when the first name's tree is done, and then waits for the script of
+    // `last`, which starts when every tree is. `--force` replaces what is there, and the second
+    // name's tree used to replace the folder that the script was running in.
+    // The script is POSIX sh.
+    test.concurrent.skipIf(isWindows)("--force: its script keeps its directory while it runs", async () => {
+      const waits = [
+        `until [ -e "$STAGING_TEST_WALKED" ] || ! kill -0 "$PPID" 2>/dev/null; do :; done`,
+        `[ . -ef "$STAGING_TEST_DEP_DIR" ]`,
+        countsItsRuns.postinstall,
+      ].join(" && ");
+      using dir = tempDir(
+        "two-names-tarball-force",
+        await tarballFiles(
+          { postinstall: waits },
+          {
+            "package.json": json({
+              name: "app",
+              workspaces: ["packages/*"],
+              dependencies: { bb: "workspace:packages/b", dep: "file:./other", last: "file:./last" },
+              trustedDependencies: ["dep", "last"],
+            }),
+            "last/package.json": json({
+              name: "last",
+              version: "1.0.0",
+              scripts: { postinstall: `: > "$STAGING_TEST_WALKED"` },
+            }),
+          },
+        ),
+      );
+      const root = realpathSync(String(dir));
+
+      const { stderr, exitCode, runs } = await run(root, ["--force"], {
+        STAGING_TEST_WALKED: join(root, "walked"),
+        STAGING_TEST_DEP_DIR: join(root, dep),
+      });
+      expect(stderr).not.toContain("error");
+      expect({ dep: placed(root, dep), runs }).toEqual({ dep: nested, runs: ["ran"] });
+      expect(exitCode).toBe(0);
+    });
+
+    // `bun pm untrusted` and `bun pm trust` read the same trees.
+    test.concurrent("bun pm untrusted lists it once, and bun pm trust runs its script once", async () => {
+      using dir = tempDir(
+        "two-names-trust",
+        await tarballFiles(countsItsRuns, {
+          "package.json": json({
+            name: "app",
+            workspaces: ["packages/*"],
+            dependencies: { bb: "workspace:packages/b", dep: "file:./other" },
+          }),
+        }),
+      );
+      const root = String(dir);
+      const runs = join(root, "runs.txt");
+      const env = { ...installEnv, STAGING_TEST_RUNS: runs };
+
+      const installed = await run(root);
+      expect(installed.stderr).not.toContain("error");
+      expect(installed.stdout).toContain("Blocked 1 postinstall.");
+      expect({ runs: installed.runs, exitCode: installed.exitCode }).toEqual({ runs: [], exitCode: 0 });
+
+      const untrusted = await bun(root, ["pm", "untrusted"], env);
+      expect(untrusted.stdout.split(/\r?\n/).filter(line => line.includes("[postinstall]"))).toHaveLength(1);
+      expect(untrusted.exitCode).toBe(0);
+
+      const trust = await bun(root, ["pm", "trust", "--all"], env);
+      expect(trust.stderr).not.toContain("error");
+      expect({ runs: readFileSync(runs, "utf8").trim().split(/\r?\n/), exitCode: trust.exitCode }).toEqual({
+        runs: ["ran"],
+        exitCode: 0,
+      });
+    });
+
+    // `bun link b` points `node_modules/b` at the folder of the globally linked `b`. What
+    // `packages/b` needs is placed in `packages/b` all the same.
+    test.concurrent("a link to the workspace that leads to another folder", async () => {
+      using dir = tempDir(
+        "two-names-relinked",
+        await tarballFiles(
+          {},
+          {
+            "dep-2.0.0.tgz": Buffer.from(await pack("dep", "2.0.0")),
+            "elsewhere/package.json": json({ name: "b", version: "1.0.0" }),
+          },
+        ),
+      );
+      const root = String(dir);
+
+      const fresh = await run(root);
+      expect(fresh.stderr).not.toContain("error");
+      expect({ dep: versionAt(root, dep), exitCode: fresh.exitCode }).toEqual({ dep: "1.0.0", exitCode: 0 });
+
+      rmSync(join(root, "node_modules/b"), { recursive: true });
+      symlinkSync(join(root, "elsewhere"), join(root, "node_modules/b"), "junction");
+      expect(realpathSync(join(root, "node_modules/b"))).toBe(realpathSync(join(root, "elsewhere")));
+      const dependencies = { dep: "file:../../dep-2.0.0.tgz" };
+      writeFileSync(join(root, "packages/b/package.json"), json({ name: "b", version: "1.0.0", dependencies }));
+
+      const bumped = await run(root);
+      expect(bumped.stderr).not.toContain("error");
+      expect({ dep: versionAt(root, dep), exitCode: bumped.exitCode }).toEqual({ dep: "2.0.0", exitCode: 0 });
+    });
+
+    // Three names, and the link of the second one leads to another folder. With the tarball gone
+    // from the cache, each row waits for it. Each folder that a link leads to gets the package
+    // once. The script is POSIX sh.
+    test.concurrent.skipIf(isWindows)("three names, and one link leads to another folder", async () => {
+      using dir = tempDir(
+        "two-names-three",
+        await tarballFiles(
+          { postinstall: `pwd -P >> "$STAGING_TEST_RUNS"` },
+          {
+            "package.json": json({
+              name: "app",
+              workspaces: ["packages/*"],
+              dependencies: { bb: "workspace:packages/b", bc: "workspace:packages/b", dep: "file:./other" },
+              trustedDependencies: ["dep"],
+            }),
+            "elsewhere/package.json": json({ name: "b", version: "1.0.0" }),
+          },
+        ),
+      );
+      const root = realpathSync(String(dir));
+
+      const fresh = await run(root);
+      expect(fresh.stderr).not.toContain("error");
+      expect({ runs: fresh.runs, exitCode: fresh.exitCode }).toEqual({ runs: [join(root, dep)], exitCode: 0 });
+
+      rmSync(join(root, "node_modules/bb"), { recursive: true });
+      symlinkSync(join(root, "elsewhere"), join(root, "node_modules/bb"));
+      for (const gone of [".bun-cache", dep]) rmSync(join(root, gone), { recursive: true });
+
+      const again = await run(root);
+      expect(again.stderr).not.toContain("error");
+      // Once in each folder that a link leads to.
+      expect({
+        inPackagesB: again.runs.filter(at => at === join(root, dep)),
+        twice: again.runs.filter((at, i) => again.runs.indexOf(at) !== i),
+        exitCode: again.exitCode,
+      }).toEqual({ inPackagesB: [join(root, dep)], twice: [], exitCode: 0 });
+    });
+  });
+
+  // `m` is nested in `packages/b`, which has a tree of its own and a tree for the link below `a`.
+  // Only below `a` is m's `n` nested in `m`: the root has that `n`, and `a` has another one. With
+  // `m` gone from the cache and from `packages/b`, its first row waits for the tarball, and
+  // nothing may be placed inside `m` before `m` itself is.
+  test.concurrent("a package that waits for its files is placed before what is nested in it", async () => {
+    using dir = tempDir("two-names-waits", {
+      "package.json": json({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { b: "file:./b-9.9.9.tgz", m: "file:./m-0.0.0.tgz", n: "file:./n-2.0.0.tgz" },
+        trustedDependencies: ["m"],
+      }),
+      "packages/a/package.json": json({
+        name: "a",
+        version: "1.0.0",
+        dependencies: { b: "workspace:*", n: "file:../../n-1.0.0.tgz" },
+      }),
+      "packages/b/package.json": json({ name: "b", version: "1.0.0", dependencies: { m: "file:../../m-1.0.0.tgz" } }),
+      "b-9.9.9.tgz": Buffer.from(await pack("b", "9.9.9")),
+      "m-0.0.0.tgz": Buffer.from(await pack("m", "0.0.0")),
+      "n-1.0.0.tgz": Buffer.from(await pack("n", "1.0.0")),
+      "n-2.0.0.tgz": Buffer.from(await pack("n", "2.0.0")),
+      "bunfig.toml": bunfig,
+    });
+    const root = String(dir);
+    // A tarball names its own dependencies by their full path.
+    const dependencies = { n: `file:${join(root, "n-2.0.0.tgz").replaceAll("\\", "/")}` };
+    await Bun.write(join(root, "m-1.0.0.tgz"), await pack("m", "1.0.0", { dependencies, scripts: countsItsRuns }));
+
+    const m = "packages/b/node_modules/m";
+    const state = () => ({
+      m: versionAt(root, m),
+      n: versionAt(root, join(m, "node_modules/n")),
+      aSees: versionAt(root, "packages/a/node_modules/n"),
+    });
+    const whole = { m: "1.0.0", n: "2.0.0", aSees: "1.0.0" };
+
+    const fresh = await run(root);
+    expect(fresh.stderr).not.toContain("error");
+    expect({ ...state(), runs: fresh.runs }).toEqual({ ...whole, runs: ["ran"] });
+    expect(fresh.exitCode).toBe(0);
+
+    rmSync(join(root, m), { recursive: true });
+    const cache = join(root, ".bun-cache");
+    const cached = readdirSync(cache).filter(entry => {
+      const manifest = join(cache, entry, "package.json");
+      return existsSync(manifest) && readFileSync(manifest, "utf8").includes('"version":"1.0.0","dependencies"');
+    });
+    expect(cached).toHaveLength(1);
+    rmSync(join(cache, cached[0]), { recursive: true });
+
+    const again = await run(root);
+    expect(again.stderr).not.toContain("error");
+    expect({ ...state(), runs: again.runs }).toEqual({ ...whole, runs: ["ran"] });
+    expect(again.exitCode).toBe(0);
+  });
+
+  // `m` is nested in `packages/b` under both names, and `n` in that `m`. The script of `n` is not
+  // trusted: a tarball names it.
+  test.concurrent("a package nested in a package of the folder is placed once", async () => {
+    using dir = tempDir(
+      "two-names-deeper",
+      files({
+        "package.json": json({
+          name: "app",
+          workspaces: ["packages/*"],
+          dependencies: { bb: "workspace:packages/b", m: "file:./m-0.0.0.tgz", n: "file:./n-1.0.0.tgz" },
+        }),
+        "packages/b/package.json": json({ name: "b", version: "1.0.0", dependencies: { m: "file:../../m-1.0.0.tgz" } }),
+        "m-0.0.0.tgz": Buffer.from(await pack("m", "0.0.0")),
+        "n-1.0.0.tgz": Buffer.from(await pack("n", "1.0.0")),
+        "n-2.0.0.tgz": Buffer.from(await pack("n", "2.0.0", { scripts: countsItsRuns })),
+      }),
+    );
+    const root = String(dir);
+    const dependencies = { n: `file:${join(root, "n-2.0.0.tgz").replaceAll("\\", "/")}` };
+    await Bun.write(join(root, "m-1.0.0.tgz"), await pack("m", "1.0.0", { dependencies }));
+    const n = "packages/b/node_modules/m/node_modules/n";
+
+    for (const args of [[], ["--force"]]) {
+      const { stdout, stderr, exitCode, runs } = await run(root, args);
+      expect({ args, stderr }).toEqual({ args, stderr: expect.not.stringContaining("error") });
+      expect({ args, stdout }).toEqual({ args, stdout: expect.stringContaining("Blocked 1 postinstall.") });
+      expect({ args, n: versionAt(root, n), runs, exitCode }).toEqual({ args, n: "2.0.0", runs: [], exitCode: 0 });
+    }
+  });
+
+  // `packages/b` lists `n` twice. Its own tree has the one of `devDependencies`, and the tree of
+  // the link below `a` has the other one, because `a` has the first. The two are different
+  // packages at one path, so neither row stands for the other, nor for what is nested in it.
+  test.concurrent("two trees of the folder that have different packages under one name", async () => {
+    using dir = tempDir("two-names-contested", {
+      "package.json": json({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { b: "file:./b-9.9.9.tgz", n: "file:./n-3.0.0.tgz", k: "file:./k-2.0.0.tgz" },
+      }),
+      "packages/a/package.json": json({
+        name: "a",
+        version: "1.0.0",
+        dependencies: { b: "workspace:*", n: "file:../../n-1.0.0.tgz" },
+      }),
+      "packages/b/package.json": json({
+        name: "b",
+        version: "1.0.0",
+        dependencies: { n: "file:../../n-2.0.0.tgz" },
+        devDependencies: { n: "file:../../n-1.0.0.tgz" },
+      }),
+      "b-9.9.9.tgz": Buffer.from(await pack("b", "9.9.9")),
+      "n-3.0.0.tgz": Buffer.from(await pack("n", "3.0.0")),
+      "n-1.0.0.tgz": Buffer.from(await pack("n", "1.0.0")),
+      "k-2.0.0.tgz": Buffer.from(await pack("k", "2.0.0")),
+      "k-1.0.0.tgz": Buffer.from(await pack("k", "1.0.0")),
+      "bunfig.toml": bunfig,
+    });
+    const root = String(dir);
+    const dependencies = { k: `file:${join(root, "k-1.0.0.tgz").replaceAll("\\", "/")}` };
+    await Bun.write(join(root, "n-2.0.0.tgz"), await pack("n", "2.0.0", { dependencies, scripts: countsItsRuns }));
+    const n = "packages/b/node_modules/n";
+
+    for (const args of [[], ["--force"]]) {
+      const { stderr, exitCode } = await run(root, args);
+      expect({ args, stderr }).toEqual({ args, stderr: expect.not.stringContaining("error") });
+      expect({ args, n: versionAt(root, n), k: versionAt(root, join(n, "node_modules/k")), exitCode }).toEqual({
+        args,
+        n: "2.0.0",
+        k: "1.0.0",
+        exitCode: 0,
+      });
+    }
+
+    const untrusted = await bun(root, ["pm", "untrusted"]);
+    expect(untrusted.stdout.split(/\r?\n/).filter(line => line.includes("[postinstall]"))).toHaveLength(1);
+    expect(untrusted.exitCode).toBe(0);
+  });
+
+  // `packages/b` has a tree of its own with `s`, and a tree for the link below `a` with `s` and
+  // `y`: the root has that `y`, and `a` has another one. `s` and `y` both have the bin `foo`. A
+  // tree links the bins of all its rows, and in that order `s` is before `y`.
+  test.concurrent("a bin that two packages of the folder have goes to the same one", async () => {
+    const withBin = (name: string) =>
+      new Bun.Archive(
+        {
+          "package/package.json": json({ name, version: "1.0.0", bin: { foo: "cli.js" } }),
+          "package/cli.js": "#!/usr/bin/env node\n",
+        },
+        { compress: "gzip" },
+      ).bytes();
+    using dir = tempDir("two-names-bin", {
+      "packages/a/package.json": json({
+        name: "a",
+        version: "1.0.0",
+        dependencies: { b: "workspace:*", y: "file:../../y-2.0.0.tgz" },
+      }),
+      "b-9.9.9.tgz": Buffer.from(await pack("b", "9.9.9")),
+      "s-0.0.0.tgz": Buffer.from(await pack("s", "0.0.0")),
+      "s-1.0.0.tgz": Buffer.from(await withBin("s")),
+      "y-1.0.0.tgz": Buffer.from(await withBin("y")),
+      "y-2.0.0.tgz": Buffer.from(await pack("y", "2.0.0")),
+      "bunfig.toml": bunfig,
+    });
+    const root = String(dir);
+    // The root and `packages/b` name the same tarball.
+    const y = `file:${join(root, "y-1.0.0.tgz").replaceAll("\\", "/")}`;
+    await Bun.write(
+      join(root, "package.json"),
+      json({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { b: "file:./b-9.9.9.tgz", s: "file:./s-0.0.0.tgz", y },
+      }),
+    );
+    await Bun.write(
+      join(root, "packages/b/package.json"),
+      json({ name: "b", version: "1.0.0", dependencies: { s: "file:../../s-1.0.0.tgz", y } }),
+    );
+
+    for (const args of [[], [], ["--force"]]) {
+      const { stderr, exitCode } = await run(root, args);
+      expect({ args, stderr }).toEqual({ args, stderr: expect.not.stringContaining("error") });
+      expect(readdirSync(join(root, "packages/b/node_modules")).sort()).toEqual([".bin", "s", "y"]);
+      expect(join(root, "packages/b/node_modules/.bin/foo")).toBeValidBin(join("..", "s", "cli.js"));
+      expect({ args, exitCode }).toEqual({ args, exitCode: 0 });
+    }
+  });
+
+  // bun.lock is read as it is written. The folder's path is copied into a buffer that holds one
+  // path, whichever dependency names the tree.
+  test.concurrent.each([
+    ["every workspace", []],
+    ["--filter", ["--filter", "./packages/a"]],
+  ])("a file: path in bun.lock that is too long is refused: %s", async (_, args) => {
+    using dir = tempDir(
+      "two-names-long",
+      files({
+        "package.json": json({ name: "app", workspaces: ["packages/*"], dependencies: { dep: "file:./other" } }),
+        "packages/a/package.json": json({ name: "a", version: "1.0.0", dependencies: { b: "workspace:*" } }),
+      }),
+    );
+    const root = String(dir);
+    const installed = await run(root);
+    expect(installed.stderr).not.toContain("error");
+    expect(installed.exitCode).toBe(0);
+
+    const long = Buffer.alloc(100_000, "h").toString();
+    const lockfile = readFileSync(join(root, "bun.lock"), "utf8");
+    expect(lockfile).toContain('"held@file:held"');
+    writeFileSync(join(root, "bun.lock"), lockfile.replace('"held@file:held"', `"held@file:${long}"`));
+
+    const { stdout, stderr, exitCode } = await run(root, args);
+    expect(errors(stderr).map(line => line.replace(long, "<long>"))).toEqual([
+      'error: refusing to install dependency held with unsafe folder path "<long>"',
+    ]);
+    expect(stdout).toContain("Failed to install 1 package\n");
+    expect(exitCode).toBe(1);
+  });
+
+  // The root gives the name `b` to another package, so `packages/b` is linked below `a` and below
+  // `c` only. `m` is nested in it through both links: `a` and `c` have another `m`. m's `k` is
+  // nested in `m` only through the link below `a`, because `c` has that `k`. The registry holds
+  // `slow`, which `a` waits for, so the tree below `c` places `m`. An older `m` is there, and the
+  // new one has a script, which is POSIX sh.
+  test.concurrent.skipIf(isWindows)("the tree that places a package is not the first one", async () => {
+    const slow: RegistryPackage = { tgz: await pack("slow", "1.0.0") };
+    using registry = serveRegistry({ slow });
+    using dir = tempDir("two-names-later-tree", {
+      "packages/a/package.json": json({
+        name: "a",
+        version: "1.0.0",
+        dependencies: { b: "workspace:*", m: "file:../../m-0.0.0.tgz", slow: "1.0.0" },
+      }),
+      "b-9.9.9.tgz": Buffer.from(await pack("b", "9.9.9")),
+      "k-0.0.0.tgz": Buffer.from(await pack("k", "0.0.0")),
+      "k-2.0.0.tgz": Buffer.from(await pack("k", "2.0.0")),
+      "m-0.0.0.tgz": Buffer.from(await pack("m", "0.0.0")),
+      "slow-0.0.0.tgz": Buffer.from(await pack("slow", "0.0.0")),
+      "bunfig.toml": ({ root }) =>
+        Bun.TOML.stringify({
+          install: { registry: registry.url.href, cache: join(root, ".bun-cache"), linker: "hoisted" },
+        }),
+    });
+    const root = realpathSync(String(dir));
+    // Those that name the same tarball name it by its full path, as a tarball does.
+    const k = `file:${join(root, "k-2.0.0.tgz")}`;
+    const newM = `file:${join(root, "m-2.0.0.tgz")}`;
+    const seesItsK = `echo "$(pwd -P): $([ -e node_modules/k/package.json ] && echo k || echo no k)" >> "$STAGING_TEST_RUNS"`;
+    await Bun.write(
+      join(root, "m-2.0.0.tgz"),
+      await pack("m", "2.0.0", { dependencies: { k }, scripts: { postinstall: seesItsK } }),
+    );
+    await Bun.write(
+      join(root, "package.json"),
+      json({
+        name: "app",
+        workspaces: ["packages/*"],
+        dependencies: { b: "file:./b-9.9.9.tgz", k: "file:./k-0.0.0.tgz", m: newM, slow: "file:./slow-0.0.0.tgz" },
+        trustedDependencies: ["m"],
+      }),
+    );
+    await Bun.write(
+      join(root, "packages/b/package.json"),
+      json({ name: "b", version: "1.0.0", dependencies: { m: newM } }),
+    );
+    await Bun.write(
+      join(root, "packages/c/package.json"),
+      json({ name: "c", version: "1.0.0", dependencies: { b: "workspace:*", m: "file:../../m-0.0.0.tgz", k } }),
+    );
+    const m = join(root, "packages/b/node_modules/m");
+
+    const warm = await run(root, ["--ignore-scripts"]);
+    expect(warm.stderr).not.toContain("error");
+    expect(readdirSync(join(m, "node_modules"))).toEqual(["k"]);
+    expect(warm.exitCode).toBe(0);
+
+    // What an install of an older bun.lock left in `packages/b`.
+    rmSync(m, { recursive: true });
+    mkdirSync(m);
+    writeFileSync(join(m, "package.json"), json({ name: "m", version: "1.0.0" }));
+    writeFileSync(join(m, "helper.js"), "");
+    rmSync(join(root, "node_modules"), { recursive: true });
+    const cached = readdirSync(join(root, ".bun-cache")).filter(entry => entry.startsWith("slow@"));
+    expect(cached).toHaveLength(1);
+    rmSync(join(root, ".bun-cache", cached[0]), { recursive: true });
+
+    const released = Promise.withResolvers<void>();
+    slow.release = released.promise;
+    const runs = join(root, "runs.txt");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "install"],
+      cwd: root,
+      env: { ...installEnv, STAGING_TEST_RUNS: runs },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let exited = false;
+    // An install that ends early must not leave the registry waiting.
+    proc.exited.then(() => ((exited = true), released.resolve()));
+    const output = Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    // bun moves the older folder aside before the new one is there.
+    const isPlaced = () => {
+      try {
+        return versionAt(m, ".") === "2.0.0";
+      } catch {
+        return false;
+      }
+    };
+    while (!exited && !isPlaced()) await new Promise(resolve => setImmediate(resolve));
+    // The script of `m` must not start before the tree below `a` has placed `k`, which it cannot
+    // do while `slow` is held. Nothing tells that bun has decided not to start it, so this waits
+    // for the script for a moment before it lets the install go on.
+    const deadline = performance.now() + 500;
+    while (!exited && !existsSync(runs) && performance.now() < deadline) await Bun.sleep(10);
+    const ranEarly = existsSync(runs);
+    released.resolve();
+
+    const [, stderr, exitCode] = await output;
+    expect(stderr).not.toContain("error");
+    expect({
+      ranEarly,
+      m: readdirSync(m)
+        .filter(name => name !== ".bun-tag")
+        .sort(),
+      runs: readFileSync(runs, "utf8").trim().split("\n").sort(),
+      exitCode,
+    }).toEqual({
+      ranEarly: false,
+      m: ["node_modules", "package.json"],
+      runs: [`${join(root, "node_modules/m")}: k`, `${m}: k`],
+      exitCode: 0,
+    });
+  });
+});
 
 // An alias may already be as long as a file name can be, so the staging
 // directory's name cannot be derived from it by adding to it.
