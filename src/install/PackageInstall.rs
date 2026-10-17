@@ -2106,22 +2106,18 @@ impl PackageFiles<'_> {
 /// What `move_aside` names begin with. What is left of one if bun dies stays until `bun prune`.
 pub(crate) const MOVED_ASIDE_PREFIX: &str = ".old-";
 
-/// What `move_aside` does with a mount point (a Docker volume with the package's source in it)
-/// that the file system refuses to rename. What is in one is not bun's to delete.
+/// What `move_aside` does with a mount point (a Docker volume): what is in one is not bun's to delete.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IfMounted {
     /// Return the rename's error: a link has to replace the whole directory.
     Fail,
-    /// Delete only the files `verify` reads, and let the new files join the rest.
+    /// Delete only the files `verify` reads.
     Unmark,
 }
 
 /// Renames `subpath`, if it is there, to a name in `destination_dir` made of `random`. On any thread.
-/// Any other directory that cannot be renamed (overlayfs moves none of a lower layer, Windows none
-/// with a file open in it) is emptied where it is, so that the new files never join the old ones.
-///
-/// `Ok(Some(name))` is the new name. `Ok(None)`: `subpath` is gone, or it stays and holds nothing
-/// that `verify` reads any more. `Err`: a file that `verify` reads is still there.
+/// A directory that cannot be renamed is emptied where it is, so that the new files never join the
+/// old ones. `Ok(None)`: gone, or it holds nothing that `verify` reads. `Err`: it still does.
 pub(crate) fn move_aside(
     destination_dir: &Dir,
     subpath: &ZStr,
@@ -2140,8 +2136,7 @@ pub(crate) fn move_aside(
         Err(err) if err.get_errno() == sys::E::ENOENT => return Ok(None),
         Err(err) => err,
     };
-    // `EBUSY` is a mount point on Linux before 5.8, where `statx` cannot say, and a directory a
-    // program has open (its cwd) on Windows, which keeps what it had so far.
+    // `EBUSY`: a mount point on Linux before 5.8, where `statx` cannot say.
     if refused.get_errno() == sys::E::EBUSY || sys::is_mount_point(destination_dir.fd(), subpath)? {
         if if_mounted == IfMounted::Fail {
             return Err(refused);
@@ -2158,9 +2153,7 @@ pub(crate) fn move_aside(
 }
 
 /// Deletes what is in `subpath` through a handle, then `subpath` itself if that left it empty.
-/// `Err`: a file that `verify` reads could not be deleted, and the rest was left as it was. Any
-/// other file that cannot go (on Windows, one a program has open) stays, and the new copy goes in
-/// beside it.
+/// `Err`: a file that `verify` reads could not be deleted, and the rest was left as it was.
 pub(crate) fn empty_in_place(dir: &Dir, subpath: &ZStr) -> sys::Maybe<()> {
     let flags = sys::O::RDONLY | sys::O::CLOEXEC | sys::O::NOFOLLOW;
     let Ok(handle) = dir.open_at_with(subpath.as_bytes(), flags) else {
@@ -2169,7 +2162,6 @@ pub(crate) fn empty_in_place(dir: &Dir, subpath: &ZStr) -> sys::Maybe<()> {
     // First: a delete that is cut short must not leave a folder that passes `verify`.
     let unmarked = unmark(&handle);
     if unmarked.is_ok() {
-        // `delete_tree` stops at the first entry it cannot delete. This goes on.
         let _ = handle.delete_children();
     }
     handle.close();
@@ -2187,8 +2179,7 @@ pub(crate) fn unmark_at(dir: &Dir, subpath: &ZStr) {
     }
 }
 
-/// Deletes what `verify` reads from a package folder: `package.json`, `.bun-tag` and every
-/// `.bun-tag-<hash>`. The first error is returned once every entry has been tried.
+/// Deletes what `verify` reads: `package.json`, `.bun-tag` and every `.bun-tag-<hash>`.
 fn unmark(dir: &Dir) -> sys::Maybe<()> {
     let mut names: Vec<bun_core::ZBox> = vec![bun_core::ZBox::from_bytes(b"package.json")];
     let mut iter = sys::iterate_dir(dir.fd());
@@ -2210,8 +2201,7 @@ fn unmark(dir: &Dir) -> sys::Maybe<()> {
     result
 }
 
-/// Whether `package` holds `marker` and no other `.bun-tag-<hash>`. A folder with two was written
-/// on top of another install by an earlier bun, and is to be installed again.
+/// Whether `package` holds `marker` and no other `.bun-tag-<hash>` (an earlier bun left both).
 pub(crate) fn has_only_patch_marker(package: &Dir, marker: &[u8]) -> bool {
     let mut found = false;
     let mut iter = sys::iterate_dir(package.fd());

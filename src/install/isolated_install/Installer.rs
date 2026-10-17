@@ -729,8 +729,7 @@ impl<'a> Installer<'a> {
         is_store_copy
     }
 
-    /// Deletes the `installed_marker` file first, because a delete can be cut short. `Err`: a file
-    /// that the next install's skip check reads is still there.
+    /// Deletes the `installed_marker` file first, because a delete can be cut short.
     fn delete_local_store_package_in_place(&self, entry_id: StoreEntryId) -> sys::Maybe<()> {
         let mut path = AutoAbsPath::init_top_level_dir();
         self.append_store_path(&mut path, entry_id);
@@ -1729,8 +1728,7 @@ impl<'a> Installer<'a> {
                             backend = match err.get_errno() {
                                 sys::Errno::EXDEV => self.set_backend(InstallMethod::Copyfile),
                                 sys::Errno::EOPNOTSUPP => self.set_backend(InstallMethod::Hardlink),
-                                // The directory stays (a mount point, or a parent that refuses
-                                // both the rename and the delete): linked into, file by file.
+                                // The directory stays: linked into, file by file.
                                 sys::Errno::EEXIST if link_in_place => InstallMethod::Hardlink,
                                 _ => break 'backend Err(err),
                             };
@@ -2512,8 +2510,7 @@ impl<'a> Installer<'a> {
         ));
     }
 
-    /// Frees the final path, and the staging path of a dead install's rest. `Ok(true)`: the final
-    /// path stays, so link in place. `Err`: the old copy still passes the next install's skip check.
+    /// Frees the final path, and the staging path of a dead install's rest. `Ok(true)`: link in place.
     fn clear_local_store_package(
         &self,
         entry_id: StoreEntryId,
