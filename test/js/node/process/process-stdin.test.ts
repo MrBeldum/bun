@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isASAN, isDebug, isWindows, tempDir } from "harness";
+import { mkfifo } from "mkfifo";
 import { exec } from "node:child_process";
+import { closeSync, openSync, writeSync } from "node:fs";
+import { join } from "node:path";
 
 test.concurrent("pipe does the right thing", async () => {
   // Note: Bun.spawnSync uses memfd_create on Linux for pipe, which means we see
@@ -119,6 +122,11 @@ type StdioResult = { stdout: string; exitCode: number; stderr?: string };
 async function stdioResult(proc: Bun.Subprocess<"pipe", "pipe", "pipe">): Promise<StdioResult> {
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   return { stdout, exitCode, stderr: exitCode === 0 ? undefined : stderr };
+}
+
+// A write to a child that is already gone fails with EPIPE. The assertions on the child's output cover that case.
+function ignoreEpipe(err: any) {
+  if (err?.code !== "EPIPE") throw err;
 }
 
 test.concurrent("paused mode read(n) returns the buffered remainder at EOF", async () => {
@@ -327,47 +335,388 @@ test.concurrent("resuming after EOF is buffered behind unread data still deliver
   });
 });
 
-// [title, code before destroy(), code after destroy()]. The later cases are
-// the four ways to take the native reader back.
-test.concurrent.each([
-  ["on('data') then destroy()", `stdin.on("data", onData);`, ``],
-  ["resume() then destroy()", `stdin.resume();`, ``],
-  ["destroy() then resume()", `stdin.on("data", onData);`, `setImmediate(() => stdin.resume());`],
-  ["destroy() then ref()", `stdin.on("data", onData);`, `setImmediate(() => stdin.ref());`],
-  ["destroy() then read(n)", `stdin.on("data", onData);`, `setImmediate(() => stdin.read(5));`],
-  ["destroy() then on('readable')", ``, `setImmediate(() => stdin.on("readable", () => events.push("readable")));`],
-])("%s: stdin stays destroyed and the process exits", async (_, beforeDestroy, afterDestroy) => {
-  await using proc = Bun.spawn({
-    cmd: [
-      bunExe(),
-      "-e",
-      `const stdin = process.stdin;
+// process.stdin.destroy() is final. It releases the native reader, whatever listeners
+// exist, and nothing takes the reader back. In each case the parent holds the writer of
+// fd 0 open until the child is gone, so a child that exits did so because stdin let go
+// of the event loop and not because of EOF.
+describe("destroy()", () => {
+  const kinds = isWindows ? (["pipe", "tty", "file"] as const) : (["pipe", "fifo", "tty", "file"] as const);
+  type Kind = (typeof kinds)[number];
+  // Pipe, socket and TTY stdin. File stdin does not hold the event loop.
+  const socketLike = kinds.filter(kind => kind !== "file");
+  type Feed = (data: string) => void;
+  type Child = Bun.Subprocess<Bun.SpawnOptions.Writable, "pipe", "pipe">;
+
+  // The child reports once, when it exits.
+  function child(body: string) {
+    return `
+      const stdin = process.stdin;
       const events = [];
       const onData = () => events.push("data");
-      stdin.on("end", () => events.push("end"));
-      stdin.on("close", () => events.push("close"));
-      ${beforeDestroy}
-      stdin.destroy();
-      ${afterDestroy}
-      // Nothing reports that stdin still holds the event loop. This timer is
-      // unref'd, so it only fires if something else keeps the process alive.
+      const onReadable = () => events.push("readable");
+      const onClose = () => events.push("close");
+      process.on("uncaughtException", err => events.push("uncaught " + err.message));
+      ${body}
+      // Nothing reports that stdin still holds the event loop. This timer is unref'd,
+      // so it only fires if something else keeps the process alive.
       setTimeout(() => {
-        console.log("STILL_ALIVE");
+        events.push("STILL_ALIVE");
         process.exit(1);
       }, 1500).unref();
-      process.on("exit", () => console.log(JSON.stringify({ events, destroyed: stdin.destroyed })));`,
+      process.on("exit", () => console.log("RESULT " + JSON.stringify({ events, destroyed: stdin.destroyed })));
+    `;
+  }
+
+  function report(output: string, stderr: string, proc: Bun.Subprocess) {
+    const result = output.match(/RESULT (\{[^}]*\})/);
+    // A child that did not report shows its raw output in the diff.
+    return {
+      ...(result ? JSON.parse(result[1]) : { output, stderr }),
+      exitCode: proc.exitCode,
+      signalCode: proc.signalCode,
+    };
+  }
+
+  // Calls `onReady` when the child prints READY.
+  async function collect(proc: Child, feed?: Feed, onReady?: (feed: Feed, proc: Child) => void) {
+    let stdout = "";
+    const decoder = new TextDecoder();
+    const drain = async () => {
+      for await (const chunk of proc.stdout) {
+        stdout += decoder.decode(chunk, { stream: true });
+        if (feed && onReady && stdout.includes("READY")) {
+          onReady(feed, proc);
+          onReady = undefined;
+        }
+      }
+    };
+    const [stderr] = await Promise.all([proc.stderr.text(), drain(), proc.exited]);
+    return report(stdout, stderr, proc);
+  }
+
+  async function run(kind: Kind, body: string, onReady?: (feed: Feed, proc: Child) => void) {
+    const cmd = [bunExe(), "-e", child(body)];
+    if (kind === "pipe") {
+      await using proc = Bun.spawn({ cmd, stdin: "pipe", stdout: "pipe", stderr: "pipe", env: bunEnv });
+      const feed: Feed = data => {
+        try {
+          Promise.resolve(proc.stdin.write(data)).catch(ignoreEpipe);
+          Promise.resolve(proc.stdin.flush()).catch(ignoreEpipe);
+        } catch (err) {
+          ignoreEpipe(err);
+        }
+      };
+      return await collect(proc, feed, onReady);
+    }
+    if (kind === "tty") {
+      let output = "";
+      const decoder = new TextDecoder();
+      const reported = Promise.withResolvers<void>();
+      await using proc = Bun.spawn({
+        cmd,
+        env: bunEnv,
+        terminal: {
+          // Wide enough that ConPTY does not hard-wrap the RESULT line.
+          cols: 200,
+          rows: 24,
+          data(_terminal, chunk) {
+            output += decoder.decode(chunk, { stream: true });
+            if (/RESULT \{[^}]*\}/.test(Bun.stripANSI(output))) reported.resolve();
+          },
+          exit() {
+            reported.resolve();
+          },
+        },
+      });
+      await Promise.all([reported.promise, proc.exited]);
+      proc.terminal?.close();
+      // ConPTY puts VT sequences and CR around the line.
+      return report(Bun.stripANSI(output).replace(/[\r\n]/g, ""), "", proc);
+    }
+    using dir = tempDir("stdin-destroy", { "input.txt": "hello\n" });
+    if (kind === "file") {
+      const stdin = Bun.file(join(String(dir), "input.txt"));
+      await using proc = Bun.spawn({ cmd, stdin, stdout: "pipe", stderr: "pipe", env: bunEnv });
+      return await collect(proc);
+    }
+    const fifo = join(String(dir), "fifo");
+    mkfifo(fifo);
+    // Read-write: the open does not wait for a writer, and the parent is one.
+    const fd = openSync(fifo, "r+");
+    try {
+      const env = { ...bunEnv, STDIN_FIFO: fifo };
+      await using proc = Bun.spawn({ cmd, stdin: fd, stdout: "pipe", stderr: "pipe", env });
+      return await collect(proc, data => void writeSync(fd, data), onReady);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  const arming = {
+    "on('data')": `stdin.on("data", onData);`,
+    "on('readable')": `stdin.on("readable", onReadable);`,
+    "resume()": `stdin.resume();`,
+    "ref()": `stdin.ref();`,
+    "read(n)": `stdin.read(1);`,
+  };
+  // [title, stdin kinds, code, events]
+  const releases: [string, readonly Kind[], string, string[]][] = [];
+  for (const [name, arm] of Object.entries(arming)) {
+    // File stdin has no ref().
+    const armKinds = name === "ref()" ? socketLike : kinds;
+    releases.push([
+      `${name} then destroy()`,
+      armKinds,
+      `stdin.on("close", onClose); ${arm} stdin.destroy();`,
+      ["close"],
+    ]);
+    releases.push([
+      `${name} then destroy(err)`,
+      armKinds,
+      `${arm} stdin.destroy(new Error("mine"));`,
+      ["uncaught mine"],
+    ]);
+  }
+  // These paths are the same JavaScript for every socket-like kind. The TTY class has its own constructor.
+  const pipeAndTty = ["pipe", "tty"] as const;
+  releases.push(
+    [
+      "resume(), removeAllListeners() then destroy()",
+      pipeAndTty,
+      `stdin.resume(); stdin.removeAllListeners(); stdin.destroy();`,
+      [],
     ],
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: bunEnv,
+    [
+      "on('data'), removeAllListeners('close') then destroy()",
+      pipeAndTty,
+      `stdin.on("data", onData); stdin.removeAllListeners("close"); stdin.destroy();`,
+      [],
+    ],
+    [
+      "on('data'), destroy() then removeAllListeners()",
+      pipeAndTty,
+      `stdin.on("data", onData); stdin.destroy(); stdin.removeAllListeners();`,
+      [],
+    ],
+    [
+      "destroy(err) with an 'error' listener that throws",
+      pipeAndTty,
+      `stdin.on("error", () => { throw new Error("from error listener"); });
+       stdin.on("data", onData);
+       stdin.destroy(new Error("mine"));`,
+      ["uncaught from error listener"],
+    ],
+    [
+      "destroy() with a 'close' listener that throws",
+      pipeAndTty,
+      `stdin.prependListener("close", () => { throw new Error("from close listener"); });
+       stdin.on("data", onData);
+       stdin.destroy();`,
+      ["uncaught from close listener"],
+    ],
+    [
+      "on('data') then push(null)",
+      pipeAndTty,
+      `stdin.on("end", () => events.push("end")); stdin.on("data", onData); stdin.push(null);`,
+      ["end"],
+    ],
+    [
+      "on('data'), emit('end') then destroy()",
+      pipeAndTty,
+      `stdin.on("data", onData); stdin.emit("end"); stdin.destroy();`,
+      [],
+    ],
+    [
+      "destroy(err) after the first turn",
+      pipeAndTty,
+      `stdin.on("data", onData); setImmediate(() => stdin.destroy(new Error("mine")));`,
+      ["uncaught mine"],
+    ],
+    [
+      "destroy() then removeAllListeners() after the first turn",
+      pipeAndTty,
+      `stdin.on("data", onData); setImmediate(() => { stdin.destroy(); stdin.removeAllListeners(); });`,
+      [],
+    ],
+    // The four ways to take the native reader, and the listener that starts the flow.
+    [
+      "destroy() then resume()",
+      ["pipe"],
+      `stdin.on("data", onData); stdin.destroy(); setImmediate(() => stdin.resume());`,
+      [],
+    ],
+    [
+      "destroy() then ref()",
+      ["pipe"],
+      `stdin.on("data", onData); stdin.destroy(); setImmediate(() => stdin.ref());`,
+      [],
+    ],
+    [
+      "destroy() then read(n)",
+      ["pipe"],
+      `stdin.on("data", onData); stdin.destroy(); setImmediate(() => stdin.read(5));`,
+      [],
+    ],
+    [
+      "destroy() then on('readable')",
+      ["pipe"],
+      `stdin.destroy(); setImmediate(() => stdin.on("readable", onReadable));`,
+      [],
+    ],
+    ["destroy() then on('data')", ["pipe"], `stdin.destroy(); setImmediate(() => stdin.on("data", onData));`, []],
+  );
+
+  test.concurrent.each(
+    releases.flatMap(([title, rowKinds, body, events]) => rowKinds.map(kind => [kind, title, body, events] as const)),
+  )("%s stdin: %s lets the process exit", async (kind, _title, body, events) => {
+    expect(await run(kind, body)).toEqual({ events, destroyed: true, exitCode: 0, signalCode: null });
   });
-  // The parent never closes the pipe: the child must exit because of destroy(), not because of EOF.
-  expect(await stdioResult(proc)).toEqual({
-    stdout: JSON.stringify({ events: ["close"], destroyed: true }) + "\n",
-    exitCode: 0,
+
+  test.concurrent.each(kinds)("%s stdin: destroy() in the first turn runs _destroy before it returns", async kind => {
+    // File stdin opens like any fs.ReadStream, so its _destroy waits for the construct ticks, as in Node.
+    const sync = kind !== "file";
+    const body = `
+      let called = false;
+      stdin.on("data", onData);
+      stdin.destroy(null, () => { called = true; });
+      events.push("callback=" + called, "closed=" + stdin.closed);
+    `;
+    expect(await run(kind, body)).toEqual({
+      events: [`callback=${sync}`, `closed=${sync}`],
+      destroyed: true,
+      exitCode: 0,
+      signalCode: null,
+    });
   });
-  expect(proc.signalCode).toBeNull();
+
+  test.concurrent.each(kinds)("%s stdin: on('data') after destroy() does not start the flow", async kind => {
+    const body = `
+      stdin.on("resume", () => events.push("resume"));
+      stdin.destroy();
+      stdin.on("data", onData);
+      events.push("flowing=" + stdin.readableFlowing);
+    `;
+    expect(await run(kind, body)).toEqual({ events: ["flowing=null"], destroyed: true, exitCode: 0, signalCode: null });
+  });
+
+  test.concurrent("emit('close') by the user does not destroy stdin", async () => {
+    const body = `
+      stdin.on("data", chunk => {
+        events.push("data " + chunk + " destroyed=" + stdin.destroyed);
+        stdin.destroy();
+      });
+      stdin.emit("close");
+      console.log("READY");
+    `;
+    expect(await run("pipe", body, feed => feed("hello"))).toEqual({
+      events: ["data hello destroyed=false"],
+      destroyed: true,
+      exitCode: 0,
+      signalCode: null,
+    });
+  });
+
+  test.concurrent("destroy(err) with no 'error' listener and no uncaughtException handler is fatal", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `process.stdin.on("data", () => {});
+        process.stdin.destroy(new Error("mine"));
+        process.on("exit", code => console.log("exit " + code));`,
+      ],
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: bunEnv,
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stdout).toBe("exit 1\n");
+    expect(stderr).toContain("error: mine");
+    expect(exitCode).toBe(1);
+    expect(proc.signalCode).toBeNull();
+  });
+
+  // destroy() on a process.stdin that never read must not pause the source that Bun.stdin shares with it.
+  describe.each(socketLike.filter(kind => kind !== "tty"))("%s stdin: Bun.stdin.stream() reads", kind => {
+    test.concurrent.each([
+      ["destroy()", `stdin.destroy();`, ["read hello"]],
+      ["destroy(err)", `stdin.destroy(new Error("mine"));`, ["uncaught mine", "read hello"]],
+    ] as const)("after %s on a process.stdin that never read", async (_title, destroy, events) => {
+      const body = `
+        ${destroy}
+        setImmediate(async () => {
+          const read = Bun.stdin.stream().getReader().read();
+          console.log("READY");
+          events.push("read " + Buffer.from((await read).value));
+          process.exit(0);
+        });
+      `;
+      expect(await run(kind, body, feed => feed("hello"))).toEqual({
+        events: [...events],
+        destroyed: true,
+        exitCode: 0,
+        signalCode: null,
+      });
+    });
+  });
+
+  describe.skipIf(isWindows)("POSIX", () => {
+    // numPolls counts the polls of the event loop. On Windows the same field is libuv's active handle count.
+    test.concurrent.each(["pipe", "fifo", "tty"] as const)(
+      "%s stdin: destroy(err) removes the poll on fd 0",
+      async kind => {
+        const body = `
+        const { getEventLoopStats } = require("bun:internal-for-testing");
+        const idle = getEventLoopStats().numPolls;
+        stdin.on("data", onData);
+        const armed = getEventLoopStats().numPolls;
+        stdin.destroy(new Error("mine"));
+        events.push("armed=+" + (armed - idle), "destroyed=+" + (getEventLoopStats().numPolls - idle));
+      `;
+        expect(await run(kind, body)).toEqual({
+          events: ["armed=+1", "destroyed=+0", "uncaught mine"],
+          destroyed: true,
+          exitCode: 0,
+          signalCode: null,
+        });
+      },
+    );
+
+    test.concurrent("bytes written after destroy(err) stay in the pipe", async () => {
+      const body = `
+        const fs = require("node:fs");
+        // The process outlives its stdin, as a server does.
+        const alive = setInterval(() => {}, 1000);
+        stdin.on("data", onData);
+        stdin.destroy(new Error("mine"));
+        process.on("SIGUSR2", () => {
+          // The bytes were written before the signal. Two more turns of the loop: a reader that still watched fd 0 has taken them.
+          setImmediate(() => setImmediate(() => {
+            const fd = fs.openSync(process.env.STDIN_FIFO, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+            const buffer = Buffer.alloc(16);
+            try {
+              events.push("left " + buffer.toString("utf8", 0, fs.readSync(fd, buffer)));
+            } catch (err) {
+              events.push("left " + err.code);
+            }
+            clearInterval(alive);
+          }));
+        });
+        console.log("READY");
+      `;
+      const onReady = (feed: Feed, proc: Child) => {
+        feed("later");
+        proc.kill("SIGUSR2");
+      };
+      expect(await run("fifo", body, onReady)).toEqual({
+        events: ["uncaught mine", "left later"],
+        destroyed: true,
+        exitCode: 0,
+        signalCode: null,
+      });
+    });
+  });
 });
 
 test.concurrent("stdin should allow process to exit when paused", async () => {
@@ -605,9 +954,6 @@ describe.skipIf(isWindows)("pipe backpressure", () => {
     // The child exits under backpressure having accepted only a few KB, so
     // the queued writes here fail with EPIPE; that is the expected outcome.
     const chunk = Buffer.alloc(1024 * 1024, 0x78);
-    const ignoreEpipe = (e: any) => {
-      if (e?.code !== "EPIPE") throw e;
-    };
     for (let i = 0; i < feedMB; i++) {
       const r = proc.stdin.write(chunk);
       if (r && typeof (r as any).then === "function") (r as Promise<number>).catch(ignoreEpipe);
