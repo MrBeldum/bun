@@ -2427,15 +2427,20 @@ mod posix_impl {
             const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
             const AT_STATX_DONT_SYNC: c_int = 0x4000;
             let mut buf = core::mem::MaybeUninit::<lx::statx>::uninit();
-            // SAFETY: `path` is NUL-terminated; `buf` is a valid out-param.
-            let rc = unsafe {
-                lx::statx(
-                    dir.native(),
-                    path.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
-                    0,
-                    buf.as_mut_ptr(),
-                )
+            let rc = loop {
+                // SAFETY: `path` is NUL-terminated; `buf` is a valid out-param.
+                let rc = unsafe {
+                    lx::statx(
+                        dir.native(),
+                        path.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
+                        0,
+                        buf.as_mut_ptr(),
+                    )
+                };
+                if rc >= 0 || SystemErrno::init(last_errno() as _) != Some(E::EINTR) {
+                    break rc;
+                }
             };
             if rc == 0 {
                 // SAFETY: rc == 0 ⇒ kernel populated the buffer.

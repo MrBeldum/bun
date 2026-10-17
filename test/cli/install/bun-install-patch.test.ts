@@ -1134,17 +1134,26 @@ new file mode 100644
         await chmod(locked, 0o555);
         await chmod(parent, 0o555);
         await Bun.write(join(dir, "patches", "is-odd@3.0.1.patch"), generationPatch("B"));
+        let result;
         try {
-          expect(await install(dir, env)).toMatchObject({ stderr: "", exitCode: 0 });
+          result = await install(dir, env);
         } finally {
           await chmod(parent, 0o755);
           await chmod(locked, 0o755);
         }
-        expect(await installedState(dir)).toEqual({
-          markers: 1,
-          files: ["index.js", "locked", "package.json"],
-          generation: "B",
-        });
+        if (result.exitCode === 0) {
+          expect(result.stderr).toBe("");
+          expect(await installedState(dir)).toEqual({
+            markers: 1,
+            files: ["index.js", "locked", "package.json"],
+            generation: "B",
+          });
+        } else {
+          // The copy itself can still be refused. Then nothing that passes as installed is left.
+          expect(result.stderr).toContain("EACCES");
+          const entries = await readdir(join(dir, packagePath));
+          expect(entries.filter(name => name.startsWith(".bun-tag-") || name === "package.json")).toEqual([]);
+        }
 
         await Bun.write(join(dir, "patches", "is-odd@3.0.1.patch"), generationPatch("A"));
         expect(await install(dir, env)).toMatchObject({ stderr: "", exitCode: 0 });

@@ -1726,11 +1726,14 @@ impl<'a> Installer<'a> {
                             let Err(err) = cloner.clone() else {
                                 break 'backend Ok(());
                             };
-                            backend = self.set_backend(match err.get_errno() {
-                                sys::Errno::EXDEV => InstallMethod::Copyfile,
-                                sys::Errno::EOPNOTSUPP => InstallMethod::Hardlink,
+                            backend = match err.get_errno() {
+                                sys::Errno::EXDEV => self.set_backend(InstallMethod::Copyfile),
+                                sys::Errno::EOPNOTSUPP => self.set_backend(InstallMethod::Hardlink),
+                                // The directory stays (a mount point, or a parent that refuses
+                                // both the rename and the delete): linked into, file by file.
+                                sys::Errno::EEXIST if link_in_place => InstallMethod::Hardlink,
                                 _ => break 'backend Err(err),
-                            });
+                            };
                             continue 'backend;
                         }
                     }

@@ -2419,7 +2419,7 @@ pub(crate) fn install_isolated_packages(
                             let mut hash_buf: install::BuntagHashBuf = Default::default();
                             let marker = installer::installed_marker(pkg_res.tag, &patch_info, &mut hash_buf);
                             // A copy with the markers of two patches was written on top of another.
-                            if marker.starts_with(crate::package_install::PATCH_TAG_PREFIX) {
+                            if marker.starts_with(crate::BUN_HASH_TAG) {
                                 // `open` follows the link of an entry that left the global store.
                                 let Ok(package) = sys::Dir::open(store_path.slice()) else {
                                     break 'needs_install true;

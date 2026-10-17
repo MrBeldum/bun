@@ -9,11 +9,9 @@ import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isLinux, isMacOS, isRoot, isWindows, readdirSorted, tempDir } from "harness";
 import {
   chmodSync,
-  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -304,18 +302,40 @@ describe.skipIf(!isWindows)("install backends on Windows", () => {
 
   /**
    * Runs the install while a file inside `node_modules/pkg/<leftoverDir>` is
-   * held open. A previous install of the package then cannot be moved out of
-   * the way, so the walker runs into the existing directory.
+   * held open without FILE_SHARE_DELETE, as a scanner holds one. A previous
+   * install of the package then cannot be moved out of the way, nor can the
+   * held file and its directories be deleted, so the walker runs into the
+   * existing directory.
    */
   async function installOverLeftover(projectDir: string, leftoverDir: string) {
-    const leftover = join(projectDir, "node_modules", "pkg", leftoverDir);
+    const pkg = join(projectDir, "node_modules", "pkg");
+    const leftover = join(pkg, leftoverDir);
     mkdirSync(leftover, { recursive: true });
     writeFileSync(join(leftover, "held-open.txt"), "");
-    const held = openSync(join(leftover, "held-open.txt"), "r");
+    await using holder = Bun.spawn({
+      cmd: [
+        bunExe(),
+        join(import.meta.dir, "bun-install-windows-rename-retry-fixture.ts"),
+        pkg,
+        leftoverDir.split(/[\\/]/)[0],
+        "60000",
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+      stdin: "ignore",
+    });
+    let output = "";
+    for await (const chunk of holder.stdout) {
+      output += new TextDecoder().decode(chunk, { stream: true });
+      if (output.includes("HELD") || output.includes("MISSED")) break;
+    }
+    expect(output).toContain("HELD");
     try {
       return await install(projectDir, "copyfile");
     } finally {
-      closeSync(held);
+      holder.kill();
+      await holder.exited;
     }
   }
 

@@ -526,10 +526,11 @@ pub(crate) fn remove_placed_package(
         &node_modules,
         &bun_core::ZBox::from_bytes(alias),
         bun_core::fast_random(),
-        package_install::IfRefused::ClearInPlace,
+        package_install::IfMounted::Unmark,
     ) {
         Ok(Some(old)) => node_modules.delete_tree(old.as_bytes()),
-        _ => node_modules.delete_tree(alias),
+        Ok(None) => Ok(()),
+        Err(_) => node_modules.delete_tree(alias),
     };
     crate::prune::prune_bins(&node_modules);
 }
