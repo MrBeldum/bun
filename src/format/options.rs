@@ -168,10 +168,8 @@ pub struct ParsedPart {
     pub diagnostics: (u32, u32),
 }
 
-/// What is called with the file that the [`Part`] has been parsed into, the statement that the part is (a type is the type
-/// of an alias), and where it is. The file is that of the whole text: every offset in it is one of the text, and the part
-/// is its one statement. Once it returns, the caller forgets the part, nodes, comments and diagnostics, as if it had not
-/// been parsed: a part is read no further, and its place can be read again, for a retry or a probe.
+/// Called with the file of the whole text that the [`Part`] has been parsed into, the statement that the part is (a type
+/// is the type of an alias), and where it is. The caller forgets the part once this returns.
 pub type ThenWithEnd<'t> =
     &'t mut dyn for<'b> FnMut(&'b bun_lint::ast::File<'b>, bun_lint::ast::Stmt<'b>, ParsedPart);
 

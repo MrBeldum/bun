@@ -180,10 +180,8 @@ struct TextLazies {
     unicode_escape_range: UnicodeEscapeRange,
 }
 
-/// What a [`File`] finds in its text alone, not in its tree: where its backslashes are. One `File` finds it out the first
-/// time it is asked. Whoever makes one `File` after another over the same text, as the driver does for each part of a Svelte
-/// component, makes one of these for the text and hands it to each `File` ([`File::sharing_text_facts`]): the text is
-/// searched once, not once per `File`.
+/// What a [`File`] finds in its text alone (its backslashes), for the `File`s made one after another over the same text,
+/// such as the parts of a Svelte component: [`File::sharing_text_facts`] searches the text once, not once per `File`.
 pub struct TextFacts<'t> {
     text: &'t [u8],
     lazies: TextLazies,
@@ -334,8 +332,7 @@ impl<'a> File<'a> {
         self
     }
 
-    /// With what other `File`s over the same text have found in it. After [`File::with_text`], if that is called: `facts` are
-    /// of the text as the file has it.
+    /// With what other `File`s over the same text have found in it. After [`File::with_text`].
     pub fn sharing_text_facts(mut self, facts: &'a TextFacts<'a>) -> File<'a> {
         assert!(
             core::ptr::eq(facts.text, self.hir.text),
@@ -433,8 +430,7 @@ impl<'a> File<'a> {
         Self::first_of_typescript_among(self.hir.diagnostics)
     }
 
-    /// [`File::first_of_typescript_in_javascript`] among the diagnostics with these ids only: those
-    /// of one part of a file that is parsed part by part.
+    /// [`File::first_of_typescript_in_javascript`] among the diagnostics with these ids only.
     pub fn first_of_typescript_in_javascript_among(
         &self,
         diagnostics: core::ops::Range<u32>,
@@ -456,8 +452,7 @@ impl<'a> File<'a> {
         List::ids(self, self.body)
     }
 
-    /// The statement with this id of the HIR: for a caller that parsed one part of the file and
-    /// was told which statement that made. It need not be among [`File::body`].
+    /// The statement with this id of the HIR, which need not be among [`File::body`].
     #[inline]
     pub fn stmt_by_id(&'a self, id: hir::StmtId) -> Stmt<'a> {
         debug_assert!(id.idx() < self.hir.stmts.len());

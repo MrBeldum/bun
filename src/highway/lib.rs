@@ -532,8 +532,7 @@ impl ScannerStopsBuffer {
         self.filled(text)
     }
 
-    /// The stops of `text`, which [`ScannerStopsBuffer::find`] or [`ScannerStopsBuffer::find_again`] has found and
-    /// the caller has held on to since: nothing is run over the text again, not even in a debug build.
+    /// The stops that [`ScannerStopsBuffer::find`] has found for `text`: nothing runs over the text again.
     pub fn found(&self, text: &[u8]) -> ScannerStops<'_> {
         debug_assert!(
             self.filled_for == Some((text.as_ptr().addr(), text.len())),

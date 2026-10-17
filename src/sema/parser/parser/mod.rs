@@ -320,9 +320,8 @@ struct Seed<'a> {
 }
 
 impl<'a> Seed<'a> {
-    /// A lexer at the start of `text`, or of `part`, that reads it as the options say, with what the scratch lends the
-    /// parser: `stacks` and `declared` are begun here, `names` and `stops` by the caller. `file` is what the parser builds
-    /// into: its comments are the lexer's while it runs.
+    /// A lexer at the start of `text`, or of `part`, and what the scratch lends the parser. `names` and `stops` are begun
+    /// by the caller.
     fn new(
         text: &'a [u8],
         options: Options,
@@ -375,8 +374,7 @@ impl<'a> Seed<'a> {
     }
 }
 
-/// Runs `$method` of the parser that `$seed` asks for: the general one, or one of the two that are not, by whether it
-/// attaches comments. No other instantiation of [`Parser`] exists.
+/// Runs `$method` of the one of the three instantiations of [`Parser`] that `$seed` asks for.
 macro_rules! with_parser {
     ($seed:expr, $method:ident($($arg:expr),*)) => {{
         let seed = $seed;
@@ -529,13 +527,9 @@ pub(crate) struct PartHarvest {
     pub(crate) comment_directives: Vec<CommentDirective>,
 }
 
-/// Parses `part` of `text` into `file`, which holds the parts before it at their offsets in `text`, with the atoms that
-/// `scratch.names` has begun. It does what is done for each part: the lists of `file` grow by the nodes, comments and
-/// diagnostics of this part, and `rare_syntax` by what was seen in it. What is done once for a file is left to the caller:
-/// `source_len`, `kind` and `is_js`, `body`, `comment_directives`, `mentioned`, the pragmas, and the sorts of
-/// `diagnostics`, `body_starts`, `parens`, `jsx_expressions`, `modifiers_of_props` and `import_attributes`. On a
-/// refusal the lists of `file` hold what the part added before it was refused: the caller truncates them. The caller
-/// has found the stops of `text` in `scratch.stops` once for all of its parts.
+/// Parses `part` of `text` behind the parts that `file` holds, with the atoms and the stops that the caller has begun in
+/// `scratch`. What a file has once (`body`, `comment_directives`, `mentioned`, the pragmas, the sorts of the lists that are
+/// searched by halves) is the caller's, and so is truncating `file` on a refusal.
 pub(crate) fn run_part<'a>(
     text: &'a [u8],
     options: Options,
@@ -679,9 +673,8 @@ impl<'a, const GENERAL: bool, const COMMENTS: bool> Parser<'a, GENERAL, COMMENTS
         }
     }
 
-    /// A [`crate::Part`] of a file that holds the parts before it: what [`Parser::source_file`] and [`Parser::parse_into`]
-    /// do for each part, and nothing of what they do once for the file. See [`run_part`]. Leaves the file in `file`: the
-    /// value is the one statement of the part, and the rest.
+    /// [`Parser::parse_into`] for one [`crate::Part`] of a file that holds the parts before it: see [`run_part`]. The
+    /// value is the one statement of the part.
     fn part_into(mut self, goal: crate::Goal, file: &mut FileBuilder) -> (StmtId, Harvest<'a>) {
         let since = bun_sema::ecmascript::Since {
             stmts: self.f.stmts.len() as u32,

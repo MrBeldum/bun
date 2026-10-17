@@ -45,8 +45,7 @@ fn position_of(sign: u8, text: &[u8], from: u32) -> u32 {
     from + strings::index_of_char(rest, sign).unwrap_or(0)
 }
 
-/// The index in each list of `FileBuilder` that `report_syntax_of_typescript_since` looks at from:
-/// the lengths of the lists before the part of the file it reports on was parsed.
+/// The lengths of the lists of a `FileBuilder` before the part that `report_syntax_of_typescript_since` reports on.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Since {
     pub stmts: u32,
@@ -73,8 +72,7 @@ pub fn report_syntax_of_typescript(file: &mut FileBuilder, text: &[u8]) {
     report_syntax_of_typescript_since(file, text, Since::default());
 }
 
-/// `report_syntax_of_typescript` over the nodes from `since` on only: those of the part of the
-/// file parsed after `since` was taken.
+/// `report_syntax_of_typescript` over the nodes from `since` on only.
 pub fn report_syntax_of_typescript_since(file: &mut FileBuilder, text: &[u8], since: Since) {
     let mut found: Vec<Found> = Vec::new();
     for stmt in from(&file.stmts, since.stmts) {

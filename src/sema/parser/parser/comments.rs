@@ -133,8 +133,7 @@ pub(crate) struct CommentTracker {
 }
 
 impl CommentTracker {
-    /// A tracker for a parser whose lexer already holds `already_tracked` comments of earlier parts of the same file. They
-    /// belong to nodes that were finished before, so they are never pending again.
+    /// For a lexer that already holds `already_tracked` comments of earlier parts of the file, which are never pending again.
     pub(crate) fn starting_after(already_tracked: usize) -> Self {
         CommentTracker {
             tracked_count: already_tracked as u32,

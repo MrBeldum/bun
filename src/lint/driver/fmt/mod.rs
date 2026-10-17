@@ -529,10 +529,8 @@ fn parse_code(
     with_file(&how, code.text, |file, _, _| then(file));
 }
 
-/// For the expressions in a component of Svelte. All parts go into one file over the whole text, at their real offsets,
-/// one at a time: every part is taken out of it again once `then` is through with it. Nothing here reads a part again,
-/// and the file is bound anew for each part over all that it holds: a component with thousands of expressions must not
-/// bind them all for each.
+/// For the expressions in a component of Svelte: one file over the whole text, which holds one part at a time. The file is
+/// bound anew for each part over all that it holds, so a part is rolled back once `then` is through with it.
 fn parse_parts(text: &[u8], then: &mut dyn FnMut(ParsePart<'_>)) {
     let names = Session::new();
     let (atoms, plain) = (Interner::new_in(&names), Resolved::default());

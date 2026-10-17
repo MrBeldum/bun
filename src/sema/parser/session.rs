@@ -1,5 +1,4 @@
-//! The parts of one text ([`Part`]), parsed one after the other into one file at their offsets in the text. Each part is
-//! parsed once; a part that is not wanted is rolled back, so that what a probe or a retry has added is not in the file.
+//! The parts of one text ([`Part`]), parsed one after the other into one file at their offsets in the text.
 
 use crate::names::FileAtoms;
 use crate::parser::{self, FileLens, file_lens, recycled_file, truncate_file};
@@ -10,8 +9,8 @@ use bun_sema::resolve::Dialect;
 use bun_sema::util::SharedSort;
 use core::ops::Range;
 
-/// A text whose parts are being parsed, and the file they go into. There is no JSX, `await` is a keyword, and nothing is
-/// recovered from. The file has its own atoms: [`Session::atoms`].
+/// A text whose parts are being parsed, and the file they go into, with its own atoms. No JSX, `await` is a keyword,
+/// nothing is recovered from.
 pub struct Session<'t> {
     text: &'t [u8],
     dialect: Dialect,
@@ -50,9 +49,8 @@ pub struct Mark {
     may_bind_a_parameter_twice: bool,
 }
 
-/// Where the lists that are looked up by a binary search ended before a part: [`SortedLens::sort_since`] sorts what the
-/// part appended, as `Parser::source_file` sorts the lists of a whole file once. The ids of a part are all greater than
-/// those of the parts before it, so the lists stay sorted as a whole.
+/// Where the lists that are searched by halves ended before a part: [`SortedLens::sort_since`] sorts what the part
+/// appended, which keeps the lists sorted as a whole, since the ids of a part are greater than those before it.
 #[derive(Copy, Clone)]
 struct SortedLens {
     diagnostics: usize,
@@ -124,11 +122,8 @@ impl<'t> Session<'t> {
         }
     }
 
-    /// Parses the part of the text from `from` to `until` behind the parts kept so far, and says where it is in the file.
-    /// The text ends at `until` for the parser, and what follows the part is not read but one token. `is_javascript`: only
-    /// in a JavaScript file is the syntax of TypeScript reported as a `DiagnosticKind::Js`. On an error nothing of the
-    /// part stays in the file. What a whole file has sorted once, the part has sorted over what it appended, as the file
-    /// is read after each part: see [`SortedLens`].
+    /// Parses the part from `from` to `until` behind the parts kept so far, and says where it is in the file. What follows
+    /// the part is not read but one token. On an error nothing of the part stays in the file.
     pub fn part_at(
         &mut self,
         goal: Goal,
@@ -179,8 +174,7 @@ impl<'t> Session<'t> {
         let file = &mut *self.file;
         lens.sort_since(file, self.dialect);
         file.comment_directives.extend(parsed.comment_directives);
-        // `body` is a range of `ids`, which the lists in the part have grown too: it is made anew at the end of `ids` unless
-        // it is still there.
+        // `body` is a range of `ids`, which the part has grown too: it is made anew at the end unless it is still there.
         let body = file.body;
         let is_at_end = body.start + body.len == file.ids.len() as u32;
         file.body = match is_at_end && body.len as usize + 1 == self.parts.len() {

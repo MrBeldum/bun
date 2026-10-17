@@ -177,20 +177,8 @@ impl FromParser<'_> {
         }
     }
 
-    /// What `read` makes of the statement that the component has at `at`, which is in the file at that place. `until`: where
-    /// the component ends for the parser. The part is forgotten once `read` is through with it: the driver of `bun fmt`
-    /// keeps one part in the file at a time, so that binding the file stays the work of one part (`parse_parts`).
-    ///
-    /// The parts that the parser of the component asks for, all from where it stands up to `until`:
-    ///
-    /// - `expression_at`: an `Expression`. In JavaScript a result with an `as`, a `satisfies` or a `!` (`stops_at`) is asked
-    ///   for again with `until` at that `as`: the last one ends where the component goes on. `read_expression_of_each` asks
-    ///   again with a shorter `until` after an error, behind `ends_of_expressions`.
-    /// - `statement_at` at a `type`: an `Expression` that is a probe: the component reads the place again as an expression
-    ///   (parser.rs, `Statement::Expression => return Ok(None)`). Elsewhere a `Declaration`.
-    /// - `type_at`: a `Type`, behind the `:` of a pattern or of a `@const`.
-    ///
-    /// `check_pattern`, `check_parameters` and `ends_of_expressions` are programs of their own, no parts.
+    /// What `read` makes of the statement that the component has at `at`, and of where it is. `until`: where the component
+    /// ends for the parser. The part is forgotten once `read` is through with it.
     fn part<R>(
         &mut self,
         (mut until, at): (usize, usize),

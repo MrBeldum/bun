@@ -535,15 +535,11 @@ impl PartError {
     }
 }
 
-// `BUN_DEBUG_sema_parts=1`: one `part` line per [`Parts::parse`] here, one `parse` line per parser run where the parser
-// runs ([`session::Session`]), and one `refused` line per part that no run parsed, to count the runs per part. Before the
-// session (5866b5f13d) each part that parsed ran the parser once more over its cut text, from offset 0, after the same
-// runs as now: that tree was never built with this scope, so its count is derived, `parse + part - refused`. Over a tree
-// of components: `BUN_DEBUG_sema_parts=1 bun fmt --check <dir> 2>&1 | grep -c 'sema_parts\] parse '` (`part `, `refused `).
+// `BUN_DEBUG_sema_parts=1`: a `part` line per [`Parts::parse`], a `parse` line per parser run, a `refused` line per part
+// that no run parsed: the runs per part.
 bun_core::declare_scope!(sema_parts, hidden);
 
-/// Parses the parts of one text into one file, at their offsets in the text: see [`Part`] and [`session::Session`]. What the
-/// scanner wants to know of the whole text is found out once.
+/// Parses the parts of one text into one file, at their offsets in the text: see [`session::Session`].
 pub struct Parts<'t> {
     text: &'t [u8],
     /// Begun with the dialect of the first part, which every part is read in, and where it was before any part.
@@ -579,9 +575,7 @@ impl<'t> Parts<'t> {
     }
 
     /// Parses `part` behind the parts kept so far, and calls `then` with the file of them all, the interner of its atoms,
-    /// the whole text, and where the part is in the file: its statement, its end, its comments and its diagnostics. Every
-    /// offset in the file is one of the text. There is no JSX, `await` is a keyword, and nothing is recovered from. A part
-    /// that is not kept is forgotten by [`Parts::rollback`].
+    /// the whole text, and where the part is in the file. A part that is not kept is forgotten by [`Parts::rollback`].
     pub fn parse<'s, R>(
         &mut self,
         dialect: Dialect,
