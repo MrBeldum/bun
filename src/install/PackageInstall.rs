@@ -2568,8 +2568,7 @@ impl<'a> PackageInstall<'a> {
     ) -> InstallResult {
         if !skip_delete
             && self.destination_dir_subpath.as_bytes() != b"."
-            && let Err(err) =
-                self.uninstall_before_install(destination_dir, IfMounted::Unmark)
+            && let Err(err) = self.uninstall_before_install(destination_dir, IfMounted::Unmark)
         {
             return InstallResult::fail(err.into(), Step::RemovingOldDir);
         }
