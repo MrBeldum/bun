@@ -9,7 +9,7 @@ namespace Bun::Bindgen {
 // The bytes of a BufferSource or of a Blob whose bytes are in memory, where they are now. The data is not null.
 std::span<const uint8_t> bytesOfBlobOrBuffer(JSC::JSValue);
 
-// Whether it is a Blob. Throws for one whose bytes are not in memory: a file.
+// Whether it holds a Blob: a Blob, or a `Bun.build()` output. Throws for one whose bytes are not in memory: a file.
 bool checkInMemoryBlob(JSC::JSGlobalObject&, JSC::JSValue);
 
 // The UTF-8 of a string, or the bytes of a Blob or a buffer where they are, which only JavaScript and a thread that writes a shared buffer change.
