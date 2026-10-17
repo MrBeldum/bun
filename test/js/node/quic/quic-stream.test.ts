@@ -2,6 +2,7 @@
 // `onwanttrailers`, records `trailers_pending` rather than `fin_pending`)
 // must deliver it with a FIN, never retract it with a RESET_STREAM.
 import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, withoutAsanQuarantine } from "harness";
 import { createPrivateKey } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -373,4 +374,42 @@ describe("headers queued before the handshake", () => {
     expect(await Promise.race([gotHeaders.promise, closed])).toBe("/queued");
     client.close();
   });
+});
+
+// A session keeps the events of its streams in a queue, and user code can
+// destroy a stream while its events still wait there. When the destroyed
+// stream is collected, the next stream of the session can get the same
+// allocation. The waiting events must not reach that stream.
+describe.concurrent("a stream that takes the allocation of a destroyed stream", () => {
+  async function runFixture(name: string) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(import.meta.dir, name), join(keysDir, "agent1-key.pem"), join(keysDir, "agent1-cert.pem")],
+      // The release allocator hands a freed block out again at once. ASAN does
+      // so only without its quarantine.
+      env: withoutAsanQuarantine(bunEnv),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  // `stderr` holds the ExperimentalWarning of a clean run, or the report of a
+  // crash. It is in the compared object so that a failure shows it. The
+  // timeout is for a debug build, where one child needs about 4 seconds.
+  test("is not reported closed by the destroyed stream's close", async () => {
+    expect(await runFixture("quic-stream-recycled-close-fixture.ts")).toEqual({
+      stdout: JSON.stringify({ opened: 16, delivered: 16, closedBeforeSent: [] }) + "\n",
+      stderr: expect.any(String),
+      exitCode: 0,
+    });
+  }, 30000);
+
+  test("does not receive the destroyed stream's response headers", async () => {
+    expect(await runFixture("quic-stream-recycled-headers-fixture.ts")).toEqual({
+      stdout: JSON.stringify(Array.from({ length: 16 }, (_, id) => ["/fresh/" + id])) + "\n",
+      stderr: expect.any(String),
+      exitCode: 0,
+    });
+  }, 30000);
 });

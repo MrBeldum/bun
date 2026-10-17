@@ -277,31 +277,31 @@ pub(super) enum SessionEvent {
     },
     Closed,
     StreamReady {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
         remote: bool,
     },
     StreamWake {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
     },
     StreamDrain {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
     },
     StreamBlocked {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
     },
     StreamReset {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
         code: u64,
     },
     StreamStopSending {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
         code: u64,
     },
     StreamWantsTrailers {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
     },
     StreamHeaders {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
         pairs: Vec<Vec<u8>>,
         kind: u32,
     },
@@ -309,7 +309,7 @@ pub(super) enum SessionEvent {
     Keylog(Vec<u8>),
     SessionResume(Vec<u8>),
     StreamClosed {
-        stream: *mut super::stream::QuicStream,
+        stream: super::stream::Key,
     },
     HandshakeConfirmed,
     GoawayReceived,
@@ -382,9 +382,10 @@ pub(crate) struct QuicSession {
     pending_tickets: JsCell<VecDeque<(u64, Vec<u8>)>>,
     close_after_streams: Cell<bool>,
     final_conn_status: JsCell<Option<(c_int, Vec<u8>)>>,
-    pending_local_bidi: JsCell<VecDeque<*mut super::stream::QuicStream>>,
-    pending_local_uni: JsCell<VecDeque<*mut super::stream::QuicStream>>,
-    streams: JsCell<Vec<*mut super::stream::QuicStream>>,
+    pending_local_bidi: JsCell<VecDeque<super::stream::Key>>,
+    pending_local_uni: JsCell<VecDeque<super::stream::Key>>,
+    streams: JsCell<Vec<(super::stream::Key, *mut super::stream::QuicStream)>>,
+    next_stream_key: Cell<u64>,
     handshake_reported: Cell<bool>,
     new_token_reported: Cell<bool>,
     close_when_bound: Cell<bool>,
@@ -433,6 +434,7 @@ impl QuicSession {
             pending_local_bidi: JsCell::new(VecDeque::new()),
             pending_local_uni: JsCell::new(VecDeque::new()),
             streams: JsCell::new(Vec::new()),
+            next_stream_key: Cell::new(0),
             handshake_reported: Cell::new(false),
             new_token_reported: Cell::new(false),
             close_when_bound: Cell::new(false),
@@ -698,30 +700,37 @@ impl QuicSession {
         } else {
             &self.pending_local_bidi
         };
-        // Skip the tombstones `remove_stream` leaves: stopping at the first
+        // Skip the streams `remove_stream` took out: stopping at the first
         // one would strand the live request behind it until the next
         // MAX_STREAMS grant.
-        while let Some(p) = queue.with_mut(VecDeque::pop_front) {
-            if !p.is_null() && self.streams.get().contains(&p) {
-                return Some(p);
+        while let Some(key) = queue.with_mut(VecDeque::pop_front) {
+            if let Some(stream) = self.stream_ptr(key) {
+                return Some(stream);
             }
         }
         None
     }
-    pub(super) fn remove_stream(&self, stream: *mut super::stream::QuicStream) {
-        self.streams.with_mut(|v| v.retain(|&s| s != stream));
-        // Null the slot rather than drop it: these are positional FIFOs
-        // lsquic fulfils in order, and a recycled allocation at the same
-        // address would otherwise bind to the wrong wrapper.
-        for queue in [&self.pending_local_bidi, &self.pending_local_uni] {
-            queue.with_mut(|v| {
-                for slot in v.iter_mut() {
-                    if *slot == stream {
-                        *slot = null_mut();
-                    }
-                }
-            });
-        }
+    /// Creates a stream of this session and adds it to the registry.
+    fn create_stream(
+        &self,
+        global: &JSGlobalObject,
+        session_handle: JSValue,
+        raw: *mut lsquic::lsquic_stream,
+    ) -> JsResult<(super::stream::Key, *mut super::stream::QuicStream, JSValue)> {
+        let key = super::stream::Key(self.next_stream_key.replace(self.next_stream_key.get() + 1));
+        let (qs, handle) = super::stream::QuicStream::create(
+            global,
+            self.vtable,
+            core::ptr::from_ref(self).cast_mut(),
+            key,
+            session_handle,
+            raw,
+        )?;
+        self.streams.with_mut(|v| v.push((key, qs)));
+        Ok((key, qs, handle))
+    }
+    pub(super) fn remove_stream(&self, key: super::stream::Key) {
+        self.streams.with_mut(|v| v.retain(|&(k, _)| k != key));
     }
     fn bump_stream_stat(&self, id: u64, local: bool) {
         let idx = match (id & STREAM_ID_UNI_BIT != 0, local) {
@@ -752,15 +761,8 @@ impl QuicSession {
         }
         // SAFETY: sessions only exist on the JS thread of this realm.
         let global = unsafe { &*global_ptr };
-        match super::stream::QuicStream::create(
-            global,
-            self.vtable,
-            core::ptr::from_ref(self).cast_mut(),
-            self.handle(),
-            raw,
-        ) {
-            Ok((qs, _handle)) => {
-                self.streams.with_mut(|v| v.push(qs));
+        match self.create_stream(global, self.handle(), raw) {
+            Ok((key, qs, _handle)) => {
                 // SAFETY: `qs` was just created.
                 unsafe { (*qs).mark_wrote_to_lsquic() };
                 // SAFETY: `raw` is the live stream lsquic just created.
@@ -768,12 +770,12 @@ impl QuicSession {
                     self.bump_stream_stat(s.id(), false);
                 }
                 self.push_event(SessionEvent::StreamReady {
-                    stream: qs,
+                    stream: key,
                     remote: true,
                 });
                 // SAFETY: `qs` was just created.
                 if let Some(code) = unsafe { (*qs).pre_reset_code() } {
-                    self.push_event(SessionEvent::StreamReset { stream: qs, code });
+                    self.push_event(SessionEvent::StreamReset { stream: key, code });
                 }
                 qs
             }
@@ -813,14 +815,14 @@ impl QuicSession {
         }
     }
 
-    fn stream_is_live(&self, stream: *mut super::stream::QuicStream) -> bool {
-        self.streams.get().contains(&stream)
+    fn stream_ptr(&self, key: super::stream::Key) -> Option<*mut super::stream::QuicStream> {
+        let streams = self.streams.get();
+        streams.iter().find_map(|&(k, s)| (k == key).then_some(s))
     }
-    /// Teardown removes a stream from the registry before its allocation is
-    /// freed, so a registered pointer is live on the JS thread.
-    fn live_stream(&self, p: *mut super::stream::QuicStream) -> Option<&super::stream::QuicStream> {
-        // SAFETY: see doc comment.
-        self.stream_is_live(p).then(|| unsafe { &*p })
+    fn live_stream(&self, key: super::stream::Key) -> Option<&super::stream::QuicStream> {
+        // SAFETY: teardown removes a stream from the registry before its
+        // allocation is freed, so a registered pointer is live on the JS thread.
+        self.stream_ptr(key).map(|stream| unsafe { &*stream })
     }
 
     pub(super) fn apply_peer_datagram_budget(&self) {
@@ -1278,9 +1280,10 @@ impl QuicSession {
                         1
                     }
                 });
-                let streams: Vec<*mut super::stream::QuicStream> = self.streams.get().clone();
-                for sp in streams {
-                    if let Some(stream) = self.live_stream(sp) {
+                let keys: Vec<super::stream::Key> =
+                    self.streams.get().iter().map(|&(key, _)| key).collect();
+                for key in keys {
+                    if let Some(stream) = self.live_stream(key) {
                         stream.cancel_early_rejected(code);
                     }
                 }
@@ -1449,8 +1452,8 @@ impl QuicSession {
                 };
                 stream.apply_peer_stop_sending(code);
             }
-            SessionEvent::StreamClosed { stream: stream_ptr } => {
-                let Some(stream) = self.live_stream(stream_ptr) else {
+            SessionEvent::StreamClosed { stream: key } => {
+                let Some(stream) = self.live_stream(key) else {
                     return Ok(());
                 };
                 if stream.mark_close_reported() {
@@ -1460,7 +1463,7 @@ impl QuicSession {
                 // no onStreamClose -- but it still has to leave `streams`
                 // and drop its self-root, or it lives until teardown.
                 if stream.is_announce_suppressed() {
-                    self.streams.with_mut(|v| v.retain(|&s| s != stream_ptr));
+                    self.remove_stream(key);
                     stream.release_close_root();
                     return Ok(());
                 }
@@ -1468,7 +1471,7 @@ impl QuicSession {
                 // this stream and let GC free it. Re-acquire before any
                 // further use; `mark_close_reported` above already fired.
                 stream.end_read_side(global);
-                let Some(stream) = self.live_stream(stream_ptr) else {
+                let Some(stream) = self.live_stream(key) else {
                     return Ok(());
                 };
                 let handle = stream.handle();
@@ -1484,10 +1487,10 @@ impl QuicSession {
                 }
                 // onStreamClose is user JS too: re-acquire before the
                 // `release_close_root` below, as above.
-                let Some(stream) = self.live_stream(stream_ptr) else {
+                let Some(stream) = self.live_stream(key) else {
                     return Ok(());
                 };
-                self.streams.with_mut(|v| v.retain(|&s| s != stream_ptr));
+                self.remove_stream(key);
                 // Nothing else reaches this stream now, so drop the
                 // self-root; `stream` stays valid because the retain above
                 // only dropped a pointer.
@@ -1828,13 +1831,13 @@ impl QuicSession {
         // root every wrapper up front.
         let _roots: Vec<Strong> = streams
             .iter()
-            .map(|&qs| {
+            .map(|&(_, qs)| {
                 // SAFETY: entries are live here -- a stream is only downgraded
                 // after `remove_stream` drops it from `self.streams`.
                 Strong::create(unsafe { (*qs).handle() }, _global)
             })
             .collect();
-        for qs in streams {
+        for (_, qs) in streams {
             // SAFETY: rooted by `_roots` above; teardown is idempotent.
             unsafe { (*qs).teardown(_global) };
         }
@@ -1960,7 +1963,7 @@ impl QuicSession {
     }
 
     fn any_stream_undelivered(&self) -> bool {
-        self.streams.get().iter().any(|&s| {
+        self.streams.get().iter().any(|&(_, s)| {
             // SAFETY: pointers in `streams` are unregistered before their
             // owner is destroyed (registry invariant).
             unsafe { (*s).has_undelivered_outbound() }
@@ -2067,19 +2070,12 @@ impl QuicSession {
         }
         let [direction, body] = frame.arguments_as_array::<2>();
         let unidirectional = direction.is_number() && direction.as_number() == 1.0;
-        let (qs, handle) = super::stream::QuicStream::create(
-            global,
-            self.vtable,
-            core::ptr::from_ref(self).cast_mut(),
-            frame.this(),
-            null_mut(),
-        )?;
+        let (key, qs, handle) = self.create_stream(global, frame.this(), null_mut())?;
         if unidirectional {
-            self.pending_local_uni.with_mut(|q| q.push_back(qs));
+            self.pending_local_uni.with_mut(|q| q.push_back(key));
         } else {
-            self.pending_local_bidi.with_mut(|q| q.push_back(qs));
+            self.pending_local_bidi.with_mut(|q| q.push_back(key));
         }
-        self.streams.with_mut(|v| v.push(qs));
         self.bump_stream_stat(if unidirectional { STREAM_ID_UNI_BIT } else { 0 }, true);
         if let Some(buf) = body.as_array_buffer(global) {
             // SAFETY: `qs` was just created.
