@@ -261,7 +261,8 @@ mod tests {
     use bun_sema::hir::StmtKind;
     use bun_sema_standalone as _;
 
-    const TEXT: &[u8] = b"<script>let a = /* one */ 1;\n</script><p>{a /* two */ + b}</p>{#if a}{c(d)}{/if}";
+    const TEXT: &[u8] =
+        b"<script>let a = /* one */ 1;\n</script><p>{a /* two */ + b}</p>{#if a}{c(d)}{/if}";
 
     fn at(needle: &[u8]) -> u32 {
         index_of(TEXT, needle).map_or(u32::MAX, |it| it as u32)
@@ -279,7 +280,9 @@ mod tests {
         let call = session.part_at(Goal::Expression, true, at(b"c(d)"), len);
         match (declaration, sum, call) {
             (Ok(declaration), Ok(sum), Ok(call)) => [declaration, sum, call],
-            (declaration, sum, call) => panic!("a part was refused: {declaration:?} {sum:?} {call:?}"),
+            (declaration, sum, call) => {
+                panic!("a part was refused: {declaration:?} {sum:?} {call:?}")
+            }
         }
     }
 
@@ -328,7 +331,11 @@ mod tests {
             panic!("refused: {first:?}");
         };
         let mark = session.mark();
-        let lens = [session.file().stmts.len(), session.file().exprs.len(), session.file().ids.len()];
+        let lens = [
+            session.file().stmts.len(),
+            session.file().exprs.len(),
+            session.file().ids.len(),
+        ];
         let comments = session.file().comments.len();
         let sum = session.part_at(Goal::Expression, true, at(b"a /*"), len);
         assert!(sum.is_ok(), "{sum:?}");
@@ -343,7 +350,10 @@ mod tests {
         let Ok(again) = again else {
             panic!("refused: {again:?}");
         };
-        assert_eq!(ids(session.file().body, session.file()), [first.stmt.0, again.stmt.0]);
+        assert_eq!(
+            ids(session.file().body, session.file()),
+            [first.stmt.0, again.stmt.0]
+        );
     }
 
     #[test]

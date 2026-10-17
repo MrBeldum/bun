@@ -172,11 +172,8 @@ pub struct ParsedPart {
 /// of an alias), and where it is. The file is that of the whole text: every offset in it is one of the text, and the part
 /// is its one statement. Once it returns, the caller forgets the part, nodes, comments and diagnostics, as if it had not
 /// been parsed: a part is read no further, and its place can be read again, for a retry or a probe.
-pub type ThenWithEnd<'t> = &'t mut dyn for<'b> FnMut(
-    &'b bun_lint::ast::File<'b>,
-    bun_lint::ast::Stmt<'b>,
-    ParsedPart,
-);
+pub type ThenWithEnd<'t> =
+    &'t mut dyn for<'b> FnMut(&'b bun_lint::ast::File<'b>, bun_lint::ast::Stmt<'b>, ParsedPart);
 
 /// Why a [`Part`] cannot be parsed.
 #[derive(Debug, Copy, Clone)]
