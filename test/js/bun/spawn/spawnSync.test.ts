@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { bunEnv, bunExe, bunRun, isLinux, isMusl, isPosix, isRoot, isWindows } from "harness";
+import { bunEnv, bunExe, bunRun, isLinux, isMusl, isPosix, isRoot, isWindows, tempDir } from "harness";
 import { totalmem } from "os";
 import { join } from "path";
 describe("spawnSync", () => {
@@ -171,6 +171,188 @@ describe.skipIf(!isPosix || totalmem() < 16 * 1024 ** 3)("spawnSync output at th
       signalCode: null,
     });
   }, 120_000);
+});
+
+// A test times out while it waits in spawnSync. The runner then sends the child its kill signal, and SIGTERM with the
+// other processes of that test. A child that ignores both used to keep the test waiting for as long as it ran.
+describe.concurrent("the timeout of a test that waits in spawnSync", () => {
+  const prelude = /* ts */ `
+    import { afterAll, expect, test } from "bun:test";
+    import { spawnSync } from "node:child_process";
+    import { writeFileSync } from "node:fs";
+
+    const ignore = { stdin: "ignore", stdout: "ignore", stderr: "ignore" } as const;
+
+    function report({ exitCode, signalCode }: { exitCode: number | null; signalCode?: unknown }) {
+      console.log(\`the child ended: exitCode \${exitCode}, signalCode \${signalCode ?? null}\`);
+    }
+  `;
+
+  async function runTestFile(source: string, { noOrphans = false, files = {} } = {}) {
+    using dir = tempDir("spawnsync-test-timeout", { "timeout.test.ts": prelude + source, ...files });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "timeout.test.ts"],
+      // The mode is the runner's choice for some CI lanes, so every case names it.
+      env: { ...bunEnv, BUN_FEATURE_FLAG_NO_ORPHANS: noOrphans ? "1" : undefined },
+      cwd: String(dir),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { combined: stdout + stderr, exitCode };
+  }
+
+  // Windows ends a process on the first signal.
+  describe.skipIf(isWindows)("a child that ignores SIGTERM", () => {
+    // One process: `sleep` keeps the SIGTERM that `sh` ignores. Nothing tells a caller that waits in spawnSync when
+    // `sh` has done that, so no case sends SIGTERM sooner than 300 ms after the spawn.
+    const ignoresSigterm = (seconds: number) => JSON.stringify(["sh", "-c", `trap '' TERM; exec sleep ${seconds}`]);
+    // SIGURG does nothing to a process that does not handle it.
+    const ownTimeout = `timeout: 100, killSignal: "SIGURG"`;
+
+    const sigkill = "the child ended: exitCode null, signalCode SIGKILL";
+
+    it.each([
+      ["Bun.spawnSync", `test("times out", () => { report(Bun.spawnSync({ cmd, ...ignore })); }, 300);`],
+      [
+        "child_process.spawnSync",
+        `test("times out", () => {
+          const { status, signal } = spawnSync(cmd[0], cmd.slice(1), { stdio: "ignore" });
+          report({ exitCode: status, signalCode: signal });
+        }, 300);`,
+      ],
+      [
+        "Bun.spawnSync after an await",
+        `test("times out", async () => {
+          await new Promise(resolve => setImmediate(resolve));
+          report(Bun.spawnSync({ cmd, ...ignore }));
+        }, 300);`,
+      ],
+      [
+        "Bun.spawnSync after its own timeout",
+        `test("times out", () => { report(Bun.spawnSync({ cmd, ${ownTimeout}, ...ignore })); }, 300);`,
+      ],
+    ])("%s: the child is sent SIGKILL", async (_, timesOut) => {
+      const { combined, exitCode } = await runTestFile(`const cmd = ${ignoresSigterm(3)}; ${timesOut}`);
+
+      expect(combined).toContain(sigkill);
+      expect(combined).toContain("(fail) times out");
+      expect(exitCode).toBe(1);
+    });
+
+    it("in no-orphans mode too", async () => {
+      const { combined, exitCode } = await runTestFile(
+        `test("times out", () => { report(Bun.spawnSync({ cmd: ${ignoresSigterm(3)}, ...ignore })); }, 300);`,
+        { noOrphans: true },
+      );
+
+      expect(combined).toContain(sigkill);
+      expect(exitCode).toBe(1);
+    });
+
+    it("a test that is done before spawnSync returns keeps the child", async () => {
+      const { combined, exitCode } = await runTestFile(`
+        test("is done in time", done => {
+          setImmediate(() => {
+            done();
+            report(Bun.spawnSync({ cmd: ${ignoresSigterm(1.2)}, ...ignore }));
+          });
+        }, 300);
+      `);
+
+      expect(combined).toContain("the child ended: exitCode 0, signalCode null");
+      expect(combined).toContain("(pass) is done in time");
+      expect(exitCode).toBe(0);
+    });
+
+    it("in a group of concurrent tests, the timeout of one test does not send SIGKILL to the child of another", async () => {
+      const { combined, exitCode } = await runTestFile(`
+        test.concurrent("times out", async () => {
+          await new Promise(() => {});
+        }, 100);
+
+        test.concurrent("has no timeout", async () => {
+          await new Promise(resolve => setImmediate(resolve));
+          report(Bun.spawnSync({ cmd: ["sleep", "1"], killSignal: "SIGURG", ...ignore }));
+        }, 0);
+      `);
+
+      expect(combined).toContain("the child ended: exitCode 0, signalCode null");
+      expect(combined).toContain("(pass) has no timeout");
+      expect(exitCode).toBe(1);
+    });
+
+    it("the timeout of spawnSync alone does not send SIGKILL", async () => {
+      const { combined, exitCode } = await runTestFile(`
+        test("does not time out", () => {
+          report(Bun.spawnSync({ cmd: ["sleep", "1"], ${ownTimeout}, ...ignore }));
+        });
+      `);
+
+      expect(combined).toContain("the child ended: exitCode 0, signalCode null");
+      expect(exitCode).toBe(0);
+    });
+
+    it("a child that exits on SIGTERM keeps its exit code", async () => {
+      const exitsOnSigterm = [
+        "sh",
+        "-c",
+        "trap 'exit 7' TERM; i=0; while [ $i -lt 300 ]; do sleep 0.01; i=$((i+1)); done",
+      ];
+      const { combined, exitCode } = await runTestFile(
+        `test("times out", () => { report(Bun.spawnSync({ cmd: ${JSON.stringify(exitsOnSigterm)}, ...ignore })); }, 300);`,
+      );
+
+      expect(combined).toContain("the child ended: exitCode 7, signalCode null");
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  // The runner and the deadlines of its tests belong to the main thread.
+  it("does not signal the child of a spawnSync in a Worker", async () => {
+    // It is told to stop right after the deadline of the test, and takes 200 ms to do it: a signal that is sent
+    // at that deadline ends it first.
+    const untilStopped = `
+      for (let i = 0; i < 2000 && !require("node:fs").existsSync("stop"); i++) Bun.sleepSync(5);
+      Bun.sleepSync(200);
+    `;
+    const { combined, exitCode } = await runTestFile(
+      `
+        const worker = new Worker(new URL("worker.ts", import.meta.url).href);
+        afterAll(() => worker.terminate());
+        const ended = new Promise(resolve => {
+          worker.onmessage = event => resolve(event.data);
+        });
+
+        test("times out", async () => {
+          await new Promise(() => {});
+        }, 1000);
+
+        test("the child of the worker ended by itself", async () => {
+          writeFileSync("stop", "");
+          expect(await ended).toEqual({ exitCode: 0, signalCode: null });
+        });
+      `,
+      {
+        files: {
+          "worker.ts": `
+            // With a pipe, spawnSync waits in its event loop, where the deadlines of bun:test are read.
+            const { exitCode, signalCode = null } = Bun.spawnSync({
+              cmd: [process.execPath, "-e", ${JSON.stringify(untilStopped)}],
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "ignore",
+            });
+            postMessage({ exitCode, signalCode });
+          `,
+        },
+      },
+    );
+
+    expect(combined).toContain("(pass) the child of the worker ended by itself");
+    expect(exitCode).toBe(1);
+  });
 });
 
 describe("uid/gid", () => {

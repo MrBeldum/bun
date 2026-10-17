@@ -191,6 +191,35 @@ impl<'a> TestRunner<'a> {
         bun_core::Timespec { sec: active_file.timer.next.sec, nsec: active_file.timer.next.nsec }
     }
 
+    /// How long the child of a `spawnSync` has to exit after the test that waits for it timed out, before it is
+    /// sent SIGKILL.
+    pub(crate) const SPAWN_SYNC_KILL_GRACE_MS: i64 = 500;
+
+    /// Whether the deadline that [`Self::get_active_timeout`] gives `spawnSync` is certainly its caller's: the
+    /// group runs one test, and that test's callback is not done. In a group of concurrent tests the caller can
+    /// be any of them. Never on Windows, where the default kill signal ends the child.
+    pub(crate) fn active_timeout_is_callers(&self) -> bool {
+        if cfg!(windows) {
+            return false;
+        }
+        let Some(active_file) = self.bun_test_root.active_file.clone() else {
+            return false;
+        };
+        let buntest = active_file.get();
+        let execution = &mut buntest.execution;
+        let one_test_runs = execution.active_group_ref().is_some_and(|group| {
+            matches!(group.sequences_const(execution), [only] if only.active_entry.is_some())
+        });
+        // A result for it is queued: its callback is done, and `run` has yet to step past it.
+        let queue = &buntest.result_queue;
+        one_test_runs
+            && !(0..queue.readable_length()).any(|offset| {
+                execution
+                    .get_current_and_valid_execution_sequence(&queue.peek_item(offset))
+                    .is_some()
+            })
+    }
+
     pub(crate) fn remove_active_timeout(&mut self, vm: &mut VirtualMachine) {
         let Some(active_file) = self.bun_test_root.active_file.as_ref() else {
             return;
