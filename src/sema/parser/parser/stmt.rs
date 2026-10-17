@@ -755,7 +755,7 @@ impl<const GENERAL: bool, const COMMENTS: bool> Parser<'_, GENERAL, COMMENTS> {
         id
     }
 
-    /// `Options::part`, at its first token: the one statement of the file. Nothing is read after it.
+    /// A [`crate::Part`], at its first token: the one statement of it. Nothing is read after it.
     pub(crate) fn part(&mut self, goal: Goal) -> StmtId {
         let start = self.start();
         let statement = match goal {
