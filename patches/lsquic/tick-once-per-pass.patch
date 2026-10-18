@@ -1,0 +1,51 @@
+--- a/src/liblsquic/lsquic_engine.c
++++ b/src/liblsquic/lsquic_engine.c
+@@ -2256,8 +2256,9 @@
+ static lsquic_conn_t *
+ conn_iter_next_tickable (struct lsquic_engine *engine)
+ {
+-    lsquic_conn_t *conn;
++    lsquic_conn_t *conn, *pushed = NULL;
+ 
++  pop:
+     if (engine->flags & ENG_SERVER)
+         while (1)
+         {
+@@ -2270,6 +2271,23 @@
+     else
+         conn = lsquic_mh_pop(&engine->conns_tickable);
+ 
++    /* bun: lsquic_engine_packet_in() queues a connection also while the
++     * running pass ticks it or after that.  A callback that runs its
++     * application's event loop gets a packet read in the middle of a pass.
++     * The connection goes back on the queue, for the next pass.  An entry
++     * made during the tick has the key of the tick before: the push moves
++     * it behind the connections that are still due, and the pop goes on.
++     * The pass is over when the same connection comes back.
++     */
++    if (conn && (conn->cn_flags & LSCONN_TICKED))
++    {
++        lsquic_mh_insert(&engine->conns_tickable, conn, conn->cn_last_ticked);
++        if (conn == pushed)
++            return NULL;
++        pushed = conn;
++        goto pop;
++    }
++
+     if (conn)
+         conn = engine_decref_conn(engine, conn, LSCONN_TICKABLE);
+     if (conn && (conn->cn_flags & LSCONN_ATTQ))
+@@ -3229,6 +3247,13 @@
+     while ((conn = next_conn(engine))
+                             || (conn = next_new_full_conn(&new_full_conns)))
+     {
++        /* bun: this pass ticked the connection already.  A second tick would
++         * link it on ticked_conns or closed_conns twice.  It is a promoted
++         * connection that was also on the Tickable Queue, or one that was
++         * queued again after the tick that closed it.
++         */
++        if (conn->cn_flags & (LSCONN_TICKED|LSCONN_CLOSING))
++            continue;
+         tick_st = conn->cn_if->ci_tick(conn, now);
+ #if LSQUIC_CONN_STATS
+         if (conn == engine->busy.current)
