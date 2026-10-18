@@ -5,8 +5,9 @@ import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, normalizeBunSnapshot, tempDir } from "harness";
 import { createPrivateKey } from "node:crypto";
 import { createSocket } from "node:dgram";
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
-import { BlockList } from "node:net";
+import { BlockList, SocketAddress } from "node:net";
 import { join } from "node:path";
 import { connect, listen, QuicEndpoint, type EndpointOptions, type SessionOptions } from "node:quic";
 
@@ -309,4 +310,148 @@ describe("endpoint.close() while a session is live", () => {
     await server.closed;
     expect({ announced, resolved }).toEqual({ announced: 1, resolved: true });
   });
+});
+
+// lsquic merges the 1-RTT ACK frames that it reads in one batch of packets
+// into one frame. A range of one frame that lay inside a range of the other
+// cut the merged range short: [16-8] merged with [15-12][10-9] gave
+// [16-12][10-9]. A packet that arrived late, and that only the newer frame
+// acknowledged, was then declared lost.
+describe("ACK frames read in one batch", () => {
+  test("a packet is acknowledged when the frame that covers it is merged with an older frame", async () => {
+    // Two datagrams of SIZE bytes do not fit in one packet. The relay sees
+    // ciphertext, so it tells the packets apart by length: one with a SIZE
+    // datagram, one with the server's MARK datagram. A path MTU probe is
+    // longer than 1400 bytes.
+    const SIZE = 1100;
+    const MARK = 600;
+    const lengthIn = (min: number, max: number) => (packet: Buffer) =>
+      !(packet[0] & 0x80) && packet.length >= min && packet.length < max;
+    const carriesDatagram = lengthIn(SIZE, 1400);
+    const carriesMark = lengthIn(MARK, SIZE);
+
+    const received: number[] = [];
+    const statuses: string[] = [];
+    let sent = 0;
+    let marks = 0;
+    // Each event source below calls `check`, and the pending wait tests its condition again.
+    let check = () => {};
+    const until = (done: () => boolean) =>
+      new Promise<void>(resolve => {
+        check = () => done() && resolve();
+        check();
+      });
+
+    // While `keeping`, the relay below keeps what both sides send.
+    let keeping = false;
+    let serverSession: any;
+    await using server = await listen(
+      (session: any) => {
+        serverSession = session;
+        session.onerror = () => {};
+        session.closed.catch(() => {});
+      },
+      {
+        sni: { "*": { keys: [key], certs: [cert] } },
+        alpn: ["quic-test"],
+        transportParams: { maxIdleTimeout: 10 },
+        ondatagram(this: any, datagram: Uint8Array) {
+          received.push(datagram[0]);
+          // The packet of MARK leaves after every ACK that the server owes, or carries it.
+          if (keeping && received.length === sent) this.sendDatagram(new Uint8Array(MARK));
+          check();
+        },
+      } as any,
+    );
+
+    const front = createSocket("udp4");
+    const upstream = createSocket("udp4");
+    let clientPort = 0;
+    const datagramPackets: Buffer[] = [];
+    const otherClientPackets: Buffer[] = [];
+    const serverPackets: Buffer[] = [];
+    const toServer = (packet: Buffer) => upstream.send(packet, server.address!.port, "127.0.0.1");
+    front.on("message", (packet, from) => {
+      clientPort = from.port;
+      if (!keeping) toServer(packet);
+      else (carriesDatagram(packet) ? datagramPackets : otherClientPackets).push(packet);
+      check();
+    });
+    upstream.on("message", packet => {
+      if (keeping) serverPackets.push(packet);
+      else front.send(packet, clientPort, "127.0.0.1");
+      check();
+    });
+    front.bind(0, "127.0.0.1");
+    upstream.bind(0, "127.0.0.1");
+    await Promise.all([once(front, "listening"), once(upstream, "listening")]);
+
+    let client: any;
+    try {
+      client = await connect(new SocketAddress({ address: "127.0.0.1", port: front.address().port }), {
+        alpn: "quic-test",
+        servername: "localhost",
+        verifyPeer: "manual",
+        transportParams: { maxIdleTimeout: 10 },
+        onerror() {},
+        ondatagram() {
+          marks++;
+          check();
+        },
+        ondatagramstatus(_id: bigint, status: string) {
+          statuses.push(status);
+          check();
+        },
+      } as SessionOptions);
+      client.closed.catch(() => {});
+      await client.opened;
+      const send = (count: number) => {
+        for (let i = 0; i < count; i++) client.sendDatagram(Buffer.alloc(SIZE, ++sent));
+      };
+
+      // Datagrams 1 to 3 arrive in order. Once the client has their statuses, the server owes no ACK.
+      send(3);
+      await until(() => statuses.length === 3);
+
+      // A round does not always end in a merge, so the test runs three.
+      for (let round = 1; round <= 3; round++) {
+        // The relay keeps the packets of the next five datagrams: N to N+4.
+        keeping = true;
+        send(5);
+        await until(() => datagramPackets.length === 5);
+        const [n, ...later] = datagramPackets.splice(0);
+
+        // N+1 and N+2 arrive: the ACK frame of the server has the gap of N.
+        toServer(later[0]);
+        toServer(later[1]);
+        await until(() => received.length === sent - 3 && serverPackets.length >= 1);
+
+        // N, N+3 and N+4 arrive: the next ACK frame reaches higher and has no gap.
+        toServer(n);
+        toServer(later[2]);
+        toServer(later[3]);
+        await until(() => serverPackets.some(carriesMark));
+
+        // The client reads both ACK frames in one batch, and lsquic merges them.
+        keeping = false;
+        for (const packet of serverPackets.splice(0)) front.send(packet, clientPort, "127.0.0.1");
+        for (const packet of otherClientPackets.splice(0)) toServer(packet);
+        // The client dispatches the statuses of a batch in the pass that delivers MARK.
+        await until(() => marks === round);
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+
+      const { datagramsAcknowledged, datagramsLost } = client.stats;
+      expect({ statuses, datagramsAcknowledged, datagramsLost }).toEqual({
+        statuses: Array.from({ length: sent }, () => "acknowledged"),
+        datagramsAcknowledged: BigInt(sent),
+        datagramsLost: 0n,
+      });
+    } finally {
+      client?.destroy();
+      serverSession?.destroy();
+      front.close();
+      upstream.close();
+    }
+  }, 30000);
 });
