@@ -1,5 +1,6 @@
+import { socketFaultInjection as fault } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, tls as tlsCert } from "harness";
+import { bunEnv, bunExe, isWindows, tls as tlsCert } from "harness";
 import { once } from "node:events";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import https from "node:https";
@@ -131,3 +132,73 @@ describe.each(["http", "https"] as const)("%s: the raw socket's FIN follows the 
     }).toEqual({ statusLine: "HTTP/1.1 200 OK", body });
   });
 });
+
+// destroySoon() closes the connection behind its FIN. Over TLS a short send can leave the
+// ciphertext of the last write in the TLS layer at that point, and here 5 bytes of the client
+// also wait unread behind req.socket.pause(). The close waits for the ciphertext and drops the
+// unread bytes, so it is a FIN: a close over unread input is a reset, and a reset throws away
+// the output that the kernel has not sent yet.
+test.concurrent.skipIf(!fault.available() || isWindows)(
+  "https: req.socket.destroySoon() sends the TLS ciphertext that a short send left behind",
+  async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+          import { socketFaultInjection as fault } from "bun:internal-for-testing";
+          import { once } from "node:events";
+          import https from "node:https";
+          import tls from "node:tls";
+          const server = https.createServer({ key: process.env.KEY, cert: process.env.CERT });
+          await once(server.listen(0, "127.0.0.1"), "listening");
+          const client = tls.connect({ port: server.address().port, host: "127.0.0.1", rejectUnauthorized: false });
+          client.pause();
+          let received = 0;
+          let end = "none";
+          const closed = Promise.withResolvers();
+          client.on("error", err => (end = err.code));
+          client.on("end", () => (end = "end"));
+          client.on("close", closed.resolve);
+          client.on("data", chunk => {
+            // One chunk for each turn of the event loop, so that a reset cuts the output short.
+            client.pause();
+            setImmediate(() => client.resume());
+            received += chunk.length;
+          });
+          await once(client, "secureConnect");
+          const handled = Promise.withResolvers();
+          server.once("request", req => {
+            req.socket.on("error", () => {});
+            req.socket.pause();
+            handled.resolve(req.socket);
+          });
+          client.write("POST / HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: 5\\r\\n\\r\\n");
+          const socket = await handled.promise;
+          // The reads are paused: the body stays in the kernel of the server.
+          await new Promise(resolve => client.write("hello", resolve));
+          await new Promise(resolve => socket.write(Buffer.alloc(256 * 1024, "a"), resolve));
+          // The kernel takes 1 byte of the next write. The rest of its ciphertext waits in the TLS layer.
+          fault.set({ syscall: "send", action: "short", bytes: 1, repeat: -1 });
+          socket.write(Buffer.alloc(64 * 1024, "b"));
+          socket.destroySoon();
+          await once(socket, "finish");
+          fault.clear();
+          client.resume();
+          await closed.promise;
+          server.close();
+          process.stdout.write(JSON.stringify({ received, end }));
+        `,
+      ],
+      env: { ...bunEnv, KEY: tlsCert.key, CERT: tlsCert.cert },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: JSON.stringify({ received: 256 * 1024 + 64 * 1024, end: "end" }),
+      stderr: "",
+      exitCode: 0,
+    });
+  },
+);

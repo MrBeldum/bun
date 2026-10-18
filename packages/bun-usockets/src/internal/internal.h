@@ -382,6 +382,9 @@ struct us_socket_t {
   unsigned char ssl_shutdown_after_first_flight : 1;
   /* ssl_raw_write shut the write side down, not the owner. */
   unsigned char ssl_send_rejected : 1;
+  /* The reads of this socket were paused at least once (us_socket_pause, or it was opened paused).
+   * The peer's input can then wait in the kernel where no read reported it: us_socket_discard_queued_input. */
+  unsigned char reads_were_paused : 1;
   /* Consecutive send() failures with an errno that is neither
    * would-block/transient nor a known peer-gone error (see
    * us_socket_write_check_error). Reset by any send that makes progress.

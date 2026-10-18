@@ -92,6 +92,18 @@ public:
         getHttpResponseData()->state |= HttpResponseData<SSL>::HTTP_WROTE_DATE_HEADER;
     }
 
+    /* Every close of an HTTP/1 connection that sends a FIN first. A pause of the reads leaves
+     * the peer's input in the kernel, and the kernel turns a close over unread input into a
+     * reset: it throws away the output it has not sent yet, and the peer can miss the close.
+     * So the input of a socket that was paused is dropped between the FIN and the close. */
+    us_socket_t *shutdownAndClose() {
+        ((AsyncSocket<SSL> *) this)->shutdown();
+        us_socket_discard_queued_input((us_socket_t *) this);
+        /* We need to force close after sending FIN since we want to hinder
+         * clients from keeping to send their huge data */
+        return ((AsyncSocket<SSL> *) this)->close();
+    }
+
     /* Shutdown+close when the connection is marked to close (Connection:
      * close, peer FIN, close-when-idle), the response is complete and every
      * outgoing byte has been flushed. Returns true when the socket was closed. */
@@ -99,10 +111,7 @@ public:
         if (httpResponseData->shouldCloseConnection()) {
             if ((httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING) == 0) {
                 if (((AsyncSocket<SSL> *) this)->hasFullyDrained()) {
-                    ((AsyncSocket<SSL> *) this)->shutdown();
-                    /* We need to force close after sending FIN since we want to hinder
-                     * clients from keeping to send their huge data */
-                    ((AsyncSocket<SSL> *) this)->close();
+                    shutdownAndClose();
                     return true;
                 }
             }
@@ -1024,10 +1033,7 @@ public:
             if (httpResponseData->shouldCloseConnection()) {
                 if ((httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING) == 0) {
                     if (((AsyncSocket<SSL> *) this)->hasFullyDrained()) {
-                        ((AsyncSocket<SSL> *) this)->shutdown();
-                        /* We need to force close after sending FIN since we want to hinder
-                        * clients from keeping to send their huge data */
-                        ((AsyncSocket<SSL> *) this)->close();
+                        shutdownAndClose();
                     }
                 }
             }

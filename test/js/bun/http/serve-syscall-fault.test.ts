@@ -1,6 +1,7 @@
 import { socketFaultInjection as fault } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, tls as certs, isWindows } from "harness";
+import { join } from "node:path";
 
 const skip = !fault.available() || isWindows;
 
@@ -151,5 +152,36 @@ describe.skipIf(skip)("Bun.serve under injected syscall faults", () => {
     }
     expect(proc.signalCode).toBeNull();
     expect(proc.exitCode).toBe(0);
+  });
+});
+
+// Bun.serve stops the reads of a connection when 1 MiB of a request body is unread. The input
+// of the client can then wait in the kernel where no read reported it, and the kernel turns a
+// close over unread input into a reset. So the server drops that input right before it closes:
+// the close is a FIN, the response arrives whole, and the client can still write behind it.
+// The fixture leaves a request unread with one short read. Each shape closes its connection at
+// another place in uWS.
+describe.skipIf(skip)("Bun.serve closes with a FIN over unread input", () => {
+  test.each(["tcp", "tls"])("%s", async transport => {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(import.meta.dir, "serve-close-over-unread-input-fixture.js"), transport],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1", KEY: certs.key, CERT: certs.cert },
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const closed = { status: "HTTP/1.1 200 OK", body: "all", end: "end", afterEnd: "written" };
+    expect({ result: stdout ? JSON.parse(stdout) : undefined, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+      result: {
+        sync: closed,
+        async: closed,
+        head: closed,
+        invalid: { ...closed, status: "HTTP/1.1 505 HTTP Version Not Supported" },
+      },
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
   });
 });

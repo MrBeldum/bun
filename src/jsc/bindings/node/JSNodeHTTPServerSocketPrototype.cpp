@@ -309,6 +309,10 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNodeHTTPServerSocketEnd, (JSC::JSGlobalObject
         } else {
             us_socket_buffered_js_write(thisObject->socket, thisObject->is_ssl, thisObject->ended, thisObject->hasUnsentResponseBytes(), thisObject->flushesStreamBufferOnDrain(), &thisObject->streamBuffer, globalObject, JSValue::encode(JSC::jsUndefined()), JSValue::encode(JSC::jsUndefined()));
         }
+        // The close comes right behind the FIN, as at the close gates of uWS (HttpResponse::shutdownAndClose).
+        if (thisObject->socket) {
+            us_socket_discard_queued_input(thisObject->socket);
+        }
         thisObject->close();
         return JSValue::encode(JSC::jsUndefined());
     }

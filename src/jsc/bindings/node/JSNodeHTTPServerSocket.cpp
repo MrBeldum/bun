@@ -350,7 +350,9 @@ static bool deferShutdownUntilResponseDrains(us_socket_t* socket, bool destroySo
     /* The end() of a finished response whose request body is still being parsed: Node parses the whole read before destroySoon(). */
     bool bodyStillParsing = destroySoon && reinterpret_cast<uWS::HttpResponse<SSL>*>(socket)->isDeliveringBodyAfterResponse();
     auto* asyncSocket = reinterpret_cast<uWS::AsyncSocket<SSL>*>(socket);
-    if (!bodyStillParsing && asyncSocket->getBufferedAmount() == 0) {
+    /* destroySoon() closes behind its FIN, so it also waits for TLS ciphertext that the kernel has not taken yet. */
+    const bool drained = destroySoon ? asyncSocket->hasFullyDrained() : asyncSocket->getBufferedAmount() == 0;
+    if (!bodyStillParsing && drained) {
         return false;
     }
     /* uWS shuts down after the parse and the flush. HttpContext dispatches nothing behind a complete response that closes the connection. */

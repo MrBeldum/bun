@@ -931,6 +931,21 @@ int bsd_queued_input(LIBUS_SOCKET_DESCRIPTOR fd) {
     return bsd_would_block() ? LIBUS_QUEUED_INPUT_NONE : LIBUS_QUEUED_INPUT_ERROR;
 }
 
+void bsd_discard_queued_input(LIBUS_SOCKET_DESCRIPTOR fd) {
+    /* Not the receive buffer of the loop: the caller can run inside the read of another socket. */
+    char buf[4096];
+    for (int reads = LIBUS_RECV_BUFFER_LENGTH / (int) sizeof(buf); reads > 0; reads--) {
+        ssize_t ret;
+        do {
+            ret = recv(fd, buf, (int) sizeof(buf), MSG_DONTWAIT);
+        } while (UNLIKELY(IS_EINTR(ret)));
+        /* Not at a short read: a read opens the receive window, and a peer on this host fills it again at once. */
+        if (ret <= 0) {
+            return;
+        }
+    }
+}
+
 #if !defined(_WIN32)
 ssize_t bsd_recvmsg(LIBUS_SOCKET_DESCRIPTOR fd, struct msghdr *msg, int flags) {
     ssize_t injected = 0; int unused = 0;

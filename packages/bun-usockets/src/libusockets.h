@@ -704,6 +704,16 @@ int us_socket_is_closed(us_socket_r s) nonnull_fn_decl;
  * own a socket between loop iterations use this to tell an idle connection
  * from one the peer has already written to or closed. */
 int us_socket_queued_input(us_socket_r s) nonnull_fn_decl;
+/* For the close of a socket whose reads were paused: call it between
+ * us_socket_shutdown and us_socket_close. A pause leaves the peer's input in
+ * the kernel, and the kernel turns a close over unread input into a reset,
+ * which also throws away the output it has not sent yet. This reads and drops
+ * what is queued at that moment, at most LIBUS_RECV_BUFFER_LENGTH bytes. Input
+ * that arrives later still resets the connection.
+ * It does nothing for a socket that was never paused. It also does nothing
+ * until the write side is shut down: the fd is read raw (ciphertext for TLS),
+ * and a close that waits for TLS ciphertext to drain can read the socket again. */
+void us_socket_discard_queued_input(us_socket_r s) nonnull_fn_decl;
 
 int us_socket_is_ssl_handshake_finished(us_socket_r s) nonnull_fn_decl;
 int us_socket_ssl_handshake_callback_has_fired(us_socket_r s) nonnull_fn_decl;

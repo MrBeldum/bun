@@ -316,8 +316,7 @@ private:
     static us_socket_t *rejectHttp1(us_socket_t *s) {
         static const char response[] = "HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
         us_socket_write(s, response, sizeof(response) - 1);
-        us_socket_shutdown(s);
-        return us_socket_close(s, 0, nullptr);
+        return ((HttpResponse<SSL> *) s)->shutdownAndClose();
     }
 
     template <bool IsNodeHttp>
@@ -770,9 +769,8 @@ private:
             ((AsyncSocket<SSL> *) s)->uncork();
             /* For errors, we only deliver them "at most once". We don't care if they get halfways delivered or not. */
             us_socket_write(s, httpErrorResponses[httpErrorStatusCode].data(), (int) httpErrorResponses[httpErrorStatusCode].length());
-            us_socket_shutdown(s);
             /* Close any socket on HTTP errors */
-            us_socket_close(s, 0, nullptr);
+            ((HttpResponse<SSL> *) s)->shutdownAndClose();
         }
 
         auto returnedData = result.returnedData;
@@ -833,10 +831,7 @@ private:
             if (httpResponseData->shouldCloseConnection()) {
                 if ((httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING) == 0) {
                     if (((AsyncSocket<SSL> *) s)->hasFullyDrained()) {
-                        ((AsyncSocket<SSL> *) s)->shutdown();
-                        /* We need to force close after sending FIN since we want to hinder
-                         * clients from keeping to send their huge data */
-                        ((AsyncSocket<SSL> *) s)->close();
+                        ((HttpResponse<SSL> *) s)->shutdownAndClose();
                     }
                 }
             }
@@ -995,10 +990,7 @@ private:
                 }
             }
             if (responseDone && asyncSocket->hasFullyDrained()) {
-                asyncSocket->shutdown();
-                /* We need to force close after sending FIN since we want to hinder
-                 * clients from keeping to send their huge data */
-                asyncSocket->close();
+                reinterpret_cast<HttpResponse<SSL> *>(s)->shutdownAndClose();
             }
         }
 

@@ -184,6 +184,13 @@ int us_socket_queued_input(struct us_socket_t *s) {
     return bsd_queued_input(us_poll_fd(&s->p));
 }
 
+void us_socket_discard_queued_input(struct us_socket_t *s) {
+    if (!s->reads_were_paused || s->flags.is_closed || !us_socket_is_established(s) || !us_socket_is_shut_down(s)) {
+        return;
+    }
+    bsd_discard_queued_input(us_poll_fd(&s->p));
+}
+
 /* Detach c from its group + drop the borrowed SSL_CTX ref, but leave c
  * allocated. After this, c->group is NULL and the embedding owner may safely
  * deinit; the only remaining link is into a loop-owned list. */
@@ -453,6 +460,7 @@ struct us_socket_t *us_socket_from_fd(struct us_socket_group_t *group, unsigned 
     s->unclassified_send_failures = 0;
     s->read_eof = 0;
     s->hangup_closes_unsent = 0;
+    s->reads_were_paused = open_paused;
     s->connect_state = NULL;
 
     /* We always use nodelay */
@@ -870,6 +878,7 @@ void us_socket_pause(struct us_socket_t *s) {
     us_poll_change(&s->p, s->group->loop,
                    us_internal_socket_can_raw_write(s) ? LIBUS_SOCKET_WRITABLE : us_poll_events(&s->p) & LIBUS_SOCKET_WRITABLE);
     s->flags.is_paused = 1;
+    s->reads_were_paused = 1;
 }
 
 void us_socket_resume(struct us_socket_t *s) {
