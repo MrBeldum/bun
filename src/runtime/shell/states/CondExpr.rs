@@ -5,7 +5,7 @@ use crate::shell::ast;
 use crate::shell::interpreter::{Interpreter, Node, NodeId, ShellExecEnv, log};
 use crate::shell::io::IO;
 use crate::shell::states::base::Base;
-use crate::shell::states::expansion::Expansion;
+use crate::shell::states::expansion::{Expansion, WordContext};
 use crate::shell::yield_::Yield;
 
 pub(crate) struct CondExpr {
@@ -66,7 +66,8 @@ impl CondExpr {
                         return Self::command_impl_start(interp, this, n.op);
                     }
                     let atom: *const ast::Atom = n.args.get_const(idx as usize);
-                    let child = Expansion::init(interp, shell, atom, this, false);
+                    let child =
+                        Expansion::init(interp, shell, atom, this, WordContext::CondOperand);
                     return Expansion::start(interp, child);
                 }
                 CondExprState::WaitingStat => return Yield::suspended(),
@@ -79,7 +80,25 @@ impl CondExpr {
     /// the expanded `args` and returns the resulting exit code.
     fn command_impl_start(interp: &Interpreter, this: NodeId, op: ast::CondExprOp) -> Yield {
         use ast::CondExprOp as Op;
-        let parent = interp.as_condexpr(this).base.parent;
+        let me = interp.as_condexpr(this);
+        let parent = me.base.parent;
+        // bash matches the right operand of `==`/`!=` as a pattern when it has
+        // an unquoted `*`. The arms below only compare text, which would
+        // silently take another branch.
+        if matches!(op, Op::EqEq | Op::NotEq)
+            && let [_, pattern] = me.args.as_slice()
+            && me.node.args.get_const(1).has_glob_expansion()
+        {
+            let pattern = pattern.clone();
+            return Self::write_failing_error(
+                interp,
+                this,
+                format_args!(
+                    "bun: pattern matching is not supported in [[ ]]: {}\nnote: a quoted operand is compared as text, not matched as a pattern\n",
+                    bstr::BStr::new(&pattern)
+                ),
+            );
+        }
         match op {
             Op::DashC | Op::DashD | Op::DashF => {
                 // Empty expansion or empty path → exit 1 (bash always
@@ -223,24 +242,19 @@ impl CondExpr {
         child: NodeId,
         exit_code: ExitCode,
     ) -> Yield {
-        // Child is always an Expansion that produced one arg.
-        // On nonzero exit, write the failing error and finish; otherwise
-        // collect the expanded word and advance.
+        // Child is always the Expansion of one operand.
         if exit_code != 0 {
-            // Pull the expansion error out before deiniting the child, then
-            // write the failing error.
-            let err = Expansion::take_err(interp, child);
+            // `WordContext::CondOperand` runs none of the steps that report an
+            // expansion error (brace and pathname expansion), so the child
+            // fails only when the script failed inside a command substitution.
             interp.deinit_node(child);
-            if let Some(err) = err {
-                return Self::write_failing_error(interp, this, format_args!("{}\n", err));
-            }
-            // Defensive fallback — finish via `writeFailingError` with exit 1.
             debug_assert!(interp.failed(), "Expansion child failed without an error");
             let parent = interp.as_condexpr(this).base.parent;
             return interp.child_done(parent, this, 1);
         }
         let out = Expansion::take_out(interp, child);
         interp.deinit_node(child);
+        debug_assert!(out.bounds.is_empty(), "a [[ ]] operand is one word");
         {
             let me = interp.as_condexpr_mut(this);
             me.args.push(out.buf);
