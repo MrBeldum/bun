@@ -5500,6 +5500,7 @@ pub mod bv2_impl {
                                 .as_mut_slice()
                                 [resolve.import_record.import_record_index as usize];
                         import_record.path = path_as_static(&path);
+                        import_record.clear_unreadable_attributes();
                     }
 
                     if let Some(source_index) = out_source_index {
@@ -5537,6 +5538,7 @@ pub mod bv2_impl {
                                     .as_mut_slice()
                                     [resolve.import_record.import_record_index as usize];
                                 import_record.source_index = source_index;
+                                import_record.clear_unreadable_attributes();
                                 this.schedule_barrel_imports_after_plugin_resolve(
                                     resolve.import_record.importer_source_index,
                                 );
@@ -6634,8 +6636,9 @@ pub mod bv2_impl {
         /// the runtime can read. A loader picked here from the file extension may not be
         /// the one the runtime picks, so the call stays in the output as written.
         ///
-        /// Every place that binds a record to a module asks this first, and none binds a
-        /// record that still carries the mark.
+        /// Every place that binds a record to the module its path resolves to asks this
+        /// first, and none binds a record that still carries the mark. The answer of an
+        /// `onResolve` plugin decides its record without asking, and clears the mark.
         #[inline]
         fn leaves_import_to_runtime(
             &mut self,
@@ -7729,8 +7732,10 @@ pub mod bv2_impl {
                     if save_import_record_source_index
                         || input_file_loaders[to_assign.to_source_index.get() as usize].is_css()
                     {
-                        import_records.as_mut_slice()[to_assign.import_record_index as usize]
-                            .source_index = to_assign.to_source_index;
+                        let record = &mut import_records.as_mut_slice()
+                            [to_assign.import_record_index as usize];
+                        record.source_index = to_assign.to_source_index;
+                        record.clear_unreadable_attributes();
                     }
                 }
                 drop(value);
