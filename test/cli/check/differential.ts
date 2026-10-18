@@ -83,6 +83,10 @@ export async function inTurns<T>(items: T[], run: (item: T) => Promise<void>) {
  */
 type Case = { files: Record<string, string>; build?: true; deep?: true; theirs?: string[] };
 
+// `ONLY=import-type bun bd test test/cli/check/differential-cases-1.test.ts` runs the programs with that in their name,
+// all of them also on a debug build. They are few enough for the first test: the others are skipped.
+const only = process.env.ONLY;
+
 /**
  * Small programs about which `bun check` and tsc once said something else, each named after where it was found.
  * A program takes two processes, and a test file has three minutes: each file tests one part of `parts`.
@@ -90,17 +94,17 @@ type Case = { files: Record<string, string>; build?: true; deep?: true; theirs?:
 export function programsThatOnceDiffered(part: number, parts: number) {
   const tests = 4;
   for (let nth = 0; nth < tests; nth++) {
-    test.skipIf(!tsc)(
+    test.skipIf(!tsc || (!!only && part + nth > 0))(
       `programs about which the two once differed, ${part * tests + nth + 1} of ${parts * tests}`,
       async () => {
         const all: Record<string, Case> = await Bun.file(join(import.meta.dir, "differential-cases.json")).json();
         using dir = tempDir("bun-check-differential", {});
         const root = String(dir);
         const cases = Object.entries(all)
-          .filter(([, it]) => !(it.deep && (isDebug || isASAN)))
+          .filter(([name, it]) => (only ? name.includes(only) : !(it.deep && (isDebug || isASAN))))
           // A debug build checks a sample. It is always the same sample.
-          .filter((_, index) => index % (isDebug || isASAN ? 40 : 1) === 0)
-          .filter((_, index) => index % (parts * tests) === part * tests + nth)
+          .filter((_, index) => only || index % (isDebug || isASAN ? 40 : 1) === 0)
+          .filter((_, index) => only || index % (parts * tests) === part * tests + nth)
           // Windows cannot create a directory named `c:` or `w*d`.
           .filter(([, it]) => !isWindows || !Object.keys(it.files).some(path => /[:*?"<>|]/.test(path)))
           .filter(([name, it]) => {
@@ -116,6 +120,8 @@ export function programsThatOnceDiffered(part: number, parts: number) {
               throw error;
             }
           });
+        // A test that runs no program passes. `ONLY` may name none.
+        expect(cases.length).toBeGreaterThan(0);
         const different: Record<string, object> = {};
         await inTurns(cases, async ([name, it]) => {
           const cwd = join(root, name);
