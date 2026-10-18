@@ -1104,6 +1104,9 @@ impl PathLikeExt for PathLike<'_> {
                                 )
                                 .throw());
                         }
+                        Err(ToFileSystemPathError::Undecodable) => {
+                            return Err(ctx.throw_value(jsc::dom_url::uri_malformed_error(ctx)));
+                        }
                     };
                     if str.is_empty() {
                         return Err(ctx
