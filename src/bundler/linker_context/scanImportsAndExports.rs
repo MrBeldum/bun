@@ -419,9 +419,10 @@ pub(crate) fn scan_imports_and_exports(
             // resulting wrapper won't be invoked by other files. An exception is
             // made for entry point files in CommonJS format (or when in pass-through mode).
             if kind == ExportsKind::Cjs
-                && (!col_ref!(entry_point_kinds)[id].is_entry_point()
-                    || output_format == Format::Iife
-                    || output_format == Format::Esm)
+                && (!col_ref!(entry_point_kinds)[id].is_entry_point() || {
+                    let file_output_format = this.output_format_for(id as u32);
+                    file_output_format == Format::Iife || file_output_format == Format::Esm
+                })
             {
                 col!(flags)[id].wrap = WrapKind::Cjs;
             }
@@ -447,6 +448,8 @@ pub(crate) fn scan_imports_and_exports(
                     export_star_map: HashMap::default(),
                     export_star_records: &*export_star_import_records,
                     output_format,
+                    browser_runtime: this.graph.browser_runtime,
+                    targets: &*ast.target,
                     wrap_stack: Vec::new(),
                 }
             };
@@ -738,8 +741,6 @@ pub(crate) fn scan_imports_and_exports(
         let _trace = perf::trace("Bundler.BindImportsToExports");
         // const needs_export_symbol_from_runtime: []const bool = this.graph.meta.items().needs_export_symbol_from_runtime;
 
-        let mut runtime_export_symbol_ref: Ref = Ref::NONE;
-        let mut runtime_export_cjs_symbol_ref: Ref = Ref::NONE;
         let mut ident_scratch: Vec<u8> = Vec::new();
         let module_preload = this.module_preload();
         this.entry_point_part_indices = vec![u32::MAX; col_ref!(import_records_list).len()];
@@ -903,17 +904,11 @@ pub(crate) fn scan_imports_and_exports(
             // previous step. The previous step can't do this because it's running in
             // parallel and can't safely mutate the "importsToBind" map of another file.
             if flag.needs_export_symbol_from_runtime {
+                let runtime = this.graph.runtime_index(source_index);
                 let export_symbol_ref = if col_ref!(lifted_setter_params)[id].is_valid() {
-                    if !runtime_export_cjs_symbol_ref.is_valid() {
-                        runtime_export_cjs_symbol_ref = this.runtime_function(b"__exportCjs");
-                    }
-                    runtime_export_cjs_symbol_ref
+                    this.runtime_function(source_index, b"__exportCjs")
                 } else {
-                    if !runtime_export_symbol_ref.is_valid() {
-                        runtime_export_symbol_ref =
-                            this.runtime_function(this.export_runtime_function());
-                    }
-                    runtime_export_symbol_ref
+                    this.runtime_function(source_index, this.export_runtime_function())
                 };
 
                 debug_assert!(export_symbol_ref.is_valid());
@@ -923,7 +918,7 @@ pub(crate) fn scan_imports_and_exports(
                     bun_ast::NAMESPACE_EXPORT_PART_INDEX,
                     export_symbol_ref,
                     1,
-                    Index::RUNTIME,
+                    runtime,
                 )?;
             }
 
@@ -1130,8 +1125,9 @@ pub(crate) fn scan_imports_and_exports(
                         }
 
                         // This is an external import. Check if it will be a "require()" call.
+                        let file_output_format = this.output_format_for(source_index);
                         if kind == ImportKind::Require
-                            || !output_format.keep_es6_import_export_syntax()
+                            || !file_output_format.keep_es6_import_export_syntax()
                             || kind == ImportKind::Dynamic
                         {
                             // We should use "__require" instead of "require" if we're not
@@ -1140,7 +1136,7 @@ pub(crate) fn scan_imports_and_exports(
                             // nor does a split `require()` (`import.meta.require`).
                             if kind != ImportKind::Dynamic
                                 && !is_external_dyn
-                                && should_call_runtime_require(output_format)
+                                && should_call_runtime_require(file_output_format)
                             {
                                 runtime_require_uses += 1;
                             }
@@ -1328,7 +1324,10 @@ pub(crate) fn scan_imports_and_exports(
                                     Index::source(rec_source_index.get()),
                                 )?;
                             }
-                        } else if output_format.keep_es6_import_export_syntax() {
+                        } else if this
+                            .output_format_for(source_index)
+                            .keep_es6_import_export_syntax()
+                        {
                             col!(import_records_list)[id].as_mut_slice()
                                 [*import_record_index as usize]
                                 .flags
@@ -1345,7 +1344,10 @@ pub(crate) fn scan_imports_and_exports(
                     }
 
                     let mut happens_at_runtime = rec_source_index.is_invalid()
-                        && (!is_entry_point || !output_format.keep_es6_import_export_syntax());
+                        && (!is_entry_point
+                            || !this
+                                .output_format_for(source_index)
+                                .keep_es6_import_export_syntax());
                     if rec_source_index.is_valid() {
                         let other_source_index = rec_source_index.get();
                         let other_id = other_source_index as usize;
@@ -1452,10 +1454,23 @@ struct DependencyWrapper<'a> {
     entry_point_kinds: &'a [EntryPoint::Kind],
     export_star_records: &'a [bun_alloc::AstVec<u32>],
     output_format: options::Format,
+    browser_runtime: Index,
+    targets: &'a [options::Target],
     wrap_stack: Vec<IndexInt>,
 }
 
 impl DependencyWrapper<'_> {
+    /// See `LinkerContext::output_format_for`.
+    fn output_format_for(&self, source_index: IndexInt) -> options::Format {
+        if self.browser_runtime.is_valid()
+            && self.targets[source_index as usize] == options::Target::Browser
+        {
+            Format::Esm
+        } else {
+            self.output_format
+        }
+    }
+
     fn has_dynamic_exports_due_to_export_star(&mut self, source_index: IndexInt) -> bool {
         // Terminate the traversal now if this file already has dynamic exports
         let export_kind = self.exports_kind[source_index as usize];
@@ -1481,7 +1496,10 @@ impl DependencyWrapper<'_> {
             let rec_source_index =
                 self.import_records[source_index as usize].as_slice()[*id as usize].source_index;
             if (rec_source_index.is_invalid()
-                && (!kind.is_entry_point() || !self.output_format.keep_es6_import_export_syntax()))
+                && (!kind.is_entry_point()
+                    || !self
+                        .output_format_for(source_index)
+                        .keep_es6_import_export_syntax()))
                 || (rec_source_index.is_valid()
                     && rec_source_index.get() != source_index
                     && self.has_dynamic_exports_due_to_export_star(rec_source_index.get()))
@@ -1509,8 +1527,10 @@ impl DependencyWrapper<'_> {
             }
             flag.did_wrap_dependencies = true;
 
-            // Never wrap the runtime file since it always comes first
-            if source_index == Index::RUNTIME.get() {
+            // Never wrap the runtime files since they always come first
+            if source_index == Index::RUNTIME.get()
+                || (self.browser_runtime.is_valid() && source_index == self.browser_runtime.get())
+            {
                 continue;
             }
 
