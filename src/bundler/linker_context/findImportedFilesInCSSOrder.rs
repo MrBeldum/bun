@@ -7,7 +7,6 @@ use bun_collections::{ArrayHashMap, StringArrayHashMap, VecExt};
 use bun_core::handle_oom;
 
 use crate::Graph::Graph;
-use crate::bun_css::css_parser::BundlerCssRule;
 use crate::bun_css::{BundlerStyleSheet, ImportConditions, LayerName};
 use crate::chunk::{CssImportOrder, CssImportOrderKind, Layers};
 use crate::linker_context_mod::debug;
@@ -143,7 +142,6 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
             else {
                 return; // Sanity check
             };
-            let top_level_rules = &repr.rules;
 
             // TODO: should we even do this? @import rules have to be the first rules in the stylesheet, why even allow pre-import layers?
             // Any pre-import layers come first
@@ -159,104 +157,99 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
             // `visited.pop()` happens at the end of this function; the early
             // return above intentionally skips it.
 
-            // Iterate over the top-level "@import" rules
-            let mut import_record_idx: usize = 0;
-            for rule in top_level_rules.v.iter() {
-                if let BundlerCssRule::Import(import_rule) = rule {
-                    // `defer import_record_idx += 1;` — increment at end of this arm
-                    let record =
-                        &self.all_import_records[source_index.get() as usize][import_record_idx];
+            // Iterate over the "@import" rules
+            for import_rule in repr.imports.iter() {
+                let record = &self.all_import_records[source_index.get() as usize]
+                    [import_rule.import_record_idx as usize];
+                debug_assert!(
+                    !matches!(record.kind, ImportKind::Url | ImportKind::Composes),
+                    "an @import rule holds the index of its own import record"
+                );
 
-                    // Follow internal dependencies
-                    if record.source_index.is_valid() {
-                        // If this import has conditions, fork our state so that the entire
-                        // imported stylesheet subtree is wrapped in all of the conditions
-                        if import_rule.has_conditions() {
-                            // Fork our state. `visit` stores a bitwise copy of
-                            // `nested_conditions` into `self.order`; the slab is
-                            // arena-owned, so wrap the local header in
-                            // `ManuallyDrop` to avoid a double-free.
-                            let mut nested_conditions = core::mem::ManuallyDrop::new(
-                                deep_clone_conditions(wrapping_conditions, self.arena),
-                            );
-                            let mut nested_import_records =
-                                shallow_clone_records(wrapping_import_records);
+                // Follow internal dependencies
+                if record.source_index.is_valid() {
+                    // If this import has conditions, fork our state so that the entire
+                    // imported stylesheet subtree is wrapped in all of the conditions
+                    if import_rule.has_conditions() {
+                        // Fork our state. `visit` stores a bitwise copy of
+                        // `nested_conditions` into `self.order`; the slab is
+                        // arena-owned, so wrap the local header in
+                        // `ManuallyDrop` to avoid a double-free.
+                        let mut nested_conditions = core::mem::ManuallyDrop::new(
+                            deep_clone_conditions(wrapping_conditions, self.arena),
+                        );
+                        let mut nested_import_records =
+                            shallow_clone_records(wrapping_import_records);
 
-                            // Clone these import conditions and append them to the state
-                            nested_conditions.append_assume_capacity(
-                                import_rule.conditions_with_import_records(
-                                    self.arena,
-                                    &mut nested_import_records,
-                                ),
-                            );
-                            self.visit(
-                                record.source_index,
-                                &mut nested_conditions,
-                                wrapping_import_records,
-                            );
-                            // `nested_import_records` is *not* passed to `visit` (the
-                            // outer `wrapping_import_records` is), so it is uniquely
-                            // owned here — drop it normally to free the buffer.
-                            drop(nested_import_records);
-                            import_record_idx += 1;
-                            continue;
-                        }
+                        // Clone these import conditions and append them to the state
+                        nested_conditions.append_assume_capacity(
+                            import_rule.conditions_with_import_records(
+                                self.arena,
+                                &mut nested_import_records,
+                            ),
+                        );
                         self.visit(
                             record.source_index,
-                            wrapping_conditions,
+                            &mut nested_conditions,
                             wrapping_import_records,
                         );
-                        import_record_idx += 1;
+                        // `nested_import_records` is *not* passed to `visit` (the
+                        // outer `wrapping_import_records` is), so it is uniquely
+                        // owned here — drop it normally to free the buffer.
+                        drop(nested_import_records);
                         continue;
                     }
+                    self.visit(
+                        record.source_index,
+                        wrapping_conditions,
+                        wrapping_import_records,
+                    );
+                    continue;
+                }
 
-                    // Record external depednencies
-                    if !record.flags.contains(ImportRecordFlags::IS_INTERNAL) {
-                        // If this import has conditions, append it to the list of overall
-                        // conditions for this external import. Note that an external import
-                        // may actually have multiple sets of conditions that can't be
-                        // merged. When this happens we need to generate a nested imported
-                        // CSS file using a data URL.
-                        if import_rule.has_conditions() {
-                            let mut all_conditions =
-                                deep_clone_conditions(wrapping_conditions, self.arena);
-                            let mut all_import_records =
-                                shallow_clone_records(wrapping_import_records);
-                            all_conditions.append_assume_capacity(
-                                import_rule.conditions_with_import_records(
-                                    self.arena,
-                                    &mut all_import_records,
-                                ),
-                            );
-                            self.order.push(CssImportOrder {
-                                kind: CssImportOrderKind::ExternalPath(record.path),
-                                conditions: all_conditions,
-                                condition_import_records: all_import_records,
-                            });
-                        } else {
-                            self.order.push(CssImportOrder {
-                                kind: CssImportOrderKind::ExternalPath(record.path),
-                                // SAFETY: arena-backed `Vec` header; the pushed
-                                // `CssImportOrder` never drops it (see the note at
-                                // `bitwise_copy`), so the aliased buffer is freed once
-                                // with the arena.
-                                conditions: unsafe { bitwise_copy(wrapping_conditions) },
-                                // SAFETY: same single-free invariant as `conditions`
-                                // above; `CssImportOrder` suppresses `Drop`.
-                                condition_import_records: unsafe {
-                                    bitwise_copy(wrapping_import_records)
-                                },
-                            });
-                        }
-                        debug!(
-                            "Push external: {}={}",
-                            source_index.get(),
-                            self.input_file_pretty(source_index),
+                // Record external depednencies
+                if !record.flags.contains(ImportRecordFlags::IS_INTERNAL) {
+                    // If this import has conditions, append it to the list of overall
+                    // conditions for this external import. Note that an external import
+                    // may actually have multiple sets of conditions that can't be
+                    // merged. When this happens we need to generate a nested imported
+                    // CSS file using a data URL.
+                    if import_rule.has_conditions() {
+                        let mut all_conditions =
+                            deep_clone_conditions(wrapping_conditions, self.arena);
+                        let mut all_import_records = shallow_clone_records(wrapping_import_records);
+                        all_conditions.append_assume_capacity(
+                            import_rule.conditions_with_import_records(
+                                self.arena,
+                                &mut all_import_records,
+                            ),
                         );
-                        self.has_external_import = true;
+                        self.order.push(CssImportOrder {
+                            kind: CssImportOrderKind::ExternalPath(record.path),
+                            conditions: all_conditions,
+                            condition_import_records: all_import_records,
+                        });
+                    } else {
+                        self.order.push(CssImportOrder {
+                            kind: CssImportOrderKind::ExternalPath(record.path),
+                            // SAFETY: arena-backed `Vec` header; the pushed
+                            // `CssImportOrder` never drops it (see the note at
+                            // `bitwise_copy`), so the aliased buffer is freed once
+                            // with the arena.
+                            conditions: unsafe { bitwise_copy(wrapping_conditions) },
+                            // SAFETY: same single-free invariant as `conditions`
+                            // above; `CssImportOrder` suppresses `Drop`.
+                            condition_import_records: unsafe {
+                                bitwise_copy(wrapping_import_records)
+                            },
+                        });
                     }
-
-                    import_record_idx += 1;
+                    debug!(
+                        "Push external: {}={}",
+                        source_index.get(),
+                        self.input_file_pretty(source_index),
+                    );
+                    self.has_external_import = true;
                 }
             }
 

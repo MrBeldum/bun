@@ -155,6 +155,258 @@ describe("bundler", () => {
     },
   });
 
+  // An unknown at-rule statement is not a valid rule, so an "@import" after it
+  // is still a valid import. The bundler inlines the file (or hoists an
+  // external import), so the output must not hold the "@import" rule again.
+  const importAfterUnknownAtRule: Record<string, { files: Record<string, string>; out: string }> = {
+    Simple: {
+      files: {
+        "/entry.css": /* css */ `
+          @tailwind base;
+          @import "./local.css";
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `.l{color:#00f}@tailwind base;.k{color:red}`,
+    },
+    BetweenImports: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./other.css";
+          @unknown foo;
+          @import "./local.css";
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+        "/other.css": `.m { color: green }`,
+      },
+      out: `.m{color:green}.l{color:#00f}@unknown foo;.k{color:red}`,
+    },
+    LayerThenUnknown: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer a, b;
+          @unknown x;
+          @import "./local.css";
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `.l{color:#00f}@layer a,b;@unknown x;.k{color:red}`,
+    },
+    UnknownThenLayer: {
+      files: {
+        "/entry.css": /* css */ `
+          @unknown x;
+          @layer a, b;
+          @import "./local.css";
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `.l{color:#00f}@unknown x;@layer a,b;.k{color:red}`,
+    },
+    // The prelude of "@foo" holds a url(). It is not an import and has no import record.
+    UnknownWithURL: {
+      files: {
+        "/entry.css": /* css */ `
+          @foo url(./bar.png);
+          @import "./local.css";
+          @bar url(./bar.png);
+          @import "./other.css";
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+        "/other.css": `.m { color: green }`,
+      },
+      out: `.l{color:#00f}.m{color:green}@foo url(./bar.png);@bar url(./bar.png);.k{color:red}`,
+    },
+    Conditional: {
+      files: {
+        "/entry.css": /* css */ `
+          @tailwind base;
+          @import "./local.css" layer(foo) screen;
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `@media screen{@layer foo{.l{color:#00f}}}@tailwind base;.k{color:red}`,
+    },
+    External: {
+      files: {
+        "/entry.css": /* css */ `
+          @tailwind base;
+          @import "https://example.com/x.css";
+          .k { color: red }
+        `,
+      },
+      out: `@import "https://example.com/x.css";@tailwind base;.k{color:red}`,
+    },
+    // The importer is wrapped in the conditions of its own import. The wrapper must not hold an "@import".
+    ImporterWithConditions: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./mid.css" layer(foo) screen;
+        `,
+        "/mid.css": /* css */ `
+          @plugin "x";
+          @import "./local.css";
+          .m { color: green }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `@media screen{@layer foo{.l{color:#00f}}}@media screen{@layer foo{@plugin "x";.m{color:green}}}`,
+    },
+    // Both copies of mid.css come from one shared stylesheet.
+    ImporterImportedTwice: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./mid.css" layer(one);
+          @import "./mid.css" layer(two);
+        `,
+        "/mid.css": /* css */ `
+          @plugin "x";
+          @import "./local.css";
+          .m { color: green }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `@layer one{.l{color:#00f}}@layer one{@plugin "x";.m{color:green}}@layer two{.l{color:#00f}}@layer two{@plugin "x";.m{color:green}}`,
+    },
+    Cycle: {
+      files: {
+        "/entry.css": /* css */ `
+          @tailwind base;
+          @import "./entry.css";
+          .k { color: red }
+        `,
+      },
+      out: `@tailwind base;.k{color:red}`,
+    },
+    Diamond: {
+      files: {
+        "/entry.css": /* css */ `
+          @tailwind base;
+          @import "./b.css";
+          @import "./c.css";
+          .last { color: red }
+        `,
+        "/b.css": /* css */ `
+          @plugin "x";
+          @import "./d.css";
+          .first { color: red }
+        `,
+        "/c.css": /* css */ `
+          @import "./d.css";
+          .third { color: red }
+        `,
+        "/d.css": `.second { color: red }`,
+      },
+      out: `@plugin "x";.first{color:red}.second{color:red}.third{color:red}@tailwind base;.last{color:red}`,
+    },
+  };
+
+  // The CSS parser rejects an "@import" that comes after a style rule.
+  async function expectToBundleAgain(file: string) {
+    const again = await Bun.build({ entrypoints: [file], throw: false });
+    expect(again.logs.filter(log => log.level === "error").map(log => log.message)).toEqual([]);
+    expect(again.success).toBe(true);
+  }
+
+  for (const [name, { files, out }] of Object.entries(importAfterUnknownAtRule)) {
+    itBundled(`css/CSSAtImportAfterUnknownAtRule${name}`, {
+      files,
+      outfile: "/out.css",
+      minifyWhitespace: true,
+      async onAfterBundle(api) {
+        api.expectFile("/out.css").toBe(out + "\n");
+        await expectToBundleAgain(api.outfile);
+      },
+    });
+  }
+
+  itBundled("css/CSSAtImportAfterUnknownAtRuleCLI", {
+    files: importAfterUnknownAtRule.Simple.files,
+    outfile: "/out.css",
+    backend: "cli",
+    async onAfterBundle(api) {
+      api.expectFile("/out.css").toBe(`/* local.css */
+.l {
+  color: #00f;
+}
+
+/* entry.css */
+@tailwind base;
+
+.k {
+  color: red;
+}
+`);
+      await expectToBundleAgain(api.outfile);
+    },
+  });
+
+  itBundled("css/CSSAtImportAfterUnknownAtRuleFromJS", {
+    files: {
+      "/entry.js": /* js */ `import "./entry.css";`,
+      ...importAfterUnknownAtRule.Simple.files,
+    },
+    outdir: "/out",
+    minifyWhitespace: true,
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.css").toBe(importAfterUnknownAtRule.Simple.out + "\n");
+    },
+  });
+
+  itBundled("css/CSSAtImportAfterUnknownAtRuleFromHTML", {
+    files: {
+      "/index.html": /* html */ `
+        <!doctype html>
+        <html>
+          <head>
+            <link rel="stylesheet" href="./entry.css" />
+          </head>
+          <body></body>
+        </html>
+      `,
+      ...importAfterUnknownAtRule.Simple.files,
+    },
+    entryPoints: ["/index.html"],
+    outdir: "/out",
+    minifyWhitespace: true,
+    onAfterBundle(api) {
+      const chunks = readdirSync(api.outdir).filter(name => name.endsWith(".css"));
+      expect(chunks).toHaveLength(1);
+      api.expectFile("/out/" + chunks[0]).toBe(importAfterUnknownAtRule.Simple.out + "\n");
+    },
+  });
+
+  // Without bundling nothing inlines the file, so the "@import" rule stays.
+  test("css @import after an unknown at-rule prints with --no-bundle", async () => {
+    using dir = tempDir("css-import-after-unknown-no-bundle", {
+      "entry.css": `@tailwind base;\n@import "./local.css";\n.k { color: red }\n`,
+      "local.css": `.l { color: blue }\n`,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "build", "--no-bundle", "--minify", "entry.css"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({
+      stdout,
+      log: stderr.split("\n").filter(line => /^(warn|error):/.test(line)),
+      exitCode,
+    }).toEqual({
+      stdout: `@tailwind base;@import "./local.css";.k{color:red}`,
+      log: ["warn: invalid @ rule encountered: '@tailwind'"],
+      exitCode: 0,
+    });
+  });
+
   itBundled("css/CSSUrlImport", {
     files: {
       "/a.css": /* css */ `
