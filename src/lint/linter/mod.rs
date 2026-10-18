@@ -73,8 +73,8 @@ pub use resolved::{
 use resolved::{Prepared, Skipped, Slot};
 pub use schema::{OptionMistake, Step, mistake_in_options, schema_and_defaults};
 pub use syntax::{
-    Refusal, TypesInJavaScript, goes_to_flow, may_be_misread, parse_error, parse_errors,
-    redeclarations, refusal_of_oxfmt, refusal_of_prettier, refused_by_prettier_with,
+    Refusal, TypesInJavaScript, goes_to_flow, may_be_misread, parse_error, redeclarations,
+    refusal_of_oxfmt, refusal_of_prettier, refused_by_prettier_with,
 };
 
 use crate::ast::File;
@@ -468,27 +468,32 @@ impl<S: RuleSet> Linter<S> {
     ) -> LintResult {
         let locator = Locator::new(file);
         let mut problems: Vec<LintMessage> = Vec::new();
-        let (mut fatal, is_of_parser) = match file.parsed() {
+        let verdict = match file.parsed() {
             // Its language has parsed it.
-            Some(_) => (Vec::new(), false),
-            None => syntax::parse_errors_and_stage(file),
+            Some(_) => None,
+            None => Some(syntax::verdict(file)),
         };
-        if !fatal.is_empty() {
-            let is_oxlint = file.language().is_oxlint;
-            if is_oxlint && is_of_parser && syntax::is_flow(file) {
-                return LintResult::default();
-            }
+        let fatal = verdict.map_or(&[][..], |it| &it.messages[..]);
+        let is_refused = !fatal.is_empty();
+        if is_refused {
+            let is_flow = verdict.is_some_and(|it| it.is_flow);
             // What oxc refuses, oxlint does not lint. tsgolint reads the file on its own, and oxlint, which has not seen the comments,
             // passes on all that it reports. Here that is so where the tree is whole: the error is an early one.
-            if !is_oxlint || file.types.is_none() || file.has_parse_errors() {
+            if !file.language().is_oxlint || file.types.is_none() || syntax::has_holes(file) {
                 return LintResult {
-                    messages: fatal,
+                    messages: match is_flow {
+                        true => Vec::new(),
+                        false => fatal.to_vec(),
+                    },
                     ..LintResult::default()
                 };
             }
-            problems.append(&mut fatal);
+            if !is_flow {
+                problems.extend_from_slice(fatal);
+            }
         }
-        let is_refused = !problems.is_empty();
+        // They stay first, in the order of the parser.
+        let refused = problems.len();
         let mut result = LintResult {
             tolerated_errors: syntax::tolerated_errors(file),
             ..LintResult::default()
@@ -1095,8 +1100,11 @@ impl<S: RuleSet> Linter<S> {
         if file.language().stands_alone {
             problems.iter_mut().for_each(LintMessage::stay_in_file);
         }
-        if wants_places && !in_run_order {
-            LintMessage::sort(&mut problems);
+        if wants_places
+            && !in_run_order
+            && let Some(of_rules) = problems.get_mut(refused..)
+        {
+            LintMessage::sort(of_rules);
         }
 
         let report_unused = (options.report_unused_disable_directives)

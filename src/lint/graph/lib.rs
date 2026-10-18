@@ -1189,6 +1189,8 @@ impl Modules for Graph<'_> {
     }
 
     fn record_exports<'a>(&self, file: &'a File<'a>, make: MakeRecord) {
+        // Only the rules of oxlint keep records, and the first of them comes here before it comes to `record`.
+        self.follows_oxlint.store(true, Ordering::Relaxed);
         let _ = self.record_maker.set(make);
         let mut real = self.store.disk().realpath(&from_native(file.path()));
         if file.is_later_script() {

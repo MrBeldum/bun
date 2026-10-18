@@ -24,7 +24,7 @@ use bun_lint::linter::config::strings_of;
 use bun_lint::linter::globals::{InferredGlobal, InferredGlobals, ProgramGlobals};
 use bun_lint::linter::{
     Details, LintMessage, LintOptions, LintResult, MAX_AUTOFIX_PASSES, ResolvedConfig, RuleId,
-    apply_fixes, breaks_syntax,
+    apply_fixes, breaks_syntax, is_parse_error,
 };
 use bun_sema::json::Json;
 use bun_sema::program::{FileId, Files};
@@ -582,8 +582,18 @@ fn check_and_lint_in(
                 result.messages.push(type_error(diagnostic));
             }
         }
-        for (result, _) in results.iter_mut().flatten() {
-            LintMessage::sort(&mut result.messages);
+        for (at, result) in results.iter_mut().enumerate() {
+            let Some((result, _)) = result else {
+                continue;
+            };
+            // oxlint prints what oxc's parser has first, in its order, and then what tsgolint has.
+            let is_oxlint = files[indices[at]].config.language.is_oxlint;
+            let place = |it: &LintMessage| {
+                (!(is_oxlint && is_parse_error(it))).then_some((it.line as i32, it.column as i32))
+            };
+            if !result.messages.is_sorted_by_key(place) {
+                bun_lint::utils::sort::sort_by_key(&mut result.messages, place);
+            }
         }
     }
     (results, places)
