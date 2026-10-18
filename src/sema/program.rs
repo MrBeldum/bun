@@ -192,6 +192,10 @@ pub struct Module<'s> {
     pub redirected_imports: ArenaFew<'s, (Atom, ResolutionMode, Atom)>,
     /// Those of `imports` that resolve to a declaration file of a referenced project, for which its source is loaded.
     pub project_reference_imports: ArenaFew<'s, (Atom, ResolutionMode)>,
+    /// The keys of `imports` for which no entry of `moduleNames` has a task (`shouldAddFile`), the names of module augmentations among them.
+    pub imports_without_task: ArenaFew<'s, (Atom, ResolutionMode)>,
+    /// The tasks of imports that `imports` does not have, because the checker may not resolve them: with the file of the task.
+    pub tasks_without_import: ArenaFew<'s, (Atom, ResolutionMode, FileId)>,
     /// The specifiers that resolve to a source of a referenced project whose declaration file
     /// is not in the program, with `OutputDts` and `ResolvedFileName`. They resolve to no file
     /// (6305).
@@ -3505,8 +3509,13 @@ impl Included<'_, '_> {
             specifiers.extend(std::iter::repeat_n((u.spec, mode, 1393, u.pos, end), times));
         }
         for (spec, mode, code, start, end) in specifiers {
-            let Some(&target) = module.imports.get(&(spec, mode)) else {
-                continue;
+            // `subTasks`: a reference is of a task, which `imports` has only for what the checker may resolve.
+            let key = (spec, mode);
+            let task = (module.tasks_without_import.iter()).find(|it| (it.0, it.1) == key);
+            let target = match (task, module.imports.get(&key)) {
+                (Some(task), _) => task.2,
+                (None, Some(&target)) if !module.imports_without_task.contains(&key) => target,
+                _ => continue,
             };
             // The name is that of the file, unless somebody asks.
             let asked = is_asked[target.idx()].then(|| {
@@ -3934,7 +3943,8 @@ impl Included<'_, '_> {
         let visits = self.visits(&resolver, &is_reported);
         (modules.iter().zip(&visits).enumerate())
             .map(|(i, (module, visits))| (i, module, self.by_path_of(visits, module.file_name())))
-            .filter(|(.., visits)| !visits.is_empty())
+            // Not by whether there are visits: a file without a reason is still reported.
+            .filter(|(i, ..)| is_reported[*i])
             .map(|(i, module, visits)| {
                 let file = FileId(i as u32);
                 self.explain(
@@ -4685,6 +4695,8 @@ impl<'s> Files<'s> {
         // Imports that are resolved without adding the file to the program: they resolve if the
         // file is in the program for another reason.
         let mut only_found: Vec<(FileId, Atom, ResolutionMode, &[u8])> = Vec::new();
+        // The other way around: imports with a task that the checker may not resolve, with the file of the task.
+        let mut only_tasks: Vec<(FileId, Atom, ResolutionMode, FileId)> = Vec::new();
         // `processingDiagnostics` of the tasks for imported files with an extension that the
         // program does not support, each at the import: the file and the span.
         let mut unsupported: Vec<(FileId, u32, u32, Problem)> = Vec::new();
@@ -4905,6 +4917,8 @@ impl<'s> Files<'s> {
                         let file = add(path, false, &mut modules, &mut depths, &mut all_found);
                         if is_importable {
                             loaded.module.imports.insert((spec, mode), file);
+                        } else {
+                            only_tasks.push((*id, spec, mode, file));
                         }
                         sub_tasks.push(SubTask {
                             file,
@@ -5174,6 +5188,17 @@ impl<'s> Files<'s> {
                 *file = renumber(*file);
                 is_in_program
             });
+            only_tasks.retain_mut(|(file, _, _, target)| {
+                let is_in_program = is_kept[file.idx()];
+                *file = renumber(*file);
+                match renumbered[target.idx()] {
+                    Some(new) => {
+                        *target = new;
+                        is_in_program
+                    }
+                    None => false,
+                }
+            });
             for start in &mut starts {
                 *start = renumber(*start);
             }
@@ -5182,11 +5207,32 @@ impl<'s> Files<'s> {
             module.is_from_external_library = depth > 0;
         }
         program_errors.extend(resolver.resolution_problems());
+        let mut without_task: FxHashMap<FileId, Vec<(Atom, ResolutionMode)>> = FxHashMap::default();
         for (id, spec, mode, path) in only_found {
             if let Some(target) = by_path.get(path)
                 && let Some(module) = &mut modules[id.idx()]
             {
-                module.imports.insert((spec, mode), target);
+                if module.imports.insert((spec, mode), target).is_none() {
+                    without_task.entry(id).or_default().push((spec, mode));
+                }
+            }
+        }
+        for (id, keys) in without_task {
+            if let Some(module) = &mut modules[id.idx()] {
+                module.imports_without_task = few(keys, arena);
+            }
+        }
+        let mut without_import: FxHashMap<FileId, Vec<(Atom, ResolutionMode, FileId)>> =
+            FxHashMap::default();
+        for (id, spec, mode, target) in only_tasks {
+            without_import
+                .entry(id)
+                .or_default()
+                .push((spec, mode, target));
+        }
+        for (id, tasks) in without_import {
+            if let Some(module) = &mut modules[id.idx()] {
+                module.tasks_without_import = few(tasks, arena);
             }
         }
         // A name of the source that each declaration file is read in place of.
@@ -5232,7 +5278,16 @@ impl<'s> Files<'s> {
             let (built, unbuilt): (Vec<_>, Vec<_>) =
                 of_references.partition(|it| module.imports.contains_key(&(it.0, it.1)));
             for &(spec, mode, _, source) in &built {
-                redirect(source, module.imports[&(spec, mode)]);
+                // `outputFileToProjectReferenceSource` is of the task that was redirected.
+                if !module.imports_without_task.contains(&(spec, mode)) {
+                    redirect(source, module.imports[&(spec, mode)]);
+                }
+            }
+            for &(spec, mode, _, source) in &unbuilt {
+                let mut tasks = module.tasks_without_import.iter();
+                if let Some(task) = tasks.find(|it| (it.0, it.1) == (spec, mode)) {
+                    redirect(source, task.2);
+                }
             }
             let mut redirected = module.redirected_imports.to_vec();
             redirected.extend(built.into_iter().map(|it| (it.0, it.1, it.3)));
@@ -6404,6 +6459,8 @@ impl<'s> Files<'s> {
             edges: &[],
             redirected_imports: few(redirected_imports, arena),
             project_reference_imports: few(project_reference_imports, arena),
+            imports_without_task: ArenaFew::default(),
+            tasks_without_import: ArenaFew::default(),
             unbuilt_imports: few(unbuilt_imports, arena),
             project_reference_source: Atom::NONE,
             redirect_for_resolution,
@@ -6502,6 +6559,8 @@ impl<'s> Files<'s> {
                 extensionless_imports,
                 redirected_imports,
                 project_reference_imports,
+                imports_without_task,
+                tasks_without_import,
                 unbuilt_imports,
                 project_reference_source,
                 // There is none.
@@ -6518,6 +6577,10 @@ impl<'s> Files<'s> {
             .collect();
             imports.shared_sort_unstable_by_key(|it| (it.0.0, it.1));
             let edges: Vec<u32> = edges.iter().map(number_of).collect();
+            let tasks_without_import: Vec<(Atom, ResolutionMode, u32)> = (tasks_without_import
+                .iter())
+            .map(|it| (it.0, it.1, number_of(&it.2)))
+            .collect();
             of_file.clear();
             of_file.extend_from_slice(path.text);
             let flags = [
@@ -6542,7 +6605,8 @@ impl<'s> Files<'s> {
                 "{missing_references:?} {untyped_imports:?} {untyped_import_files:?} {resolved_packages:?} \
                  {untyped_import_alternates:?} {jsx_imports:?} {json_imports:?} {ts_extension_imports:?} \
                  {arbitrary_extension_imports:?} {arbitrary_extension_files:?} {extensionless_imports:?} \
-                 {redirected_imports:?} {project_reference_imports:?} {unbuilt_imports:?}"
+                 {redirected_imports:?} {project_reference_imports:?} {unbuilt_imports:?} \
+                 {imports_without_task:?} {tasks_without_import:?}"
             );
             description.extend(run.number_of(&of_file).to_le_bytes());
         }
