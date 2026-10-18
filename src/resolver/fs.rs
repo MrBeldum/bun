@@ -373,6 +373,13 @@ impl<T: DirEntryIterator + ?Sized> DirEntryIterator for &T {
     }
 }
 
+/// One name of a directory read: the `data` key, its hash, and the entry to store under it.
+pub(crate) struct ListedEntry {
+    hash: u64,
+    key: &'static [u8],
+    entry: *mut Entry,
+}
+
 pub struct DirEntry {
     // `dir` is interned in
     // DirnameStore (a process-lifetime BSSList), so `&'static` is correct.
@@ -404,6 +411,36 @@ impl DirEntry {
         filename_store: &mut FilenameStoreAppender,
         iterator: I,
     ) -> crate::CrateResult<()> {
+        let Some(listed) = self.make_entry(prev_map, entry, filename_store)? else {
+            return Ok(());
+        };
+        self.data
+            .put_static_key_hashed(listed.hash, listed.key, listed.entry)?;
+        if !I::IS_VOID {
+            // SAFETY: just produced from EntryStore append or prev_map lookup
+            iterator.next(unsafe { &mut *listed.entry }, self.fd);
+        }
+        Ok(())
+    }
+
+    /// Inserts the entries of one directory read, in one table of the final size.
+    pub(crate) fn put_entries(&mut self, entries: &[ListedEntry]) -> crate::CrateResult<()> {
+        self.data.reserve(entries.len());
+        for listed in entries {
+            self.data
+                .put_static_key_hashed(listed.hash, listed.key, listed.entry)?;
+        }
+        Ok(())
+    }
+
+    /// Finds or makes the `Entry` for one name. The caller inserts it into `data`.
+    #[inline]
+    pub(crate) fn make_entry(
+        &self,
+        prev_map: Option<&mut dir_entry::EntryMap>,
+        entry: &bun_sys::dir_iterator::IteratorResult,
+        filename_store: &mut FilenameStoreAppender,
+    ) -> crate::CrateResult<Option<ListedEntry>> {
         use bun_sys::FileKind as DK;
         // `entry.name.slice()` is OS-native (`&[u16]` on Windows); the
         // entry-store / hashmap key in `data` is UTF-8, so use the eagerly-
@@ -426,7 +463,7 @@ impl DirEntry {
             | DK::UnixDomainSocket
             | DK::Whiteout
             | DK::Door
-            | DK::EventPort => return Ok(()),
+            | DK::EventPort => return Ok(None),
         };
 
         // Lowercase the entry basename once. The same bytes drive the
@@ -545,9 +582,6 @@ impl DirEntry {
             }
         };
 
-        // SAFETY: just produced from EntryStore append or prev_map lookup
-        let stored_ref = unsafe { &mut *stored };
-
         // PERF: the
         // generic `put` here would heap-box a second key copy. `base_lowercase`
         // points either into the `Entry`'s inline `StringOrTinyString` buffer
@@ -562,13 +596,11 @@ impl DirEntry {
         // `(*stored).base_lowercase()` equals `name_lc` byte-for-byte (a fresh
         // entry interned `name_lc`; a recycled one matched it exactly above), so
         // `name_hash` is its hash too — insert without re-hashing.
-        self.data.put_static_key_hashed(name_hash, key, stored)?;
-
-        if !I::IS_VOID {
-            iterator.next(stored_ref, self.fd);
-        }
-
-        Ok(())
+        Ok(Some(ListedEntry {
+            hash: name_hash,
+            key,
+            entry: stored,
+        }))
     }
 
     /// Debug-only contract check: every `.data` probe must run under
