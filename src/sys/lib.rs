@@ -9416,8 +9416,7 @@ impl SysQuietWriterAdapter {
     }
 }
 
-/// Always `Ok(())`: a `?` on a print does not stop the work of a command. A
-/// write to stdout that fails is recorded instead (`fd_write_all_quiet`).
+/// Always `Ok(())`: a `?` on a print never stops a command. `fd_write_all_quiet` records a failed write to stdout.
 unsafe fn adapter_write_all<const RECORD: bool>(
     w: *mut bun_core::io::Writer,
     bytes: &[u8],

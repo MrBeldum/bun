@@ -74,11 +74,9 @@ impl QuietWriter {
 }
 
 /// What the sink does with a failed write through a [`QuietWriterAdapter`].
-/// It selects the sink functions of the adapter. The adapter does not store it.
 #[derive(Clone, Copy)]
 pub enum OnWriteError {
-    /// Stdout. The errno of the first failure is kept for `Global::exit`, which
-    /// reports it for a command that called [`stdout_is_the_result`].
+    /// Stdout: the errno of the first failure is kept for [`stdout_is_the_result`].
     Record,
     /// Dropped: stderr, and `console.*` as Node's `Console` does (`ignoreErrors`).
     Ignore,
@@ -1099,12 +1097,7 @@ pub fn flush_guard() -> FlushGuard {
     FlushGuard(())
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// A result that did not reach stdout
-// ──────────────────────────────────────────────────────────────────────────
-
-/// errno of the first failed write through an [`OnWriteError::Record`] adapter,
-/// 0 if none. Process-wide like fd 1: any thread prints, any thread exits.
+/// errno of the first failed write to stdout, 0 if none. Process-wide, as fd 1 is.
 static STDOUT_WRITE_ERRNO: AtomicI32 = AtomicI32::new(0);
 static STDOUT_IS_THE_RESULT: AtomicBool = AtomicBool::new(false);
 static STDOUT_WRITE_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -1116,10 +1109,7 @@ pub fn record_stdout_write_error(errno: i32) {
     let _ = STDOUT_WRITE_ERRNO.compare_exchange(0, errno, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-/// For a command whose result is what it prints on stdout (`bun build` with no
-/// outdir, `bun pm hash`, `bun --version`). When a write of it fails,
-/// `Global::exit` says so on stderr and does not exit 0. A command that does
-/// not call this keeps its exit code: what it prints is a log of work that is done.
+/// For a command whose result is what it prints: if a write of it fails, `Global::exit` reports it and exits 1.
 pub fn stdout_is_the_result() {
     STDOUT_IS_THE_RESULT.store(true, Ordering::SeqCst);
 }
@@ -1377,8 +1367,7 @@ pub fn print_to(dest: Destination, args: fmt::Arguments<'_>) {
     if let Some(s) = args.as_str() {
         return write_bytes(dest, s.as_bytes());
     }
-    // There's not much we can do here if this errors. Especially if it's something like BrokenPipe.
-    // The sink keeps the errno of a failed write to stdout for `Global::exit`.
+    // There's not much we can do if this errors. Especially if it's something like BrokenPipe.
     with_dest_writer(dest, |w| {
         // SAFETY: `w` is valid per `with_dest_writer`; `write_fmt_raw` routes
         // through the vtable without forming a `&mut Writer`, so `Display`
