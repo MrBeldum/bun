@@ -80,6 +80,9 @@ export async function inTurns<T>(items: T[], run: (item: T) => Promise<void>) {
 /** `deep`: nested too deeply for the stack of a build that is not optimised, or too slow in one. */
 type Case = { files: Record<string, string>; build?: true; deep?: true };
 
+// `ONLY=import-after`: the programs with that in their name, all of them also on a debug build.
+const only = process.env.ONLY;
+
 /**
  * Small programs about which `bun check` and tsc once said something else, each named after where it was found.
  * A program takes two processes, and a test file has three minutes: each file tests one part of `parts`.
@@ -94,10 +97,11 @@ export function programsThatOnceDiffered(part: number, parts: number) {
         using dir = tempDir("bun-check-differential", {});
         const root = String(dir);
         const cases = Object.entries(all)
-          .filter(([, it]) => !(it.deep && (isDebug || isASAN)))
+          .filter(([name, it]) => (only ? name.includes(only) : !(it.deep && (isDebug || isASAN))))
           // A debug build checks a sample. It is always the same sample.
-          .filter((_, index) => index % (isDebug || isASAN ? 40 : 1) === 0)
-          .filter((_, index) => index % (parts * tests) === part * tests + nth)
+          .filter((_, index) => only || index % (isDebug || isASAN ? 40 : 1) === 0)
+          // The programs that `ONLY` selects are few enough for the first test.
+          .filter((_, index) => (only ? part + nth === 0 : index % (parts * tests) === part * tests + nth))
           // Windows cannot create a directory named `c:` or `w*d`.
           .filter(([, it]) => !isWindows || !Object.keys(it.files).some(path => /[:*?"<>|]/.test(path)))
           .filter(([name, it]) => {
