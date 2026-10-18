@@ -172,6 +172,7 @@ impl PackageManagerCommand {
         let load_lockfile = lockfile.load_from_bytes(None, bytes, log);
         Self::handle_load_lockfile_errors_for(&load_lockfile, LogLevel::Default, "hash");
 
+        Output::stdout_is_the_result();
         Output::flush();
         Output::disable_buffering();
         Output::writer().print(format_args!("{}", lockfile.fmt_meta_hash()))?;
@@ -308,6 +309,7 @@ impl PackageManagerCommand {
                 | b"default-trusted"
                 | b"diff"
                 | b"licenses"
+                | b"whoami"
         ) {
             Output::stdout_is_the_result();
         }

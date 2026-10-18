@@ -625,9 +625,61 @@ describe("bun", () => {
       ["why", "dep"],
       ["pm", "diff", "./old", "./new"],
       [lockb],
+      [lockb, "--hash"],
     ]) {
       test(`bun ${args.join(" ").replace(lockb, "bun.lockb")} reports it and exits 1`, async () => {
         using dir = tempDir("failed-stdout", files);
+        using stdout = unwritableFd();
+        expect(await run(args, { stdout: stdout.fd }, String(dir))).toEqual({
+          stderr: "EBADF: Bad file descriptor: " + failedToWrite,
+          exitCode: 1,
+        });
+      });
+    }
+
+    // These ask the registry before they print. A registry in this process answers them.
+    for (const args of [
+      ["pm", "whoami"],
+      ["pm", "view", "pkg", "version"],
+      ["info", "pkg", "version"],
+      ["outdated"],
+      ["audit"],
+    ]) {
+      test(`bun ${args.join(" ")} reports it and exits 1`, async () => {
+        const integrity =
+          "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==";
+        using registry = Bun.serve({
+          port: 0,
+          fetch(req) {
+            const { origin, pathname } = new URL(req.url);
+            if (pathname === "/-/whoami") return Response.json({ username: "someone" });
+            // No advisory for any package.
+            if (pathname === "/-/npm/v1/security/advisories/bulk") return Response.json({});
+            if (pathname !== "/pkg") return new Response(null, { status: 404 });
+            const version = (version: string) => ({
+              name: "pkg",
+              version,
+              dist: { tarball: `${origin}/pkg/-/pkg-${version}.tgz`, integrity },
+            });
+            return Response.json({
+              name: "pkg",
+              "dist-tags": { latest: "2.0.0" },
+              versions: { "1.0.0": version("1.0.0"), "2.0.0": version("2.0.0") },
+            });
+          },
+        });
+        using dir = tempDir("failed-stdout-registry", {
+          "package.json": JSON.stringify({ name: "failed-stdout", version: "1.2.3", dependencies: { pkg: "^1.0.0" } }),
+          "bun.lock": JSON.stringify({
+            lockfileVersion: 1,
+            configVersion: 1,
+            workspaces: { "": { name: "failed-stdout", dependencies: { pkg: "^1.0.0" } } },
+            packages: { pkg: ["pkg@1.0.0", "", {}, integrity] },
+          }),
+          "bunfig.toml": Bun.TOML.stringify({
+            install: { cache: false, registry: { url: `http://localhost:${registry.port}`, token: "token" } },
+          }),
+        });
         using stdout = unwritableFd();
         expect(await run(args, { stdout: stdout.fd }, String(dir))).toEqual({
           stderr: "EBADF: Bad file descriptor: " + failedToWrite,
@@ -688,7 +740,7 @@ describe("bun", () => {
     // `bun build big.js | head -c 1`: the reader has what it wants. A pipe fails a write only for that reason.
     test("a reader that hangs up is not an error", async () => {
       using dir = tempDir("failed-stdout-hang-up", {
-        "big.js": `console.log("${Buffer.alloc(8 * 1024 * 1024, "x").toString()}");\n`,
+        "big.js": `console.log("${Buffer.alloc(2 * 1024 * 1024, "x").toString()}");\n`,
       });
       await using proc = Bun.spawn({
         cmd: [bunExe(), "build", "big.js"],

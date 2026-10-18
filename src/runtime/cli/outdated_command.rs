@@ -95,6 +95,7 @@ fn package_patterns_select(
 
 impl OutdatedCommand {
     pub(crate) fn exec(ctx: Command::Context) -> crate::Result<()> {
+        Output::stdout_is_the_result();
         bun_core::prettyln!(
             "<r><b>bun outdated <r><d>v{}<r>",
             Global::package_json_version_with_sha,
