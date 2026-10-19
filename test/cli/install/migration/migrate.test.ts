@@ -1850,6 +1850,361 @@ describe("package-lock.json migration fixes", () => {
     expect((await readLock(fresh)).lock.packages).toStrictEqual(lock.packages);
   });
 
+  // npm installs each copy of a package from its own entry. bun keeps one package for a name and version, so the
+  // copies have to name one tarball. The copy that was reached first used to decide the URL and the integrity of all.
+  describe.concurrent("copies of one package (B7)", () => {
+    const build = (says: string) =>
+      githubTarball("package", { "package.json": JSON.stringify({ name: "pkg", version: "1.0.0", says }) });
+    const sri = (bytes: Uint8Array, algorithm = "sha512") =>
+      `${algorithm}-` + new Bun.CryptoHasher(algorithm).update(bytes).digest("base64");
+    const [pinned, other] = [build("pinned"), build("other")];
+    const tarball = (host: string) => `${host}pkg/-/pkg-1.0.0.tgz`;
+    const copy = (resolved?: string, integrity?: string) => ({ name: "pkg", version: "1.0.0", resolved, integrity });
+    const aliases = { a: "npm:pkg@1.0.0", b: "npm:pkg@1.0.0" };
+    const refused = (first: string, second: string) =>
+      `error: "${first}" and "${second}" lock pkg@1.0.0 with a different integrity\n`;
+
+    type Hosts = { registry: string; mirror: string; elsewhere: string };
+
+    /**
+     * `registry` and `mirror` have pkg@1.0.0 with the pinned bytes. `elsewhere` sends the other bytes for any path.
+     * `says` is what got installed for the first dependency.
+     */
+    async function withHosts(
+      dependencies: Record<string, string>,
+      packages: (hosts: Hosts) => Record<string, object>,
+      ...args: string[]
+    ) {
+      const requests: string[] = [];
+      const serve = (name: string, bytes: Uint8Array) => {
+        const server = Bun.serve({
+          port: 0,
+          fetch(req) {
+            const { pathname } = new URL(req.url);
+            requests.push(name + pathname);
+            if (pathname !== "/pkg") return new Response(bytes);
+            const dist = { tarball: tarball(server.url.href), integrity: sri(bytes) };
+            return Response.json({
+              name: "pkg",
+              "dist-tags": { latest: "1.0.0" },
+              versions: { "1.0.0": { name: "pkg", version: "1.0.0", dist } },
+            });
+          },
+        });
+        return server;
+      };
+      using registry = serve("registry", pinned);
+      using mirror = serve("mirror", pinned);
+      using elsewhere = serve("elsewhere", other);
+      const hosts = { registry: registry.url.href, mirror: mirror.url.href, elsewhere: elsewhere.url.href };
+      using dir = synthetic(
+        "npm-migrate-copies",
+        {
+          "package.json": JSON.stringify({ name: "app", dependencies }),
+          "package-lock.json": npmLock("app", { "": { name: "app", dependencies }, ...packages(hosts) }),
+        },
+        hosts.registry,
+      );
+      const { stderr, exitCode } = await run(String(dir), ...args);
+      const installed = join(String(dir), "node_modules", Object.keys(dependencies)[0], "package.json");
+      return {
+        stderr,
+        exitCode,
+        hosts,
+        requests,
+        says: fs.existsSync(installed) ? JSON.parse(fs.readFileSync(installed, "utf8")).says : null,
+        rows: fs.existsSync(join(String(dir), "bun.lock")) ? (await readLock(String(dir))).lock.packages : null,
+      };
+    }
+
+    test.each(["first", "second"])("two sha512 are refused (the %s is the one the registry has)", async which => {
+      const [first, second] = which === "first" ? [sri(pinned), sri(other)] : [sri(other), sri(pinned)];
+      const packages = ({ registry }: Hosts) => ({
+        "node_modules/a": copy(tarball(registry), first),
+        "node_modules/b": copy(tarball(registry), second),
+      });
+
+      const ci = await withHosts(aliases, packages, "install", "--frozen-lockfile");
+      expect(ci.stderr).toContain(refused("node_modules/a", "node_modules/b"));
+      expect(ci.stderr).toContain("note: The other entry is here\n");
+      expect(ci).toMatchObject({ exitCode: 1, requests: [], says: null, rows: null });
+
+      // An install that may resolve again reports it, and then resolves without package-lock.json.
+      const install = await withHosts(aliases, packages, "install");
+      expect(install.stderr).toContain(refused("node_modules/a", "node_modules/b"));
+      expect(install.stderr).toContain("InvalidNPMLockfile: failed to migrate lockfile: 'package-lock.json'");
+      expect(install).toMatchObject({
+        exitCode: 0,
+        requests: ["registry/pkg", "registry/pkg/-/pkg-1.0.0.tgz"],
+        says: "pinned",
+      });
+    });
+
+    test.each(["sha1", "sha512"])("a sha1 beside a sha512 is checked against the sha512 (%s first)", async first => {
+      const packages =
+        (sha512: string) =>
+        ({ registry, mirror }: Hosts) => {
+          const copies = [copy(tarball(mirror), sri(pinned, "sha1")), copy(tarball(registry), sha512)];
+          const [a, b] = first === "sha1" ? copies : copies.reverse();
+          return { "node_modules/a": a, "node_modules/b": b };
+        };
+
+      // The package keeps the stronger hash, and the URL of the copy that was reached first.
+      const migrated = await withHosts(aliases, packages(sri(pinned)), "pm", "migrate");
+      const row = ["pkg@1.0.0", tarball(migrated.hosts[first === "sha1" ? "mirror" : "registry"]), {}, sri(pinned)];
+      expect(migrated.rows).toEqual({ a: row, b: row });
+      expect(migrated.exitCode).toBe(0);
+
+      // Both hosts have other bytes than this sha512 names, so the install fails.
+      const installed = await withHosts(aliases, packages(sri(other)), "install", "--frozen-lockfile");
+      expect(installed.stderr).toContain("error: Integrity check failed for tarball: pkg\n");
+      expect(installed).toMatchObject({ exitCode: 1, says: null });
+    });
+
+    test("one sha512 on two hosts is one tarball", async () => {
+      const result = await withHosts(
+        aliases,
+        ({ registry, mirror }) => ({
+          "node_modules/a": copy(tarball(mirror), sri(pinned)),
+          "node_modules/b": copy(tarball(registry), sri(pinned)),
+        }),
+        "install",
+        "--frozen-lockfile",
+      );
+      expect(result.stderr).not.toContain("error:");
+      expect(result).toMatchObject({ exitCode: 0, requests: ["mirror/pkg/-/pkg-1.0.0.tgz"], says: "pinned" });
+    });
+
+    // A dependency on a tarball URL. The copies have one URL, so only the integrity can differ.
+    test.each(["first", "second"])("a tarball URL keeps the integrity that only the %s copy has", async which => {
+      const url = (host: string) => `${host}files/pkg.tgz`;
+      const [first, second] = which === "first" ? [sri(other), undefined] : [undefined, sri(other)];
+      const result = await withHosts(
+        { pkg: "1.0.0", user: "1.0.0" },
+        ({ registry }) => ({
+          "node_modules/pkg": copy(tarball(registry), sri(pinned)),
+          "node_modules/user": {
+            version: "1.0.0",
+            resolved: "http://localhost:1/user/-/user-1.0.0.tgz",
+            integrity: "sha512-" + Buffer.alloc(64, 1).toString("base64"),
+            dependencies: { a: url(registry), b: url(registry) },
+          },
+          "node_modules/user/node_modules/a": { name: "pkg", resolved: url(registry), integrity: first },
+          "node_modules/user/node_modules/b": { name: "pkg", resolved: url(registry), integrity: second },
+        }),
+        "pm",
+        "migrate",
+      );
+      expect(result.stderr).toContain("migrated lockfile from package-lock.json");
+      const row = [`pkg@${url(result.hosts.registry)}`, {}, sri(other)];
+      expect(result.rows).toMatchObject({ a: row, b: row });
+      expect(result.exitCode).toBe(0);
+    });
+
+    // The integrity of a git entry is not the hash of a registry tarball, so it is not compared.
+    test("a git commit with two integrity values migrates", async () => {
+      const commit = `git+ssh://git@github.com/user/g.git#${sha(7)}`;
+      const result = await withHosts(
+        { g: "github:user/g", user: "1.0.0" },
+        () => ({
+          "node_modules/g": { version: "1.0.0", resolved: commit, integrity: sri(pinned) },
+          "node_modules/user": {
+            version: "1.0.0",
+            resolved: "http://localhost:1/user/-/user-1.0.0.tgz",
+            integrity: "sha512-" + Buffer.alloc(64, 1).toString("base64"),
+            dependencies: { g: "github:user/g" },
+          },
+          "node_modules/user/node_modules/g": { version: "1.0.0", resolved: commit, integrity: sri(other) },
+        }),
+        "pm",
+        "migrate",
+      );
+      expect(result.stderr).toContain("migrated lockfile from package-lock.json");
+      expect(result.rows.g[0]).toBe(`g@github:user/g#${sha(7)}`);
+      expect(result.exitCode).toBe(0);
+    });
+
+    // The sha512 copy takes the place of a sha1 as the hash of the package. The other sha1 copy still has to agree
+    // with the first one.
+    test("two sha1 are refused wherever a sha512 copy stands", async () => {
+      const hashes = { x: sri(pinned, "sha1"), y: sri(pinned), z: sri(other, "sha1") };
+      const orders = ["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"];
+      const results = await Promise.all(
+        orders.map(order =>
+          withHosts(
+            { a: "npm:pkg@1.0.0", b: "npm:pkg@1.0.0", c: "npm:pkg@1.0.0" },
+            ({ registry }) =>
+              Object.fromEntries(
+                [...order].map((hash, i) => [
+                  `node_modules/${"abc"[i]}`,
+                  copy(tarball(registry), hashes[hash as keyof typeof hashes]),
+                ]),
+              ),
+            "pm",
+            "migrate",
+          ),
+        ),
+      );
+      const errors = results.map(result => result.stderr.split("\n").filter(line => line.startsWith('error: "')));
+      // The two sha1 copies, in the order that they stand in.
+      const sha1Copies = (order: string) =>
+        [...order].flatMap((hash, i) => (hash === "y" ? [] : [`node_modules/${"abc"[i]}`])) as [string, string];
+      expect(errors).toEqual(orders.map(order => [refused(...sha1Copies(order)).trimEnd()]));
+      expect(results.map(result => result.exitCode)).toEqual(orders.map(() => 1));
+    });
+
+    test("a package with several copies that differ is one error", async () => {
+      const result = await withHosts(
+        { a: "npm:pkg@1.0.0", b: "npm:pkg@1.0.0", c: "npm:pkg@1.0.0", d: "npm:pkg@1.0.0" },
+        ({ registry }) => ({
+          "node_modules/a": copy(tarball(registry), sri(other)),
+          "node_modules/b": copy(tarball(registry), sri(pinned)),
+          "node_modules/c": copy(tarball(registry), sri(pinned)),
+          "node_modules/d": copy(tarball(registry), sri(pinned)),
+        }),
+        "pm",
+        "migrate",
+      );
+      expect(result.stderr.split("\n").filter(line => line.startsWith('error: "'))).toEqual([
+        'error: "node_modules/a" and "node_modules/b" lock pkg@1.0.0 with a different integrity, and 2 more',
+      ]);
+      expect(result.exitCode).toBe(1);
+    });
+
+    test("the error does not print the credentials of a tarball URL", async () => {
+      const token = "npm_" + Buffer.alloc(36, "a1").toString();
+      const url = `https://user:s3cret@host.example/files/pkg.tgz?token=${token}`;
+      const result = await withHosts(
+        { user: "1.0.0" },
+        () => ({
+          "node_modules/user": {
+            version: "1.0.0",
+            resolved: "http://localhost:1/user/-/user-1.0.0.tgz",
+            integrity: "sha512-" + Buffer.alloc(64, 1).toString("base64"),
+            dependencies: { a: url, b: url },
+          },
+          "node_modules/user/node_modules/a": { name: "pkg", resolved: url, integrity: sri(pinned) },
+          "node_modules/user/node_modules/b": { name: "pkg", resolved: url, integrity: sri(other) },
+        }),
+        "pm",
+        "migrate",
+      );
+      expect(result.stderr).toContain(
+        'error: "node_modules/user/node_modules/a" and "node_modules/user/node_modules/b" lock pkg@https://',
+      );
+      expect(result.stderr).not.toContain("s3cret");
+      expect(result.stderr).not.toContain(token);
+      expect(result.exitCode).toBe(1);
+    });
+
+    // `d` has its own copy of `c`, which is the package that `c` is. What is under that copy is never built.
+    describe("a copy that is never built", () => {
+      const published = (name: string, dependencies: object) => ({
+        version: "1.0.0",
+        resolved: `http://localhost:1/${name}/-/${name}-1.0.0.tgz`,
+        integrity: "sha512-" + Buffer.alloc(64, name).toString("base64"),
+        dependencies,
+      });
+      const fork = (host: string) => `${host}files/pkg-fork.tgz`;
+
+      test("is compared too", async () => {
+        const result = await withHosts(
+          { c: "1.0.0", d: "1.0.0" },
+          ({ registry }) => ({
+            "node_modules/c": published("c", { pkg: "1.0.0" }),
+            "node_modules/c/node_modules/pkg": copy(tarball(registry), sri(pinned)),
+            "node_modules/d": published("d", { c: "1.0.0" }),
+            "node_modules/d/node_modules/c": published("c", { pkg: "1.0.0" }),
+            "node_modules/d/node_modules/c/node_modules/pkg": copy(tarball(registry), sri(other)),
+          }),
+          "pm",
+          "migrate",
+        );
+        expect(result.stderr).toContain(
+          refused("node_modules/c/node_modules/pkg", "node_modules/d/node_modules/c/node_modules/pkg"),
+        );
+        expect(result).toMatchObject({ exitCode: 1, requests: [], rows: null });
+      });
+
+      // npm writes some copies of a package without `resolved` and `integrity`.
+      test("gives the package the only integrity that the lockfile has for it", async () => {
+        const result = await withHosts(
+          { c: "1.0.0", d: "1.0.0" },
+          ({ registry }) => ({
+            "node_modules/c": published("c", { pkg: "1.0.0" }),
+            "node_modules/c/node_modules/pkg": { version: "1.0.0" },
+            "node_modules/d": published("d", { c: "1.0.0" }),
+            "node_modules/d/node_modules/c": published("c", { pkg: "1.0.0", unread: "1.0.0" }),
+            "node_modules/d/node_modules/c/node_modules/pkg": copy(tarball(registry), sri(pinned)),
+            // Nothing reads this entry on main, so it is no error that nothing can.
+            "node_modules/d/node_modules/c/node_modules/unread": { version: 1, resolved: 1, integrity: sri(other) },
+          }),
+          "pm",
+          "migrate",
+        );
+        expect(result.stderr).toContain("migrated lockfile from package-lock.json");
+        expect(result.rows.pkg).toEqual(["pkg@1.0.0", tarball(result.hosts.registry), {}, sri(pinned)]);
+        expect(result.exitCode).toBe(0);
+      });
+
+      // npm 11 writes these entries for a registry package and a tarball of the same name and version.
+      test("is the package that its dependent asks for, not the registry's of that name and version", async () => {
+        const result = await withHosts(
+          { pkg: "2.0.0", q: "1.0.0", a: "1.0.0", b: "1.0.0", x: "2.0.0" },
+          ({ registry }) => ({
+            "node_modules/x": { ...published("x", {}), version: "2.0.0" },
+            "node_modules/a": published("a", { x: "1.0.0" }),
+            "node_modules/a/node_modules/pkg": { version: "1.0.0", resolved: fork(registry), integrity: sri(other) },
+            "node_modules/a/node_modules/x": published("x", { pkg: fork(registry) }),
+            "node_modules/b": published("b", { x: "1.0.0" }),
+            "node_modules/b/node_modules/pkg": { version: "1.0.0", resolved: fork(registry), integrity: sri(other) },
+            "node_modules/b/node_modules/x": published("x", { pkg: fork(registry) }),
+            "node_modules/pkg": {
+              version: "2.0.0",
+              resolved: `${registry}pkg/-/pkg-2.0.0.tgz`,
+              integrity: "sha512-" + Buffer.alloc(64, 2).toString("base64"),
+            },
+            "node_modules/q": published("q", { pkg: "^1.0.0" }),
+            "node_modules/q/node_modules/pkg": copy(tarball(registry), sri(pinned, "sha1")),
+          }),
+          "pm",
+          "migrate",
+        );
+        expect(result.stderr).toContain("migrated lockfile from package-lock.json");
+        const tarballRow = [`pkg@${fork(result.hosts.registry)}`, {}, sri(other)];
+        expect(result.rows).toMatchObject({
+          "q/pkg": ["pkg@1.0.0", tarball(result.hosts.registry), {}, sri(pinned, "sha1")],
+          "a/x/pkg": tarballRow,
+          "b/x/pkg": tarballRow,
+        });
+        expect(result.exitCode).toBe(0);
+      });
+
+      // The folded copy of `c` reaches the `pkg` of `d` as a registry package. After that, `w` builds it as a tarball.
+      test("and that another dependent builds afterwards is not folded", async () => {
+        const result = await withHosts(
+          { c: "1.0.0", d: "1.0.0" },
+          ({ registry }) => ({
+            "node_modules/c": published("c", { pkg: "1.0.0" }),
+            "node_modules/pkg": copy(tarball(registry), sri(pinned)),
+            "node_modules/d": published("d", { c: "1.0.0", w: "1.0.0" }),
+            "node_modules/d/node_modules/c": published("c", { pkg: "1.0.0" }),
+            "node_modules/d/node_modules/pkg": { version: "1.0.0", resolved: fork(registry), integrity: sri(other) },
+            "node_modules/d/node_modules/w": published("w", { pkg: fork(registry) }),
+          }),
+          "pm",
+          "migrate",
+        );
+        expect(result.stderr).toContain("migrated lockfile from package-lock.json");
+        expect(result.rows).toMatchObject({
+          pkg: ["pkg@1.0.0", tarball(result.hosts.registry), {}, sri(pinned)],
+          "w/pkg": [`pkg@${fork(result.hosts.registry)}`, {}, sri(other)],
+        });
+        expect(result.exitCode).toBe(0);
+      });
+    });
+  });
+
   test.concurrent("overrides are carried into the migrated lockfile (#55)", async () => {
     using dir = fixture("workspaces-with-overrides");
     const { lock } = await migrate(dir);

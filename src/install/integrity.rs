@@ -1,8 +1,11 @@
 use core::fmt;
 
 use bun_base64::zig_base64::STANDARD_NO_PAD as base64;
+use bun_collections::HashMap;
 use bun_core::strings;
 use bun_sha_hmac::sha as Crypto;
+
+use crate::PackageID;
 
 // Digest lengths (bytes).
 const SHA1_DIGEST_LEN: usize = 20;
@@ -27,6 +30,76 @@ impl Default for Integrity {
         Self {
             tag: Tag::UNKNOWN,
             value: EMPTY_DIGEST_BUF,
+        }
+    }
+}
+
+/// What the hash of one more lockfile entry of a package is to the hashes of its earlier entries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fold {
+    /// The entry has no hash.
+    NoHash,
+    /// An earlier entry has the same hash, so the two entries are one tarball.
+    Same,
+    /// The earlier entry given here has another hash of the same algorithm, so the two entries
+    /// are two tarballs.
+    Conflict(u32),
+    /// No earlier entry has a hash. The package has the hash of this entry now.
+    First,
+    /// The earlier entries have hashes of weaker algorithms. The package has the hash of this
+    /// entry now.
+    Stronger,
+    /// The package keeps the hash of a stronger algorithm that it has.
+    Weaker,
+}
+
+/// The lockfile entries of one package can have hashes of several algorithms. The package keeps
+/// the strongest in its `Meta`, as `Integrity::parse` picks the strongest inside one entry. This
+/// has the others, so that each entry is compared with the hash of its own algorithm, whatever
+/// the order of the entries is.
+#[derive(Default)]
+pub(crate) struct WeakerHashes {
+    /// Keyed by the package and the algorithm. The value has the entry that the hash is from.
+    seen: HashMap<(PackageID, u8), (Integrity, u32)>,
+}
+
+impl WeakerHashes {
+    /// Folds `hash`, which the lockfile entry `entry` has, into the package `id`. `kept` is the
+    /// hash that the package has so far, and `kept_entry` is the entry that it is from.
+    pub(crate) fn fold(
+        &mut self,
+        id: PackageID,
+        kept: &mut Integrity,
+        kept_entry: &mut u32,
+        hash: &Integrity,
+        entry: u32,
+    ) -> Fold {
+        if !hash.tag.is_supported() {
+            return Fold::NoHash;
+        }
+        if !kept.tag.is_supported() {
+            (*kept, *kept_entry) = (*hash, entry);
+            return Fold::First;
+        }
+        if hash.tag == kept.tag {
+            return if hash == kept {
+                Fold::Same
+            } else {
+                Fold::Conflict(*kept_entry)
+            };
+        }
+        if hash.tag.0 > kept.tag.0 {
+            self.seen.insert((id, kept.tag.0), (*kept, *kept_entry));
+            (*kept, *kept_entry) = (*hash, entry);
+            return Fold::Stronger;
+        }
+        match self.seen.get(&(id, hash.tag.0)) {
+            Some((seen, _)) if seen == hash => Fold::Same,
+            Some(&(_, seen_entry)) => Fold::Conflict(seen_entry),
+            None => {
+                self.seen.insert((id, hash.tag.0), (*hash, entry));
+                Fold::Weaker
+            }
         }
     }
 }
