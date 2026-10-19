@@ -4,7 +4,9 @@ use core::fmt::Write as _;
 
 use crate::bun_json as JSON;
 use bun_ast::{Expr, expr::Data as ExprData};
-use bun_collections::{DynamicBitSet, HashContext, HashMap, StringHashMap, index_sort};
+use bun_collections::{
+    DynamicBitSet, HashContext, HashMap, IdentityContext, StringHashMap, index_sort,
+};
 use bun_core::strings;
 use bun_core::{self};
 use bun_semver::semver_string::{
@@ -2017,32 +2019,97 @@ struct Dead {
 }
 
 /// An entry that is not live.
-#[derive(Clone, Copy)]
 struct Open<'a> {
-    /// The hash of `name`.
-    hash: u64,
     entry: u32,
+    /// The next one whose folder and name have the same hash as these.
+    next: u32,
     /// The two parts of its key. `folder` is empty if it is in no folder.
     folder: &'a [u8],
     name: &'a [u8],
 }
 
-/// The entries that are not live, by the hash of their name.
+/// The entries that are not live, by the folder that each is in and its name.
 struct OpenEntries<'a> {
-    by_name: Vec<Open<'a>>,
+    entries: Vec<Open<'a>>,
+    /// The first entry for each hash of a folder and a name.
+    first: HashMap<u64, u32, IdentityContext<u64>>,
     /// One bit for the hash of each name.
     names: [u64; 64],
 }
 
 impl<'a> OpenEntries<'a> {
-    /// The entries from the first one that has this hash.
-    fn named(&self, hash: u64) -> &[Open<'a>] {
-        if self.names[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) == 0 {
-            return &[];
-        }
-        let from = self.by_name.partition_point(|open| open.hash < hash);
-        &self.by_name[from..]
+    const NONE: u32 = u32::MAX;
+
+    fn hash_of(folder_hash: u64, name_hash: u64) -> u64 {
+        (folder_hash ^ name_hash.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
+
+    fn add(&mut self, entry: u32, key: &'a [u8]) -> Result<(), bun_alloc::AllocError> {
+        let (folder, name) = split_key(key);
+        let name_hash = StringBuilder::string_hash(name);
+        let index = self.entries.len() as u32;
+        let first = (self.first).get_or_put(Self::hash_of(hash_of_folder(folder), name_hash))?;
+        let next = if first.found_existing {
+            *first.value_ptr
+        } else {
+            Self::NONE
+        };
+        *first.value_ptr = index;
+        self.entries.push(Open {
+            entry,
+            next,
+            folder,
+            name,
+        });
+        self.names[(name_hash >> 6 & 63) as usize] |= 1 << (name_hash & 63);
+        Ok(())
+    }
+
+    fn has_name(&self, name_hash: u64) -> bool {
+        self.names[(name_hash >> 6 & 63) as usize] & (1 << (name_hash & 63)) != 0
+    }
+
+    /// The entry at `<folder>/<name>`.
+    fn find(&self, folder: (&[u8], u64), name: (&[u8], u64)) -> Option<u32> {
+        let mut index = *self.first.get(&Self::hash_of(folder.1, name.1))?;
+        while index != Self::NONE {
+            let open = &self.entries[index as usize];
+            if open.folder == folder.0 && open.name == name.0 {
+                return Some(open.entry);
+            }
+            index = open.next;
+        }
+        None
+    }
+}
+
+const FOLDER_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn hash_of_folder_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+}
+
+fn hash_of_folder(folder: &[u8]) -> u64 {
+    let mut hash = FOLDER_HASH_SEED;
+    for &byte in folder {
+        hash = hash_of_folder_byte(hash, byte);
+    }
+    hash
+}
+
+/// Lists the length and the hash of each folder that the package at `key` looks a dependency
+/// up in: its own, each one that encloses it, and the root. A workspace looks in its own and at
+/// the root only.
+fn folders_of(key: &[u8], is_member: bool, folders: &mut Vec<(u32, u64)>) {
+    let mut hash = FOLDER_HASH_SEED;
+    folders.push((0, hash));
+    for (at, &byte) in key.iter().enumerate() {
+        if byte == b'/' && !is_member {
+            folders.push((at as u32, hash));
+        }
+        hash = hash_of_folder_byte(hash, byte);
+    }
+    folders.push((key.len() as u32, hash));
 }
 
 /// Which bundled entries stop the lookup of an optional peer below them.
@@ -2147,32 +2214,29 @@ impl Lookups<'_> {
         reach: &mut Reach<'_>,
         open: &OpenEntries<'_>,
         key: &[u8],
-        // A workspace looks in its own folder and at the root only.
         is_member: bool,
         list: DependencySlice,
         stops: Stops,
+        folders: &mut Vec<(u32, u64)>,
     ) -> bool {
         let mut found = false;
+        folders.clear();
         for dep_id in list.begin()..list.end() {
             let dep = &self.dependencies[dep_id as usize];
-            let named = open.named(dep.name_hash);
-            if named.first().is_none_or(|open| open.hash != dep.name_hash)
-                || self.has_no_entry(dep_id)
-            {
+            if !open.has_name(dep.name_hash) || self.has_no_entry(dep_id) {
                 continue;
+            }
+            if folders.is_empty() {
+                folders_of(key, is_member, folders);
             }
             let name = dep.name.slice(self.string_buf);
             let is_stopped = dep.behavior.is_optional_peer() && !is_member;
-            for open in named.iter().take_while(|open| open.hash == dep.name_hash) {
-                let folder = open.folder;
-                let is_above =
-                    folder.is_empty() || key == folder || (!is_member && is_below(key, folder));
-                if is_above
-                    && !reach.live[open.entry as usize]
-                    && open.name == name
+            for &(len, hash) in folders.iter() {
+                let folder = &key[..len as usize];
+                if let Some(entry) = open.find((folder, hash), (name, dep.name_hash))
                     && !(is_stopped && self.stops_below(key, folder, stops, reach))
                 {
-                    found |= reach.mark(open.entry);
+                    found |= reach.mark(entry);
                 }
             }
         }
@@ -2187,6 +2251,7 @@ impl Lookups<'_> {
         open: &OpenEntries<'_>,
         mut scanned: Option<&mut [bool]>,
         stops: Stops,
+        folders: &mut Vec<(u32, u64)>,
     ) -> bool {
         let mut found = false;
         for entry in 0..self.rows.len() {
@@ -2210,7 +2275,7 @@ impl Lookups<'_> {
                 continue;
             }
             let (key, list) = (self.key_of(entry as u32), self.lists[package as usize]);
-            found |= self.look_up(reach, open, key, false, list, stops);
+            found |= self.look_up(reach, open, key, false, list, stops, folders);
         }
         found
     }
@@ -2225,23 +2290,17 @@ impl Lookups<'_> {
         let count = self.rows.len();
 
         let mut open = OpenEntries {
-            by_name: Vec::with_capacity(reach.open),
+            entries: Vec::with_capacity(reach.open),
+            first: HashMap::default(),
             names: [0; 64],
         };
+        open.first.ensure_total_capacity(reach.open)?;
         for entry in 0..count {
             if !reach.live[entry] {
-                let (folder, name) = split_key(self.key_of(entry as u32));
-                let hash = StringBuilder::string_hash(name);
-                open.by_name.push(Open {
-                    hash,
-                    entry: entry as u32,
-                    folder,
-                    name,
-                });
-                open.names[(hash >> 6 & 63) as usize] |= 1 << (hash & 63);
+                open.add(entry as u32, self.key_of(entry as u32))?;
             }
         }
-        (open.by_name).sort_unstable_by_key(|open| (open.hash, open.entry));
+        let mut folders: Vec<(u32, u64)> = Vec::new();
 
         // A workspace looks up its dependencies from `<name>`, or from `./<name>` if a
         // dependency of the root has the key with its name.
@@ -2255,15 +2314,15 @@ impl Lookups<'_> {
             }
             path_buf[..prefix.len()].copy_from_slice(prefix);
             path_buf[prefix.len()..end].copy_from_slice(name);
-            let list = self.lists[member as usize];
-            found |= self.look_up(reach, &open, &path_buf[..end], true, list, Stops::Each);
+            let (key, list) = (&path_buf[..end], self.lists[member as usize]);
+            found |= self.look_up(reach, &open, key, true, list, Stops::Each, &mut folders);
         }
         // Most files have no entry that is not live after these.
         for index in 0..reach.peers.len() {
             let (entry, dep_id) = reach.peers[index];
             if reach.live[entry as usize] && reach.is_trusted(entry) {
                 let (key, peer) = (self.key_of(entry), DependencySlice::new(dep_id, 1));
-                found |= self.look_up(reach, &open, key, false, peer, Stops::Each);
+                found |= self.look_up(reach, &open, key, false, peer, Stops::Each, &mut folders);
             }
         }
         if found && reach.close() {
@@ -2275,7 +2334,8 @@ impl Lookups<'_> {
         // Each waiting entry, and the entry whose dependency list it walked here.
         let mut walked: Vec<(u32, u32)> = Vec::new();
         loop {
-            let mut found = self.look_up_each(reach, &open, Some(&mut scanned), Stops::Each);
+            let mut found =
+                self.look_up_each(reach, &open, Some(&mut scanned), Stops::Each, &mut folders);
 
             // An entry that waits for a dead entry walks the dependency list that its package
             // has without that one: the list of its first live entry.
@@ -2293,20 +2353,21 @@ impl Lookups<'_> {
                         continue;
                     }
                     walked.push((entry, first.entry));
-                    let key = self.key_of(entry);
-                    found |= self.look_up(reach, &open, key, false, first.list, Stops::Each);
+                    let (key, list) = (self.key_of(entry), first.list);
+                    found |=
+                        self.look_up(reach, &open, key, false, list, Stops::Each, &mut folders);
                 }
             }
 
             // A bundled entry stops the lookup of an optional peer below it. One that is not
             // live stops nothing, so those lookups go on.
             if !found
-                && (open.by_name.iter()).any(|open| {
+                && (open.entries.iter()).any(|open| {
                     !reach.live[open.entry as usize]
                         && self.bundled.contains(self.key_of(open.entry))
                 })
             {
-                found = self.look_up_each(reach, &open, None, Stops::Live);
+                found = self.look_up_each(reach, &open, None, Stops::Live, &mut folders);
             }
 
             if !found {
@@ -2318,7 +2379,7 @@ impl Lookups<'_> {
         }
 
         let mut dead = DynamicBitSet::init_empty(count)?;
-        for open in &open.by_name {
+        for open in &open.entries {
             if !reach.live[open.entry as usize] {
                 dead.set(open.entry as usize);
             }
