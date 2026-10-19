@@ -1875,7 +1875,7 @@ impl<'a> Reach<'a> {
             pending: Vec::new(),
             waiting: Vec::new(),
             starts: Vec::with_capacity(keyed.len() + 1),
-            targets: Vec::new(),
+            targets: Vec::with_capacity(keyed.len()),
             peers: Vec::new(),
             keyed,
             makers,
@@ -2987,7 +2987,8 @@ fn load_entries(
 
         let mut repeats: Vec<Repeat> = Vec::new();
         // The entry that made each package. The root and the workspaces have none.
-        let mut makers: Vec<u32> = vec![Slot::NO_ENTRY; lockfile.packages.len()];
+        let mut makers: Vec<u32> = Vec::with_capacity(lockfile.packages.len() + pkg_rows.len());
+        makers.resize(lockfile.packages.len(), Slot::NO_ENTRY);
         // The package of each entry that has its key.
         let mut keyed: Vec<PackageID> = vec![invalid_package_id; pkg_rows.len()];
 
