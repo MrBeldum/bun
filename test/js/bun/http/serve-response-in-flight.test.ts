@@ -372,8 +372,10 @@ async function run(row: Row, { development = false, secure = false, held = false
       });
     },
   });
+  // With a deadline: a request that the server never lets go shows in the result, not as a timeout.
   const released = async () => {
-    while (server.pendingRequests > 0) await new Promise(resolve => setImmediate(resolve));
+    const deadline = Date.now() + 2000;
+    while (server.pendingRequests > 0 && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
   };
   const request = held ? { ...row, hold: released } : row;
   const { wire, closed } = await upload(server.port!, secure, request, clientClosed.resolve);

@@ -21,7 +21,10 @@ export type Upload = {
   first?: string;
   path?: string;
   // The client stops reading behind the overflow until this settles, so the
-  // response stays in flight whatever the socket buffers can take.
+  // response stays in flight whatever the socket buffers can take. Its FIN
+  // leaves when it reads on. On macOS a client that has megabytes in flight is
+  // not always told of a reset when it sends nothing afterwards: this FIN is
+  // answered with a reset in that case.
   hold?: () => Promise<unknown>;
 };
 
@@ -55,11 +58,13 @@ export function upload(
       chunks.push(d);
       if (overflowed || !Buffer.concat(chunks).includes(marker!)) return;
       overflowed = true;
-      sock.end(OVERFLOW);
-      if (hold) {
-        sock.pause();
-        hold().finally(() => sock.resume());
-      }
+      if (!hold) return void sock.end(OVERFLOW);
+      sock.write(OVERFLOW);
+      sock.pause();
+      hold().finally(() => {
+        sock.resume();
+        sock.end();
+      });
     });
     sock.on("error", () => (closed = "reset"));
     sock.on("close", () => {
