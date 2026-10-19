@@ -622,6 +622,85 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
     });
   });
 
+  // X has not answered when its body crosses the limit. That body feeds the
+  // response of Y through an HTMLRewriter that has written nothing, so Y's
+  // `error()` runs while X is being rejected. It lets the handler of X go on,
+  // and the close of Y drains microtasks: X answers with a stream that writes
+  // a chunk, under the rejection that is still on the stack. The rejection
+  // used to end that response as complete, under its stream.
+  test("the handler answers with a stream while its request is being rejected", async () => {
+    const heard: string[] = [];
+    const answer = Promise.withResolvers<void>();
+    const bodyOfX = Promise.withResolvers<ReadableStream>();
+    const attached = Promise.withResolvers<void>();
+    using server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      maxRequestBodySize: LIMIT,
+      error(e) {
+        heard.push(`error():${e}`);
+        answer.resolve();
+        return new Response("err", { status: 500 });
+      },
+      async fetch(req) {
+        if (new URL(req.url).pathname === "/x") {
+          bodyOfX.resolve(req.body!);
+          await answer.promise;
+          let controller: any;
+          req.signal.addEventListener("abort", () => void heard.push(`abort, write:${controller.write("late")}`));
+          return new Response(
+            new ReadableStream({
+              type: "direct",
+              async pull(c: any) {
+                controller = c;
+                heard.push(`write:${c.write("chunk-a")}`);
+                await c.flush();
+                await never();
+              },
+              cancel: reason => void heard.push(`cancel:${reason}`),
+            } as any),
+          );
+        }
+        // A stream on the request body of Y: the close of Y fails it, and drains.
+        req.body!.getReader();
+        const other = await bodyOfX.promise;
+        // One turn of the event loop: the server has taken the response of Y.
+        setImmediate(attached.resolve);
+        return new HTMLRewriter()
+          .on("p", { element() {} })
+          .transform(new Response(other, { headers: { "content-type": "text/html" } }));
+      },
+    });
+    // A chunked upload that stays open. `overflow()` takes it over the limit.
+    const post = (path: string) => {
+      let body!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({ start: c => void (body = c) });
+      const done = new AbortController();
+      const outcome = fetch(`http://127.0.0.1:${server.port}${path}`, {
+        method: "POST",
+        body: stream,
+        duplex: "half",
+        signal: done.signal,
+      } as RequestInit).then(
+        async res => ({ status: res.status, body: await res.text() }),
+        e => ({ rejected: e.code }),
+      );
+      return { outcome, done, overflow: () => body.enqueue(new Uint8Array(48).fill(120)) };
+    };
+    const y = post("/y");
+    const x = post("/x");
+    await attached.promise;
+    x.overflow();
+    const result = { x: await x.outcome, y: await y.outcome, heard, pendingRequests: server.pendingRequests };
+    y.done.abort();
+    expect(result).toEqual({
+      x: { rejected: "ECONNRESET" },
+      y: { status: 500, body: "err" },
+      heard: [`error():${tooLarge}`, "write:7", "abort, write:0", `cancel:${aborted}`],
+      pendingRequests: 0,
+    });
+  });
+
   // HTTP/2 holds the status back until the first body byte, and a stream ends
   // with END_STREAM. The response in flight used to end that way: an empty
   // `200`, or the body so far, as a complete message. Now the stream is reset

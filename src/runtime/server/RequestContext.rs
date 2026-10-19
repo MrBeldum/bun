@@ -1550,7 +1550,7 @@ where
         ctx_log!("rejectOversizedRequestBody");
         debug_assert!(self.pin_count.get() > 0);
         // First: a response body that the request body feeds must not answer the error below from `end_chunk`.
-        let writer = self.revoke_response_writer();
+        let _ = self.revoke_response_writer();
 
         fail_oversized_request_body(
             self.request_body_mut(),
@@ -1558,7 +1558,8 @@ where
             self.server().global_this(),
         );
 
-        // The body error can run another request's `error()` handler, which can abort this one: read `resp` again.
+        // The body error can run another request's `error()` handler, which can abort this request or let its handler answer: revoke again, read `resp` again.
+        let writer = self.revoke_response_writer();
         if let Some(resp) = self.resp.get() {
             if resp.has_responded() {
                 self.end_without_body(!MUX);
