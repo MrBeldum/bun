@@ -320,14 +320,13 @@ pub fn parse_error<'a>(file: &'a File<'a>) -> Option<LintMessage> {
 
 /// What is decided about a file before any rule runs: [`verdict`].
 pub(crate) struct Verdict {
-    /// [`parse_error`], and the others that oxlint prints about the file, in its order. ESLint's parsers throw one. Empty: the
-    /// file is linted.
+    /// [`parse_error`], and the others that oxlint prints about the file, in its order. ESLint's parsers throw one.
     pub(super) messages: Vec<LintMessage>,
     /// oxlint says nothing about the file, which its parser refuses: see [`is_flow`].
     pub(super) is_flow: bool,
 }
 
-/// Whether TypeScript's parser has an error for `file` that counts. The tree has holes then, which no rule expects.
+/// Whether TypeScript's parser has an error for `file` that counts. The tree has holes then.
 pub(super) fn has_holes<'a>(file: &'a File<'a>) -> bool {
     error_of_parser(file).is_some()
 }
@@ -344,8 +343,7 @@ pub(super) fn verdict<'a>(file: &'a File<'a>) -> &'a Verdict {
     })
 }
 
-/// [`Verdict::messages`], and whether a parser has them. `false`: oxc has parsed the file, and the pass that builds its scopes has
-/// them.
+/// [`Verdict::messages`], and whether a parser has them. `false`: the pass that builds oxc's scopes has them.
 fn errors_and_stage<'a>(file: &'a File<'a>) -> (Vec<LintMessage>, bool) {
     let parser = file.language().parser;
     // It has no place.

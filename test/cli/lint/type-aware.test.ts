@@ -1,8 +1,12 @@
 // The rules that need types read the tree of the type checker, which TypeScript's parser makes. What oxlint prints about a file
 // that oxc refuses does not depend on that tree: oxc's errors come first, in oxc's order, and tsgolint, which reads the file on
-// its own, adds its reports. Under an .oxlintrc.json every expectation is what oxlint 1.88.0 prints with oxlint-tsgolint 7.0.2004.
+// its own, adds its reports. Each expectation is what oxlint 1.88.0 prints with oxlint-tsgolint 7.0.2004, file by file, but for
+// the files where a comment says otherwise. lint.test.ts has the comments and the fixes of a file that oxc refuses for an early
+// error ("in a file that oxc refuses for an early error, the rules that need types go on").
 import { afterAll, describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isASAN, isDebug, normalizeBunSnapshot, tempDir } from "harness";
+import { bunEnv, bunExe, normalizeBunSnapshot, tempDir } from "harness";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { endChildren, spawn } from "../children";
 
 afterAll(endChildren);
@@ -20,7 +24,7 @@ const env = {
 };
 
 // One thread lints the files one after the other. A debug build takes a second to start a thread for each core.
-async function lint(files: Record<string, string>, args: string[]) {
+async function lint(files: Record<string, string>, args: string[], read: string[] = []) {
   using dir = tempDir("bun-lint-type-aware", files);
   await using proc = spawn({
     cmd: [bunExe(), "lint", "--threads", "1", ...args],
@@ -31,7 +35,8 @@ async function lint(files: Record<string, string>, args: string[]) {
     stderr: "pipe",
   });
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-  return { stdout: normalizeBunSnapshot(stdout, String(dir)), stderr, exitCode };
+  const texts = Object.fromEntries(read.map(name => [name, readFileSync(join(String(dir), name), "utf8")]));
+  return { stdout: normalizeBunSnapshot(stdout, String(dir)), stderr, exitCode, texts };
 }
 
 /** What `-f unix` prints about each file, in its order. */
@@ -56,7 +61,8 @@ const compilerOptions = {
 const tsconfig = JSON.stringify({
   compilerOptions: { ...compilerOptions, module: "esnext", moduleResolution: "bundler" },
 });
-// With no-unused-vars on, the names that are declared twice are found in the variables of the file.
+// With no-unused-vars on, the names that are declared twice are found in the variables of the file. With no rule that needs
+// the variables, a run with types does not find them.
 const oxlintrc = (config: object = {}) =>
   JSON.stringify({
     plugins: ["typescript"],
@@ -66,10 +72,10 @@ const oxlintrc = (config: object = {}) =>
   });
 const floating = "Promises must be awaited, add void operator to ignore. [Error/typescript(no-floating-promises)]";
 const redeclared = (name: string) => `Identifier \`${name}\` has already been declared [Error]`;
-const redeclaredForChecker = "Cannot redeclare block-scoped variable 'a'. [Error/typescript(TS2451)]";
+const octal = "'0'-prefixed octal literals and octal escape sequences are deprecated [Error]";
 
-describe.concurrent("bun lint --type-aware, with a file that oxc refuses", () => {
-  test("prints oxc's errors in oxc's order, and what the rules that need types report", async () => {
+describe.concurrent("bun lint with an .oxlintrc.json, and a file that oxc refuses", () => {
+  test("--type-aware prints oxc's errors in oxc's order, and what the rules that need types report", async () => {
     const files = {
       "tsconfig.json": tsconfig,
       ".oxlintrc.json": oxlintrc(),
@@ -84,77 +90,94 @@ describe.concurrent("bun lint --type-aware, with a file that oxc refuses", () =>
       // oxlint says nothing about a file with `@flow` that oxc cannot parse.
       "d.js":
         "// @flow\nconst p = Promise.resolve(1);\np;\nfunction f(a: number) { return a; }\nvar z = f(1);\nString(z);\n",
+      // Not what oxlint prints: TypeScript's parser has an error that counts for these two, so its tree has holes and no rule
+      // runs on it. oxlint also has `2:1` no-floating-promises in e.ts and `4:1` in g.js.
+      "e.ts": "declare const p: Promise<number>;\np;\nexport const y = ;\n",
+      "g.js": "// @flow\nopaque type C = number;\nconst q = Promise.resolve(1);\nq;\n",
     };
     const { stdout, exitCode } = await lint(files, ["--type-aware", "-f", "unix"]);
     expect(reported(stdout)).toEqual({
       "a.ts": [`1:16: ${redeclared("a")}`, `1:5: ${redeclared("b")}`],
-      "b.ts": [
-        "2:9: '0'-prefixed octal literals and octal escape sequences are deprecated [Error]",
-        `3:5: ${redeclared("a")}`,
-        `4:1: ${floating}`,
-      ],
+      "b.ts": [`2:9: ${octal}`, `3:5: ${redeclared("a")}`, `4:1: ${floating}`],
       "c.ts": [`3:12: ${redeclared("b")}`, `4:1: ${floating}`],
       "d.js": [`3:1: ${floating}`],
+      "e.ts": ["3:18: Unexpected token [Error]"],
     });
     expect(exitCode).toBe(1);
   });
 
-  test("--type-check adds what the type checker reports after oxc's errors", async () => {
-    const code = 'export const n: number = "s";\nlet a = 1; let a = 2;\nexport { a };\n';
-    const withoutValue = 'const x: number = "s";\nexport const y = ;\nexport { x };\n';
-    const flags = ["--type-aware", "--type-check", "-f", "unix"];
-    const [ofOxlint, ofNone] = await Promise.all([
-      lint({ "tsconfig.json": tsconfig, ".oxlintrc.json": oxlintrc(), "a.ts": code }, flags),
-      // ESLint's formats print a file's messages by their places.
-      lint({ "tsconfig.json": tsconfig, "a.ts": withoutValue }, flags),
-    ]);
-    expect({ ofOxlint: reported(ofOxlint.stdout), ofNone: reported(ofNone.stdout) }).toEqual({
-      ofOxlint: {
-        "a.ts": [
-          `2:5: ${redeclared("a")}`,
-          "1:14: Type 'string' is not assignable to type 'number'. [Error/typescript(TS2322)]",
-          `2:5: ${redeclaredForChecker}`,
-          `2:16: ${redeclaredForChecker}`,
-        ],
-      },
-      ofNone: {
-        "a.ts": [
-          "1:7: Type 'string' is not assignable to type 'number'. [Error/typescript/TS2322]",
-          "2:17: Parsing error: Expression expected. [Error]",
-          "2:18: Expression expected. [Error/typescript/TS1109]",
-        ],
-      },
-    });
-    expect({ ofOxlint: ofOxlint.exitCode, ofNone: ofNone.exitCode }).toEqual({ ofOxlint: 1, ofNone: 1 });
-  });
-
-  // TypeScript's parser has an error for `assert`, which oxc reads. The file that is linted first is the one that exports.
-  test("the rules about imports know what a file exports that only TypeScript's parser has an error for", async () => {
-    const rules = { "import/named": "error", "import/default": "error", "import/namespace": "error" };
+  test("--type-aware --fix applies the fixes of the rules that need types beside an error that oxc tolerates", async () => {
+    const rules = { "typescript/no-unnecessary-type-assertion": "error", "typescript/dot-notation": "error" };
     const files = {
       "tsconfig.json": tsconfig,
-      ".oxlintrc.json": oxlintrc({
-        plugins: ["import", "typescript"],
-        rules: { ...rules, "typescript/no-floating-promises": "error" },
-      }),
+      ".oxlintrc.json": oxlintrc({ rules }),
+      "b.ts": "declare const b: number;\nvar n = 010;\nexport const x = b as number;\nexport { n };\n",
+      "d.js": '// @flow\nconst o = { b: 1 };\nfunction f(a: number) { return a; }\nexport const x = o["b"] + f(1);\n',
+      // Not what oxlint does, which takes the assertion out: no rule runs on a tree with holes.
+      "e.ts": "declare const b: number;\nexport const x = b as number;\nexport const y = ;\n",
+    };
+    const read = ["b.ts", "d.js", "e.ts"];
+    const { stdout, texts, exitCode } = await lint(files, ["--type-aware", "--fix", "-f", "unix"], read);
+    expect({ reported: reported(stdout), texts }).toEqual({
+      reported: { "b.ts": [`2:9: ${octal}`], "e.ts": ["3:18: Unexpected token [Error]"] },
+      texts: {
+        "b.ts": "declare const b: number;\nvar n = 010;\nexport const x = b;\nexport { n };\n",
+        "d.js": "// @flow\nconst o = { b: 1 };\nfunction f(a: number) { return a; }\nexport const x = o.b + f(1);\n",
+        "e.ts": files["e.ts"],
+      },
+    });
+    expect(exitCode).toBe(1);
+  });
+
+  // Each of the two files that export has an error of TypeScript's parser that oxc does not have, and is linted before the
+  // file that imports from it: with types the files come in the order of the program, without them the largest comes first.
+  test("the rules about imports know what a file exports that only TypeScript's parser has an error for", async () => {
+    const rules = { "import/named": "error", "import/default": "error", "import/namespace": "error" };
+    const config = oxlintrc({
+      plugins: ["import", "typescript"],
+      rules: { ...rules, "typescript/no-floating-promises": "error" },
+    });
+    const withTypes = {
+      "tsconfig.json": tsconfig,
+      ".oxlintrc.json": config,
       "d.json": "{}\n",
       "a.js": 'import json from "./d.json" assert { type: "json" };\nexport const x = json;\n',
       "b.js":
         'import { missing } from "./a.js";\nimport def from "./a.js";\nimport * as ns from "./a.js";\n' +
         "export const y = [missing, def, ns.nope];\n",
     };
-    const { stdout, exitCode } = await lint(files, ["--type-aware", "-f", "unix"]);
-    expect(reported(stdout)).toEqual({
-      "b.js": [
-        '2:8: No default export found in imported module "./a.js" [Error/import(default)]',
-        '1:10: named import "missing" not found [Error/import(named)]',
-        '4:36: "nope" not found in imported namespace "./a.js". [Error/import(namespace)]',
-      ],
+    const withoutTypes = {
+      "tsconfig.json": tsconfig,
+      ".oxlintrc.json": config,
+      "colors.cts":
+        'export const red = "\\033[31m";\nexport const reset = "\\033[0m";\n' +
+        Buffer.alloc(205, "// Larger than the file that imports it.\n").toString(),
+      "main.ts":
+        'import colors from "./colors.cts";\nimport * as ns from "./colors.cts";\nexport const y = [colors, ns.blue];\n',
+    };
+    const [typed, plain] = await Promise.all([
+      lint(withTypes, ["--type-aware", "-f", "unix"]),
+      lint(withoutTypes, ["-f", "unix"]),
+    ]);
+    expect({ typed: reported(typed.stdout), plain: reported(plain.stdout) }).toEqual({
+      typed: {
+        "b.js": [
+          '2:8: No default export found in imported module "./a.js" [Error/import(default)]',
+          '1:10: named import "missing" not found [Error/import(named)]',
+          '4:36: "nope" not found in imported namespace "./a.js". [Error/import(namespace)]',
+        ],
+      },
+      plain: {
+        "main.ts": [
+          '1:8: No default export found in imported module "./colors.cts" [Error/import(default)]',
+          '3:30: "blue" not found in imported namespace "./colors.cts". [Error/import(namespace)]',
+        ],
+      },
     });
-    expect(exitCode).toBe(1);
+    expect({ typed: typed.exitCode, plain: plain.exitCode }).toEqual({ typed: 1, plain: 1 });
   });
 
-  test("a file that oxc does not refuse is parsed once", async () => {
+  test("--type-aware parses a file that oxc does not refuse once", async () => {
     const clean = "declare const p: Promise<number>;\nvoid p;\nexport {};\n";
     /** How many times the parser runs. */
     const parsed = async (files: Record<string, string>) => {
@@ -164,38 +187,5 @@ describe.concurrent("bun lint --type-aware, with a file that oxc refuses", () =>
     };
     const [one, two] = await Promise.all([parsed({ "a.ts": clean }), parsed({ "a.ts": clean, "b.ts": clean })]);
     expect(two - one).toBe(1);
-  });
-
-  // oxlint has no such warning. A debug build needs seconds to check a body that large.
-  test.skipIf(isDebug || isASAN)("the warning about control flow analysis stays before oxc's errors", async () => {
-    const files = {
-      "tsconfig.json": tsconfig,
-      ".oxlintrc.json": oxlintrc(),
-      "a.ts":
-        "declare const c: boolean, p: Promise<number>;\nlet x: number;\np;\n" +
-        Buffer.alloc(1_100 * 18, "if (c) { x = 1; }\n").toString() +
-        "let a = 1; let a = 2;\nexport { a, x };\n",
-    };
-    const [typed, checked] = await Promise.all([
-      lint(files, ["--type-aware", "-f", "unix"]),
-      lint(files, ["--type-aware", "--type-check", "-f", "unix"]),
-    ]);
-    const tooLarge =
-      "1:1: This file is too large for control flow analysis. " +
-      "Reports from rules that need type information may be wrong or incomplete. [Warning]";
-    expect({ typed: reported(typed.stdout), checked: reported(checked.stdout) }).toEqual({
-      typed: { "a.ts": [tooLarge, `1104:5: ${redeclared("a")}`, `3:1: ${floating}`] },
-      checked: {
-        "a.ts": [
-          tooLarge,
-          `1104:5: ${redeclared("a")}`,
-          "1:1: The containing function or module body is too large for control flow analysis. [Error/typescript(TS2563)]",
-          `3:1: ${floating}`,
-          `1104:5: ${redeclaredForChecker}`,
-          `1104:16: ${redeclaredForChecker}`,
-        ],
-      },
-    });
-    expect({ typed: typed.exitCode, checked: checked.exitCode }).toEqual({ typed: 1, checked: 1 });
   });
 });
