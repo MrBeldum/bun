@@ -2037,6 +2037,15 @@ impl Lookups<'_> {
         }
         open.sort_unstable();
 
+        // The entries that repeat each package, together.
+        let mut by_package: Vec<Repeat> = self.repeats.to_vec();
+        by_package.sort_unstable_by_key(|repeat| (repeat.package, repeat.entry));
+        let repeats_of = |package: PackageID| {
+            let from = by_package.partition_point(|repeat| repeat.package < package);
+            let count = by_package[from..].partition_point(|repeat| repeat.package == package);
+            &by_package[from..from + count]
+        };
+
         // The first live entry of each package that an entry made.
         let mut first_live: Vec<u32> = vec![Slot::NO_ENTRY; self.lists.len()];
         for (package, &maker) in self.makers.iter().enumerate() {
@@ -2089,10 +2098,10 @@ impl Lookups<'_> {
                 // entries walk that one as well.
                 first_live[package as usize] = entry;
                 sources.extend(
-                    (self.repeats.iter())
-                        .filter(|repeat| repeat.package == package && repeat.entry != entry)
+                    (repeats_of(package).iter())
                         .filter(|repeat| {
-                            owners[repeat.entry as usize] != invalid_package_id
+                            repeat.entry != entry
+                                && owners[repeat.entry as usize] != invalid_package_id
                                 && live.is_set(repeat.entry as usize)
                         })
                         .map(|repeat| repeat.entry),
