@@ -1664,6 +1664,7 @@ pub(crate) mod tocss_servo {
     }
 }
 
+#[inline]
 pub(crate) fn should_unwrap_is(selectors: &[parser::Selector]) -> bool {
     if selectors.len() == 1 {
         let first = &selectors[0];
@@ -1727,10 +1728,16 @@ fn is_simple(selector: &parser::Selector) -> bool {
     selector
         .iter_raw_parse_order_from(0)
         .all(|component| match scope_argument(component) {
-            // `:is()` cannot match a pseudo-element, so an argument with one prints as written.
-            Some(argument) => is_simple(argument) || argument.has_pseudo_element(),
+            Some(argument) => is_simple_argument(argument),
             None => !component.is_combinator(),
         })
+}
+
+/// `:is()` cannot match a pseudo-element, so an argument with one prints as written.
+/// Out of line, so that `is_simple` does not call itself and inlines into its callers.
+#[inline(never)]
+fn is_simple_argument(argument: &parser::Selector) -> bool {
+    is_simple(argument) || argument.has_pseudo_element()
 }
 
 /// Whether `selector` has a descendant, child or sibling combinator.
