@@ -1202,21 +1202,18 @@ describe("a bun.lock entry at a key where no dependency is looked up", () => {
   type Lock = {
     root: object;
     workspaces?: Record<string, object>;
-    packages: Record<string, unknown[]>;
+    // A string is the text of the object, for a file that has one key twice.
+    packages: Record<string, unknown[]> | string;
     lockfileVersion?: number;
   };
 
   // What loading decides: the packages, the package that each dependency resolves to, the root's bin, and for each
   // package its tarball, integrity, bin, os and cpu.
   function load({ root, workspaces = {}, packages, lockfileVersion = 1 }: Lock) {
+    const header = JSON.stringify({ lockfileVersion, configVersion: 1, workspaces: { "": root, ...workspaces } });
     using dir = tempDir("bun-lock-no-lookup", {
       "package.json": JSON.stringify(root),
-      "bun.lock": JSON.stringify({
-        lockfileVersion,
-        configVersion: 1,
-        workspaces: { "": root, ...workspaces },
-        packages,
-      }),
+      "bun.lock": `${header.slice(0, -1)},"packages":${typeof packages === "string" ? packages : JSON.stringify(packages)}}`,
     });
     const lockfile = parseLockfile(String(dir));
     const label = (id: number | null | undefined) => {
@@ -1500,6 +1497,22 @@ describe("a bun.lock entry at a key where no dependency is looked up", () => {
       packages: ["<root>", "mid@1.0.0", "host@1.0.0", "peer@1.0.0"],
       resolved: load({ root: app, packages: pinned }).resolved,
     });
+  });
+
+  // The entry of the workspace repeats the key of the package w, so it is at no key of its own. It has its turn
+  // with the package that has the key, but its lookups are those of that package's entry.
+  it("another version of a peer is not loaded if a key is there twice", () => {
+    const root = { name: "app", dependencies: { host: "1.0.0", w: "1.0.0" } };
+    const workspaces = { "packages/w": { name: "w", version: "1.0.0" } };
+    const rows = (added: string) => `{
+      "host": ${JSON.stringify(host)},
+      "w": ${JSON.stringify(entry("w@1.0.0", { peerDependencies: { peer: "^1.0.0" } }))},
+      "w": ["w@workspace:packages/w"],
+      "peer": ${JSON.stringify(peer)}${added}
+    }`;
+    const loaded = load({ root, workspaces, packages: rows("") });
+    expect(loaded.resolved).toMatchObject({ "host@1.0.0 > peer": "peer@1.0.0", "w@1.0.0 > peer": "peer@1.0.0" });
+    expect(load({ root, workspaces, packages: rows(`, "zzz/peer": ${JSON.stringify(other)}`) })).toEqual(loaded);
   });
 
   // An entry at a key where a dependency is looked up is loaded, also if the lookup stops at a nearer entry.
