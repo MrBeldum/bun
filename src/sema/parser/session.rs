@@ -14,8 +14,8 @@ use core::ops::Range;
 pub struct Session<'t> {
     text: &'t [u8],
     dialect: Dialect,
-    /// Given back when the session is dropped.
-    scratch: Box<Scratch>,
+    /// Given back when the session is dropped: `None` from then on.
+    scratch: Option<Box<Scratch>>,
     /// Recycled when the session is dropped.
     file: Box<FileBuilder>,
     /// The statement of each part kept so far, in order: `FileBuilder::body` is made of them after each part.
@@ -102,8 +102,11 @@ impl SortedLens {
 }
 
 impl<'t> Session<'t> {
-    /// Begins a file for the parts of `text`, which are all read in `dialect`.
-    pub fn begin(text: &'t [u8], dialect: Dialect) -> Session<'t> {
+    /// Begins a file for the parts of `text`, which are all read in `dialect`. `None`: the text is too large to parse.
+    pub fn begin(text: &'t [u8], dialect: Dialect) -> Option<Session<'t>> {
+        if text.len() >= 1 << 30 {
+            return None;
+        }
         let mut scratch = take_scratch();
         // Once for all the parts: `run_part` reads them back with `ScannerStopsBuffer::found`.
         scratch.stops.find(text);
@@ -112,14 +115,14 @@ impl<'t> Session<'t> {
         *file = recycled_file(&mut file);
         file.source_len = text.len() as u32;
         file.kind = FileKind::Ts;
-        Session {
+        Some(Session {
             text,
             dialect,
-            scratch,
+            scratch: Some(scratch),
             file,
             parts: Vec::new(),
             has_parsed: false,
-        }
+        })
     }
 
     /// Parses the part from `from` to `until` behind the parts kept so far, and says where it is in the file. What follows
@@ -199,7 +202,8 @@ impl<'t> Session<'t> {
     /// One run of the parser over `part`. On a refusal the file holds what the part added: the caller rolls it back.
     fn run(&mut self, options: Options, part: Part) -> Result<parser::PartHarvest, Refused> {
         bun_core::scoped_log!(sema_parts, "parse {}..{}", part.from, part.until);
-        parser::run_part(self.text, options, part, &mut self.scratch, &mut self.file)
+        let scratch = self.scratch.get_or_insert_default();
+        parser::run_part(self.text, options, part, scratch, &mut self.file)
     }
 
     /// Where the parts kept so far end in the file: [`Session::rollback`] forgets what is parsed after this.
@@ -235,14 +239,18 @@ impl<'t> Session<'t> {
     }
 
     /// The atoms of the file.
-    pub fn atoms(&self) -> FileAtoms<'_> {
-        Scratch::atoms(&self.scratch, self.text)
+    pub fn atoms(&mut self) -> FileAtoms<'_> {
+        Scratch::atoms(self.scratch.get_or_insert_default(), self.text)
     }
 }
 
 impl Drop for Session<'_> {
     fn drop(&mut self) {
-        let mut scratch = std::mem::take(&mut self.scratch);
+        let Some(mut scratch) = self.scratch.take() else {
+            return;
+        };
+        // Another text can get the address of this one.
+        scratch.stops.forget();
         scratch.recycle(std::mem::take(&mut self.file));
         give_back_scratch(scratch);
     }
@@ -252,7 +260,7 @@ impl Drop for Session<'_> {
 mod tests {
     use super::*;
     use bun_core::strings::index_of;
-    use bun_sema::hir::StmtKind;
+    use bun_sema::hir::{NodeOrName, StmtKind};
     use bun_sema_standalone as _;
 
     const TEXT: &[u8] =
@@ -265,6 +273,13 @@ mod tests {
     fn ids(body: IdList<StmtId>, file: &FileBuilder) -> Vec<u32> {
         let range = body.start as usize..(body.start + body.len) as usize;
         file.ids.get(range).unwrap_or_default().to_vec()
+    }
+
+    fn begin() -> Session<'static> {
+        let Some(session) = Session::begin(TEXT, Dialect::default()) else {
+            panic!("the text is not too large");
+        };
+        session
     }
 
     fn kept(session: &mut Session<'_>) -> [PartOk; 3] {
@@ -282,7 +297,7 @@ mod tests {
 
     #[test]
     fn the_parts_kept_make_one_file_at_their_offsets() {
-        let mut session = Session::begin(TEXT, Dialect::default());
+        let mut session = begin();
         let [declaration, sum, call] = kept(&mut session);
         let file = session.file();
         let body = ids(file.body, file);
@@ -311,6 +326,12 @@ mod tests {
         assert_eq!(comment_at(&sum.comments), [at(b"/* two */")]);
         assert_eq!(comment_at(&call.comments), []);
         assert!(file.comments.is_sorted_by_key(|it| it.pos));
+        // The parser of a later part leaves the comments of the earlier ones attached as they are.
+        let attached = |range: &Range<u32>| {
+            let comments = &file.comments[range.start as usize..range.end as usize];
+            comments.iter().all(|it| !matches!(it.enclosing_node, NodeOrName::None))
+        };
+        assert!(attached(&declaration.comments) && attached(&sum.comments));
         assert!(file.diagnostics.is_empty());
         assert!(file.body_starts.is_sorted_by_key(|it| it.0.0));
         assert!(file.parens.is_sorted_by_key(|it| it.0.0));
@@ -318,7 +339,7 @@ mod tests {
 
     #[test]
     fn a_rollback_forgets_the_parts_after_the_mark() {
-        let mut session = Session::begin(TEXT, Dialect::default());
+        let mut session = begin();
         let len = TEXT.len() as u32;
         let first = session.part_at(Goal::Declaration, true, at(b"let a"), len);
         let Ok(first) = first else {
@@ -352,7 +373,7 @@ mod tests {
 
     #[test]
     fn a_refused_part_leaves_nothing_in_the_file() {
-        let mut session = Session::begin(TEXT, Dialect::default());
+        let mut session = begin();
         let len = TEXT.len() as u32;
         let first = session.part_at(Goal::Declaration, true, at(b"let a"), len);
         assert!(first.is_ok(), "{first:?}");

@@ -3,7 +3,7 @@
 //! recovers from errors as TypeScript's does.
 
 use crate::session::{self, PartOk};
-use crate::{Options, Part, Refusal, Scratch};
+use crate::{Options, Part, Refusal, Refused, Scratch};
 use bun_alloc::Arena;
 use bun_sema::atom::{Intern, Interner};
 use bun_sema::hir::{
@@ -585,11 +585,17 @@ impl<'t> Parts<'t> {
     ) -> Result<R, PartError> {
         bun_core::scoped_log!(sema_parts, "part {}..{}", part.from, part.until);
         let text = self.text;
-        let (session, _, begun_in) = self.session.get_or_insert_with(|| {
-            let session = session::Session::begin(text, dialect);
-            let before_any = session.mark();
-            (session, before_any, dialect)
-        });
+        let (session, _, begun_in) = match &mut self.session {
+            Some(begun) => begun,
+            None => {
+                let Some(session) = session::Session::begin(text, dialect) else {
+                    let refused = Refused::new(Refusal::TooLarge);
+                    return Err(PartError::of(&refused, 0));
+                };
+                let before_any = session.mark();
+                self.session.insert((session, before_any, dialect))
+            }
+        };
         debug_assert!(
             *begun_in == dialect,
             "the parts of a text are read in one dialect"
