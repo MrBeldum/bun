@@ -2310,9 +2310,10 @@ pub struct StyleSheet<AtRule> {
     /// The `@import` rules of a `parse_bundler` sheet, in source order. Such a
     /// sheet has no `CssRule::Import` in `rules` and never prints one: the
     /// bundler inlines a stylesheet, hoists an external import, and drops an
-    /// import of any other file. The position of an `@import` among the
-    /// `@layer` statements in `rules` is not kept. Empty for
-    /// `StyleSheet::parse`, which keeps each `@import` in `rules`.
+    /// import of any other file. `minify` does not visit this list, and the
+    /// position of an `@import` among the `@layer` statements in `rules` is
+    /// not kept. Empty for `StyleSheet::parse`, which keeps each `@import` in
+    /// `rules`.
     ///
     /// An `@import` after an unknown at-rule statement (`@tailwind base;`) is
     /// valid (css-cascade-5) and is in this list. esbuild and lightningcss

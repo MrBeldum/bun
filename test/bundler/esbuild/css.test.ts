@@ -158,6 +158,7 @@ describe("bundler", () => {
   // An unknown at-rule statement is not a valid rule, so an "@import" after it
   // is still a valid import. The bundler inlines the file (or hoists an
   // external import), so the output must not hold the "@import" rule again.
+  // esbuild and lightningcss do not inline this import: they keep the rule.
   const importAfterUnknownAtRule: Record<string, { files: Record<string, string>; out: string }> = {
     Simple: {
       files: {
@@ -183,6 +184,8 @@ describe("bundler", () => {
       },
       out: `.m{color:green}.l{color:#00f}@unknown foo;.k{color:red}`,
     },
+    // In the next two cases the "@layer" statement prints after the inlined
+    // file. esbuild prints a "@layer" statement that precedes an "@import" first.
     LayerThenUnknown: {
       files: {
         "/entry.css": /* css */ `
@@ -397,35 +400,22 @@ describe("bundler", () => {
 
   // A CSS module holds "@import" records and "composes" records in one list.
   // "@value" is an unknown at-rule here.
-  for (const splitting of [false, true]) {
-    itBundled(`css/CSSAtImportAfterUnknownAtRuleInCSSModule${splitting ? "Splitting" : ""}`, {
-      files: {
-        "/entry.js": /* js */ `
-          import styles from "./m.module.css";
-          console.log(styles.box);
-        `,
-        "/m.module.css": /* css */ `
-          @value primary: red;
-          @import "./shared.css";
-          .box { composes: other from "./o.module.css"; color: blue }
-        `,
-        "/o.module.css": /* css */ `
-          @value gap: 4px;
-          @import "./deep.css";
-          .other { background: green }
-        `,
-        "/shared.css": `.shared { color: red }`,
-        "/deep.css": `.deep { color: red }`,
-      },
-      outdir: "/out",
-      splitting,
-      onAfterBundle(api) {
-        api.expectFile("/out/entry.css").toBe(`/* shared.css */
-.shared {
-  color: red;
-}
-
-/* deep.css */
+  const importInCSSModule = {
+    files: {
+      "/m.module.css": /* css */ `
+        @value primary: red;
+        @import "./shared.css";
+        .box { composes: other from "./o.module.css"; color: blue }
+      `,
+      "/o.module.css": /* css */ `
+        @value gap: 4px;
+        @import "./deep.css";
+        .other { background: green }
+      `,
+      "/shared.css": `.shared { color: red }`,
+      "/deep.css": `.deep { color: red }`,
+    },
+    o: `/* deep.css */
 .deep {
   color: red;
 }
@@ -436,17 +426,63 @@ describe("bundler", () => {
 .other_WK10Lw {
   background: green;
 }
-
-/* m.module.css */
+`,
+    m: `/* m.module.css */
 @value primary: red;
 
 .box_5WBUVQ {
   color: #00f;
 }
-`);
-      },
-    });
-  }
+`,
+    shared: `/* shared.css */
+.shared {
+  color: red;
+}
+`,
+  };
+
+  itBundled("css/CSSAtImportAfterUnknownAtRuleInCSSModule", {
+    files: {
+      "/entry.js": /* js */ `
+        import styles from "./m.module.css";
+        console.log(styles.box);
+      `,
+      ...importInCSSModule.files,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      const { shared, o, m } = importInCSSModule;
+      api.expectFile("/out/entry.css").toBe([shared, o, m].join("\n"));
+    },
+  });
+
+  // Two CSS chunks print the same two stylesheets.
+  itBundled("css/CSSAtImportAfterUnknownAtRuleInCSSModuleSplitting", {
+    files: {
+      "/a.js": /* js */ `
+        import styles from "./m.module.css";
+        console.log(styles.box);
+        import("./lazy.js");
+      `,
+      "/b.js": /* js */ `
+        import styles from "./o.module.css";
+        console.log(styles.other);
+      `,
+      "/lazy.js": /* js */ `
+        import styles from "./m.module.css";
+        console.log(styles.box);
+      `,
+      ...importInCSSModule.files,
+    },
+    entryPoints: ["/a.js", "/b.js"],
+    outdir: "/out",
+    splitting: true,
+    onAfterBundle(api) {
+      const { shared, o, m } = importInCSSModule;
+      api.expectFile("/out/a.css").toBe([shared, o, m].join("\n"));
+      api.expectFile("/out/b.css").toBe(o);
+    },
+  });
 
   // An "@import" of a file that is not a stylesheet is not inlined and not
   // printed. esbuild fails this build: `Cannot import "notes.txt" into a CSS file`.

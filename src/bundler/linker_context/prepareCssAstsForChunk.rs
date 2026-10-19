@@ -360,7 +360,7 @@ fn prepare_css_asts_for_chunk_impl(c: &LinkerContext, chunk: &mut Chunk, bump: &
     }
 }
 
-/// Builds a `BundlerCssRuleList` whose backing storage is arena-owned.
+/// Builds a one-rule `BundlerCssRuleList` whose backing storage is arena-owned.
 ///
 /// `CssRuleList::v` is a global `Vec`, but every rule slab built here must be
 /// arena-backed: the elements bitwise-alias the source AST and must never run
@@ -369,24 +369,15 @@ fn prepare_css_asts_for_chunk_impl(c: &LinkerContext, chunk: &mut Chunk, bump: &
 /// because the resulting `Vec` is never dropped (`CssChunk::Drop` `forget`s
 /// the `asts` slab) and never grown after this point; the arena reclaims the
 /// storage on `reset`.
-fn arena_rule_list(rules: ArenaVec<'_, BundlerCssRule>) -> BundlerCssRuleList {
-    let len = rules.len();
-    if len == 0 {
-        return BundlerCssRuleList::default();
-    }
+fn arena_rule_list_one(bump: &Bump, rule: BundlerCssRule) -> BundlerCssRuleList {
+    let mut rules: ArenaVec<BundlerCssRule> = ArenaVec::with_capacity_in(1, bump);
+    rules.push(rule);
     let slab = rules.into_bump_slice_mut();
     BundlerCssRuleList {
         // SAFETY: `slab` is arena-owned; the `Vec` is never dropped or grown
         // (see fn doc).
-        v: unsafe { Vec::from_raw_parts(slab.as_mut_ptr(), len, len) },
+        v: unsafe { Vec::from_raw_parts(slab.as_mut_ptr(), 1, 1) },
     }
-}
-
-/// Single-element shorthand for [`arena_rule_list`].
-fn arena_rule_list_one(bump: &Bump, rule: BundlerCssRule) -> BundlerCssRuleList {
-    let mut v: ArenaVec<BundlerCssRule> = ArenaVec::with_capacity_in(1, bump);
-    v.push(rule);
-    arena_rule_list(v)
 }
 
 fn wrap_rules_with_conditions(
