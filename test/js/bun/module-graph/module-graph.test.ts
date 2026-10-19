@@ -3355,6 +3355,86 @@ describe("Bun.ModuleGraph — re-entrancy: graphs created/disposed from inside o
   });
 });
 
+describe("Bun.ModuleGraph — a cycle member suspended at a top-level await when a later member of its cycle throws", () => {
+  // a.mjs imports suspended.mjs, which imports a.mjs back and waits for `gate`, and then throws.mjs. When throws.mjs
+  // throws, the graph's import() rejects while suspended.mjs waits. Its body has started, so it still runs to its end.
+  const cycle = (suspended: string) => ({
+    "a.mjs": `import { state } from "./suspended.mjs"; import "./throws.mjs"; export { state };`,
+    "suspended.mjs": `import "./a.mjs"; export let state = who + ": suspended"; suspendedAtItsAwait(who); ${suspended}`,
+    "throws.mjs": `if (siblingThrows) throw new Error(who + ": the sibling throws");`,
+  });
+  const turns = async () => {
+    for (let i = 0; i < 50; i++) await new Promise<void>(r => setImmediate(r));
+  };
+  test("after dispose() the body runs to its end in the graph's context; what it starts does not start and its error is nobody's", async () => {
+    const dir = fixture({
+      ...cycle(`
+        state = who + ": resumed with " + (await gate) + (Bun.ModuleGraph.current === graph() ? " in its graph" : "");
+        import("./late.mjs").then(() => note("import() settled"), () => note("import() settled"));
+        setTimeout(() => note("timer fired"), 0);
+        ranToItsEnd(state);
+        throw new Error("thrown after the await");`),
+      "late.mjs": `note("late.mjs ran");`,
+    });
+    const gate = Promise.withResolvers<string>();
+    const seen = { ended: [] as string[], notes: [] as string[], errors: [] as string[] };
+    const g: ModuleGraphInstance = ModuleGraph({
+      onError: (e: any) => seen.errors.push(e.message),
+      globals: {
+        who: "g",
+        siblingThrows: true,
+        gate: gate.promise,
+        graph: () => g,
+        suspendedAtItsAwait: () => {},
+        ranToItsEnd: (state: string) => seen.ended.push(state),
+        note: (what: string) => seen.notes.push(what),
+      },
+    });
+    expect(await rejection(g.import(join(dir, "a.mjs")))).toBe("Error [undefined]: g: the sibling throws");
+    g.dispose();
+    gate.resolve("the gate");
+    await turns();
+    expect(seen).toEqual({ ended: ["g: resumed with the gate in its graph"], notes: [], errors: [] });
+  });
+  test("a second graph loads the same files while the first graph's failed member is suspended; each body ends with its own state", async () => {
+    const dir = fixture(cycle(`state = who + ": resumed with " + (await gate); ranToItsEnd(state);`));
+    for (const order of [
+      ["failed", "second"],
+      ["second", "failed"],
+    ]) {
+      const gates: Record<string, PromiseWithResolvers<string>> = {
+        failed: Promise.withResolvers(),
+        second: Promise.withResolvers(),
+      };
+      const suspended: string[] = [];
+      const ended: string[] = [];
+      const graph = (who: string) =>
+        ModuleGraph({
+          globals: {
+            who,
+            siblingThrows: who === "failed",
+            gate: gates[who].promise,
+            suspendedAtItsAwait: (who: string) => suspended.push(who),
+            ranToItsEnd: (state: string) => ended.push(state),
+          },
+        });
+      expect(await rejection(graph("failed").import(join(dir, "a.mjs")))).toBe(
+        "Error [undefined]: failed: the sibling throws",
+      );
+      const second = graph("second").import(join(dir, "a.mjs"));
+      await until(() => suspended.length === 2);
+      for (const who of order) {
+        gates[who].resolve("its gate");
+        await turns();
+      }
+      expect({ ended, state: (await second).state }).toEqual({
+        ended: order.map(who => `${who}: resumed with its gate`),
+        state: "second: resumed with its gate",
+      });
+    }
+  });
+});
+
 describe("Bun.ModuleGraph — host natives injected via globals, called as bare identifiers", () => {
   // A bare-identifier call whose callee lives in the overlay passes the overlay environment in the `this`
   // slot (JSC's convention for scope-resolved callees); JS callees normalise it, natives must not care.

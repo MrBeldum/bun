@@ -240,3 +240,201 @@ test("sibling dynamic imports sharing a TLA wrapper wait for its post-await expo
   expect(stdout.trim()).toBe("foo bar");
   expect(exitCode).toBe(0);
 });
+
+// a.mjs and t.mjs are one import cycle, so t.mjs is still on the stack of
+// Evaluate(), suspended at its await, when x.mjs throws. Evaluate() gives every
+// module on the stack that error, but the body of t.mjs has started: it runs to
+// its end like the body of an async function, as in Node.
+const suspendedCycleMember = {
+  "a.mjs": `
+    import "./t.mjs";
+    import "./x.mjs";
+    console.log("a");
+  `,
+  "t.mjs": `
+    import "./a.mjs";
+    console.log("t1");
+    try {
+      await 0;
+      console.log("t2 (after the await)");
+    } finally {
+      console.log("t finally");
+    }
+  `,
+  "x.mjs": `
+    console.log("x");
+    throw new Error("from x");
+  `,
+  "main.mjs": `
+    await import("./a.mjs").catch(e => console.log("rejected:", e.message));
+    console.log("done");
+  `,
+};
+
+test.concurrent("a cycle member suspended at a top-level await continues when a later import throws", async () => {
+  using dir = tempDir("tla-cycle-suspended-member", suspendedCycleMember);
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "main.mjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect({ stdout: stdout.split("\n"), stderr }).toEqual({
+    stdout: ["t1", "x", "t2 (after the await)", "t finally", "rejected: from x", "done", ""],
+    stderr: "",
+  });
+  expect(exitCode).toBe(0);
+});
+
+test.concurrent("a cycle member suspended at a top-level await continues when the entry point fails", async () => {
+  using dir = tempDir("tla-cycle-suspended-member-entry", suspendedCycleMember);
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "a.mjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect(stdout.split("\n")).toEqual(["t1", "x", "t2 (after the await)", "t finally", ""]);
+  expect(stderr).toContain("error: from x");
+  expect(exitCode).toBe(1);
+});
+
+test.concurrent("a cycle member suspended at a top-level await resumes every time", async () => {
+  // a.mjs imports suspended.mjs, which imports a.mjs back, and then throws.mjs.
+  const graph = (name: string, suspended: string) => ({
+    [`${name}/a.mjs`]: `
+      import "./suspended.mjs";
+      import "./throws.mjs";
+      log.push("a");
+    `,
+    [`${name}/suspended.mjs`]: `
+      import "./a.mjs";
+      log.push("suspended: start");
+      ${suspended}
+    `,
+    [`${name}/throws.mjs`]: `
+      log.push("throws");
+      throw new Error("${name}/throws.mjs");
+    `,
+  });
+  using dir = tempDir("tla-cycle-suspended-member-resumes", {
+    ...graph(
+      "awaits",
+      `for (let i = 1; i <= 3; i++) {
+        await 0;
+        log.push("suspended: " + i);
+      }`,
+    ),
+    ...graph(
+      "rejected-await",
+      `try {
+        await Promise.reject(new Error("rejected"));
+      } catch (e) {
+        log.push("suspended: caught " + e.message);
+      }`,
+    ),
+    ...graph(
+      "for-await",
+      `async function* values() {
+        yield 1;
+        yield 2;
+      }
+      try {
+        for await (const value of values()) log.push("suspended: " + value);
+      } finally {
+        log.push("suspended: finally");
+      }`,
+    ),
+    // The module already has the error of throws.mjs: its own goes nowhere.
+    ...graph(
+      "late-throw",
+      `await 0;
+      log.push("suspended: after the await");
+      throw new Error("late-throw/suspended.mjs");`,
+    ),
+    // waits.mjs depends on suspended.mjs, so its body has not started when
+    // throws.mjs throws. It never does.
+    ...graph(
+      "not-started",
+      `await 0;
+      log.push("suspended: end");`,
+    ),
+    "not-started/a.mjs": `
+      import "./waits.mjs";
+      import "./throws.mjs";
+      log.push("a");
+    `,
+    "not-started/waits.mjs": `
+      import "./suspended.mjs";
+      log.push("waits: start");
+      await 0;
+      log.push("waits: end");
+    `,
+    "entry.mjs": `
+      const output = {};
+      process.on("unhandledRejection", error => {
+        output.unhandledRejection = error.message;
+      });
+      const settle = promise => promise.then(() => "fulfilled", error => "rejected: " + error.message);
+      // Every suspended body needs only jobs to reach its end: they have all run when a task runs.
+      const jobsDone = () => new Promise(resolve => setImmediate(resolve));
+      for (const name of ["awaits", "rejected-await", "for-await", "late-throw", "not-started"]) {
+        globalThis.log = [];
+        const result = await settle(import("./" + name + "/a.mjs"));
+        await jobsDone();
+        output[name] = { result, log };
+      }
+      output.reimport = await settle(import("./late-throw/suspended.mjs"));
+      await jobsDone();
+      console.log(JSON.stringify(output));
+    `,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "entry.mjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect({ stdout: stdout.trim() && JSON.parse(stdout), stderr }).toEqual({
+    stdout: {
+      "awaits": {
+        result: "rejected: awaits/throws.mjs",
+        log: ["suspended: start", "throws", "suspended: 1", "suspended: 2", "suspended: 3"],
+      },
+      "rejected-await": {
+        result: "rejected: rejected-await/throws.mjs",
+        log: ["suspended: start", "throws", "suspended: caught rejected"],
+      },
+      "for-await": {
+        result: "rejected: for-await/throws.mjs",
+        log: ["suspended: start", "throws", "suspended: 1", "suspended: 2", "suspended: finally"],
+      },
+      "late-throw": {
+        result: "rejected: late-throw/throws.mjs",
+        log: ["suspended: start", "throws", "suspended: after the await"],
+      },
+      "not-started": {
+        result: "rejected: not-started/throws.mjs",
+        log: ["suspended: start", "throws", "suspended: end"],
+      },
+      reimport: "rejected: late-throw/throws.mjs",
+    },
+    stderr: "",
+  });
+  expect(exitCode).toBe(0);
+});
