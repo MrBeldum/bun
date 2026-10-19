@@ -134,6 +134,13 @@ export const lsquic: Dependency = {
     // H3_CLOSED_CRITICAL_STREAM and closes the connection, which kills the
     // requests the graceful stop was draining. Reject only request streams.
     "patches/lsquic/goaway-accept-uni-streams.patch",
+    // lsquic_stream_credit_on_consume() / lsquic_stream_credit(): a stream's
+    // receive limit follows what the application consumed, not what
+    // lsquic_stream_read() copied out. lsquic has no read that keeps the
+    // credit, so node:quic could not hold a peer back without leaving data in
+    // the stream. Applies on top of node-quic-accessors (the reset there must
+    // not drop a queued MAX_STREAM_DATA).
+    "patches/lsquic/stream-credit-on-consume.patch",
   ],
 
   fetchDeps: ["zlib", "lshpack", "lsqpack", "boringssl"],
