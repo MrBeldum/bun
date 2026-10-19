@@ -1847,8 +1847,12 @@ struct Reach {
     pending: Vec<u32>,
     /// The live entries that walked the dependency list of an entry that is not live.
     waiting: Vec<u32>,
+    /// One for each entry that had its turn, in the order of the file.
     walks: Vec<Walk>,
+    /// The lookups of the entries that were not live in their turn.
     targets: Vec<u32>,
+    /// True if the entry that has its turn is live, so that its lookups count right away.
+    counts: bool,
     /// The peers that were bound by version, each with its entry. A peer is looked up from its
     /// entry as well, but most files have no entry that only such a lookup arrives at.
     peers: Vec<(u32, DependencyID)>,
@@ -1868,13 +1872,17 @@ impl Reach {
             waiting: Vec::new(),
             walks: Vec::with_capacity(entries + 1),
             targets: Vec::new(),
+            counts: false,
             peers: Vec::new(),
         })
     }
 
+    /// Makes `entry` live. If it had its turn, its lookups are followed later.
     fn mark(&mut self, entry: u32) {
         self.live.set(entry as usize);
-        self.pending.push(entry);
+        if (entry as usize) + 1 < self.walks.len() {
+            self.pending.push(entry);
+        }
     }
 
     /// A dependency of a live package was looked up at `slot`. Returns true if that makes an
@@ -1889,22 +1897,42 @@ impl Reach {
 
     /// The lookups that follow are those of the next entry.
     fn next_entry(&mut self) {
+        self.counts = false;
         self.walks.push(Walk {
             start: self.targets.len() as u32,
             list_of: Slot::NO_ENTRY,
         });
     }
 
+    /// The entry that has its turn has its key and walks the dependency list of `list_of`,
+    /// which is `Slot::NO_ENTRY` if the list is its own.
+    ///
+    /// Its lookups count only once the entry that gave the list is live. Otherwise a copy of a
+    /// package that is listed first could name itself in its list.
+    fn walks_list_of(&mut self, entry: u32, list_of: u32) {
+        self.walks[entry as usize].list_of = list_of;
+        if self.live.is_set(entry as usize) {
+            if list_of == Slot::NO_ENTRY || self.live.is_set(list_of as usize) {
+                self.counts = true;
+            } else {
+                self.pending.push(entry);
+            }
+        }
+    }
+
     fn arrive(&mut self, slot: Slot) {
-        if slot.entry != Slot::NO_ENTRY {
+        if slot.entry == Slot::NO_ENTRY {
+            return;
+        }
+        if self.counts {
+            self.mark_slot(slot);
+        } else {
             self.targets.push(slot.entry);
         }
     }
 
-    /// Follows the lookups of each live entry. Returns true if every entry is live then.
-    ///
-    /// The lookups of an entry count only once the entry whose dependency list it walked is
-    /// live. Otherwise a copy of a package that is listed first could name itself in its list.
+    /// Follows the lookups of each live entry that had its turn. Returns true if every entry is
+    /// live then.
     fn close(&mut self) -> bool {
         loop {
             while let Some(entry) = self.pending.pop() {
@@ -1948,6 +1976,11 @@ fn split_key(key: &[u8]) -> (&[u8], &[u8]) {
         return (&key[..scope.saturating_sub(1)], &key[scope..]);
     }
     (&key[..slash], &key[slash + 1..])
+}
+
+/// Returns true if the entry at `key` is in a folder below the entry at `above`.
+fn is_below(key: &[u8], above: &[u8]) -> bool {
+    key.len() > above.len() && key[above.len()] == b'/' && key.starts_with(above)
 }
 
 /// Returns true if two values of `packages` are the same apart from whitespace.
@@ -2001,6 +2034,42 @@ struct Lookups<'a> {
 }
 
 impl Lookups<'_> {
+    fn key_of(&self, entry: u32) -> &[u8] {
+        self.rows[entry as usize].key.slice()
+    }
+
+    fn has_key(&self, entry: u32) -> bool {
+        self.keyed[entry as usize] != invalid_package_id
+    }
+
+    /// A stripped `catalog:` dependency stays unresolved, and so does one that the install that
+    /// wrote the file did not resolve. Neither has an entry.
+    fn has_no_entry(&self, dep_id: DependencyID) -> bool {
+        self.dependencies[dep_id as usize].version.tag == DependencyVersionTag::Uninitialized
+            || (!self.unresolved.is_empty() && self.unresolved.binary_search(&dep_id).is_ok())
+    }
+
+    /// The entries that repeat a package, with those of one package together.
+    fn repeats_by_package(&self) -> Vec<Repeat> {
+        let mut by_package = self.repeats.to_vec();
+        by_package.sort_unstable_by_key(|repeat| (repeat.package, repeat.entry));
+        by_package
+    }
+
+    /// The first live entry of `package` that is not the one that made it.
+    fn first_live_repeat(
+        &self,
+        by_package: &[Repeat],
+        package: PackageID,
+        live: &DynamicBitSet,
+    ) -> Option<Repeat> {
+        let from = by_package.partition_point(|repeat| repeat.package < package);
+        (by_package[from..].iter())
+            .take_while(|repeat| repeat.package == package)
+            .find(|repeat| self.has_key(repeat.entry) && live.is_set(repeat.entry as usize))
+            .copied()
+    }
+
     /// Returns the entries that no dependency of a live package is looked up at, if there is
     /// one.
     ///
@@ -2013,28 +2082,25 @@ impl Lookups<'_> {
         reach: &mut Reach,
         path_buf: &mut [u8],
     ) -> Result<Option<Dead>, bun_alloc::AllocError> {
-        let owners = self.keyed;
-        let key_of = |entry: u32| self.rows[entry as usize].key.slice();
-        let has_key = |entry: u32| owners[entry as usize] != invalid_package_id;
+        let count = self.rows.len() as u32;
 
-        // The entries that are not live by the hash of their name, and one bit for each hash.
-        let mut open: Vec<(u64, u32)> = Vec::new();
+        // The entries that are not live, and one bit for the hash of each of their names.
+        let mut open: Vec<u32> = Vec::new();
+        let mut open_names: Vec<u64> = Vec::new();
         let mut open_bits = [0u64; 64];
-        for entry in 0..self.rows.len() as u32 {
-            if has_key(entry) && !reach.live.is_set(entry as usize) {
-                let hash = StringBuilder::string_hash(split_key(key_of(entry)).1);
-                open.push((hash, entry));
+        for entry in 0..count {
+            if self.has_key(entry) && !reach.live.is_set(entry as usize) {
+                let hash = StringBuilder::string_hash(split_key(self.key_of(entry)).1);
+                open.push(entry);
+                open_names.push(hash);
                 open_bits[(hash >> 6 & 63) as usize] |= 1 << (hash & 63);
             }
         }
-        // A stripped `catalog:` dependency stays unresolved, and so does one that the install
-        // that wrote the file did not resolve. Neither has an entry.
-        let has_no_entry = |dep_id: DependencyID| {
-            self.dependencies[dep_id as usize].version.tag == DependencyVersionTag::Uninitialized
-                || (!self.unresolved.is_empty() && self.unresolved.binary_search(&dep_id).is_ok())
-        };
-        // Looks up the peers of the live entries that have the name of an entry that is not
-        // live. Returns true if that makes an entry live.
+        let is_open_name =
+            |hash: u64| open_bits[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) != 0;
+
+        // A peer that was bound by version is looked up from its entry only now, and only if it
+        // has the name of an entry that is not live.
         let peer_lookups = |reach: &mut Reach, path_buf: &mut [u8]| {
             let mut arrived: Vec<Slot> = Vec::new();
             let Reach {
@@ -2048,9 +2114,9 @@ impl Lookups<'_> {
                     return true;
                 }
                 let dep = &self.dependencies[dep_id as usize];
-                if open_bits[(dep.name_hash >> 6 & 63) as usize] & (1 << (dep.name_hash & 63)) != 0
+                if is_open_name(dep.name_hash)
                     && let Ok((&slot, _)) = self.map.find_resolution(
-                        key_of(entry),
+                        self.key_of(entry),
                         dep,
                         self.string_buf,
                         path_buf,
@@ -2073,78 +2139,76 @@ impl Lookups<'_> {
             }
         }
 
-        // Every entry that has the name of an entry that is not live. Within one name, an entry
-        // comes right before the entries below its folder.
-        let mut named: Vec<(u64, u32)> = Vec::new();
-        for entry in 0..self.rows.len() as u32 {
-            if has_key(entry) {
-                let hash = StringBuilder::string_hash(split_key(key_of(entry)).1);
-                if open_bits[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) != 0 {
-                    named.push((hash, entry));
+        // The live entries in a folder that have the name of an entry that is not live. Such an
+        // entry can be above one of these.
+        open_names.sort_unstable();
+        let mut below: Vec<u32> = Vec::new();
+        for entry in 0..count {
+            if self.has_key(entry) && reach.live.is_set(entry as usize) {
+                let (folder, name) = split_key(self.key_of(entry));
+                if !folder.is_empty() {
+                    let hash = StringBuilder::string_hash(name);
+                    if is_open_name(hash) && open_names.binary_search(&hash).is_ok() {
+                        below.push(entry);
+                    }
                 }
             }
         }
-        named.sort_unstable_by(|a, b| (a.0.cmp(&b.0)).then_with(|| key_of(a.1).cmp(key_of(b.1))));
+        // Set for each entry of `open` that is in `below` by now.
+        let mut is_listed = vec![false; open.len()];
 
-        // The entries that repeat each package, together.
-        let mut by_package: Vec<Repeat> = self.repeats.to_vec();
-        by_package.sort_unstable_by_key(|repeat| (repeat.package, repeat.entry));
-        let repeats_of = |package: PackageID| {
-            let from = by_package.partition_point(|repeat| repeat.package < package);
-            let count = by_package[from..].partition_point(|repeat| repeat.package == package);
-            &by_package[from..from + count]
-        };
-        let first_live_repeat = |package: PackageID, live: &DynamicBitSet| {
-            (repeats_of(package).iter())
-                .find(|repeat| has_key(repeat.entry) && live.is_set(repeat.entry as usize))
-                .copied()
-        };
-
+        let mut by_package: Vec<Repeat> = Vec::new();
         // Each waiting entry, and the entry whose dependency list it walked here.
         let mut walked: Vec<(u32, u32)> = Vec::new();
         loop {
             let mut found = peer_lookups(reach, path_buf);
-            for &(hash, entry) in &open {
-                if reach.live.is_set(entry as usize) {
-                    continue;
+
+            for (index, &entry) in open.iter().enumerate() {
+                if !is_listed[index] && reach.live.is_set(entry as usize) {
+                    is_listed[index] = true;
+                    below.push(entry);
                 }
-                let (folder, name) = split_key(key_of(entry));
-                let from = named.partition_point(|&(other, _)| other < hash);
-                let same_name = &named[from..];
-                let same_name =
-                    &same_name[..same_name.partition_point(|&(other, _)| other == hash)];
-                // With the same name, the keys that start with `<folder>/` are those below it.
-                let below = if folder.is_empty() {
-                    same_name
-                } else {
-                    let from = same_name.partition_point(|&(_, other)| {
-                        let key = key_of(other);
-                        if key.len() > folder.len() && key.starts_with(folder) {
-                            key[folder.len()] < b'/'
-                        } else {
-                            key <= folder
-                        }
-                    });
-                    let below = &same_name[from..];
-                    &below[..below.partition_point(|&(_, other)| is_below(key_of(other), folder))]
-                };
-                let is_above_live = below.iter().any(|&(_, other)| {
-                    other != entry
-                        && reach.live.is_set(other as usize)
-                        && split_key(key_of(other)).1 == name
-                });
-                if is_above_live {
-                    reach.mark(entry);
-                    found = true;
+            }
+            // The first entry of the same name above a live entry is live. It then stands for
+            // the ones above it.
+            while let Some(entry) = below.pop() {
+                let (mut folder, name) = split_key(self.key_of(entry));
+                while !folder.is_empty() {
+                    folder = split_key(folder).0;
+                    let key = if folder.is_empty() {
+                        name
+                    } else {
+                        let end = folder.len() + 1 + name.len();
+                        path_buf[..folder.len()].copy_from_slice(folder);
+                        path_buf[folder.len()] = b'/';
+                        path_buf[folder.len() + 1..end].copy_from_slice(name);
+                        &path_buf[..end]
+                    };
+                    let Some(above) = self.map.get(key).map(|slot| slot.entry) else {
+                        continue;
+                    };
+                    if above == Slot::NO_ENTRY || !self.has_key(above) {
+                        continue;
+                    }
+                    if !reach.live.is_set(above as usize) {
+                        reach.mark(above);
+                        found = true;
+                    }
+                    break;
                 }
             }
 
             // An entry that waits for a dead entry walks the dependency list that its package
             // has without that one: the list of its first live entry.
-            if !found {
+            if !found && !reach.waiting.is_empty() {
+                if by_package.is_empty() {
+                    by_package = self.repeats_by_package();
+                }
                 for index in 0..reach.waiting.len() {
                     let entry = reach.waiting[index];
-                    let Some(first) = first_live_repeat(owners[entry as usize], &reach.live) else {
+                    let package = self.keyed[entry as usize];
+                    let Some(first) = self.first_live_repeat(&by_package, package, &reach.live)
+                    else {
                         continue;
                     };
                     if walked.contains(&(entry, first.entry)) {
@@ -2152,9 +2216,9 @@ impl Lookups<'_> {
                     }
                     walked.push((entry, first.entry));
                     for dep_id in first.list.begin()..first.list.end() {
-                        if !has_no_entry(dep_id)
+                        if !self.has_no_entry(dep_id)
                             && let Ok((&slot, _)) = self.map.find_resolution(
-                                key_of(entry),
+                                self.rows[entry as usize].key.slice(),
                                 &self.dependencies[dep_id as usize],
                                 self.string_buf,
                                 path_buf,
@@ -2170,48 +2234,7 @@ impl Lookups<'_> {
             // A bundled entry stops the lookup of an optional peer below it. One that is not
             // live stops nothing, so those lookups go on.
             if !found {
-                let stops: Vec<&[u8]> = (open.iter())
-                    .filter(|&&(_, entry)| !reach.live.is_set(entry as usize))
-                    .map(|&(_, entry)| key_of(entry))
-                    .filter(|key| self.bundled.contains(key))
-                    .collect();
-                if !stops.is_empty() {
-                    let mut live_bundled = PkgPathSet::init();
-                    for entry in 0..self.rows.len() as u32 {
-                        if has_key(entry)
-                            && reach.live.is_set(entry as usize)
-                            && self.bundled.contains(key_of(entry))
-                        {
-                            live_bundled.map.put(key_of(entry), ())?;
-                        }
-                    }
-                    for entry in 0..self.rows.len() as u32 {
-                        let key = key_of(entry);
-                        let package = owners[entry as usize];
-                        if package == invalid_package_id
-                            || !reach.live.is_set(entry as usize)
-                            || !stops.iter().any(|above| is_below(key, above))
-                        {
-                            continue;
-                        }
-                        let list = self.lists[package as usize];
-                        for dep_id in list.begin()..list.end() {
-                            let dep = &self.dependencies[dep_id as usize];
-                            if dep.behavior.is_optional_peer()
-                                && !has_no_entry(dep_id)
-                                && let Ok((&slot, _)) = self.map.find_resolution(
-                                    key,
-                                    dep,
-                                    self.string_buf,
-                                    path_buf,
-                                    Some(&live_bundled),
-                                )
-                            {
-                                found |= reach.mark_slot(slot);
-                            }
-                        }
-                    }
-                }
+                found = self.lookups_past_dead_bundles(reach, &open, path_buf)?;
             }
 
             if !found {
@@ -2227,6 +2250,9 @@ impl Lookups<'_> {
         if dead.count() == 0 {
             return Ok(None);
         }
+        if by_package.is_empty() {
+            by_package = self.repeats_by_package();
+        }
 
         // A dead entry changed nothing but the bindings of its package if a live entry has the
         // same package with the same value, and it is no entry of the root or of a workspace.
@@ -2235,16 +2261,17 @@ impl Lookups<'_> {
         let mut bundled: Vec<&[u8]> = Vec::new();
         let mut entries = dead.iterator::<true, true>();
         while let Some(entry) = entries.next() {
-            let package = owners[entry];
+            let package = self.keyed[entry];
             let maker = self.makers[package as usize];
             if maker == Slot::NO_ENTRY {
                 only_repeats = false;
                 break;
             }
+            let first = self.first_live_repeat(&by_package, package, &reach.live);
             if maker as usize == entry {
                 // The first entry of a package gives the package its fields and its dependency
                 // list.
-                let Some(first) = first_live_repeat(package, &reach.live) else {
+                let Some(first) = first else {
                     only_repeats = false;
                     break;
                 };
@@ -2265,9 +2292,7 @@ impl Lookups<'_> {
                     only_repeats = false;
                     break;
                 }
-            } else if !reach.live.is_set(maker as usize)
-                && first_live_repeat(package, &reach.live).is_none()
-            {
+            } else if !reach.live.is_set(maker as usize) && first.is_none() {
                 only_repeats = false;
                 break;
             }
@@ -2281,10 +2306,12 @@ impl Lookups<'_> {
         // a live entry below it.
         if only_repeats && !bundled.is_empty() {
             only_repeats = bundled.len() <= Self::MAX_BUNDLED
-                && !(0..self.rows.len() as u32).any(|entry| {
-                    has_key(entry)
+                && !(0..count).any(|entry| {
+                    self.has_key(entry)
                         && !dead.is_set(entry as usize)
-                        && bundled.iter().any(|above| is_below(key_of(entry), above))
+                        && bundled
+                            .iter()
+                            .any(|above| is_below(self.key_of(entry), above))
                 });
         }
         Ok(Some(Dead {
@@ -2295,11 +2322,61 @@ impl Lookups<'_> {
 
     /// More dead bundled entries than this are not compared with the keys of the live entries.
     const MAX_BUNDLED: usize = 64;
-}
 
-/// Returns true if the entry at `key` is in a folder below the entry at `above`.
-fn is_below(key: &[u8], above: &[u8]) -> bool {
-    key.len() > above.len() && key[above.len()] == b'/' && key.starts_with(above)
+    /// Looks up the optional peers of the live entries below a bundled entry that is not live,
+    /// and stops them at the live bundled entries only. Returns true if that makes an entry live.
+    fn lookups_past_dead_bundles(
+        &self,
+        reach: &mut Reach,
+        open: &[u32],
+        path_buf: &mut [u8],
+    ) -> Result<bool, bun_alloc::AllocError> {
+        let stops: Vec<&[u8]> = (open.iter())
+            .filter(|&&entry| !reach.live.is_set(entry as usize))
+            .map(|&entry| self.key_of(entry))
+            .filter(|key| self.bundled.contains(key))
+            .collect();
+        if stops.is_empty() {
+            return Ok(false);
+        }
+        let count = self.rows.len() as u32;
+        let mut live_bundled = PkgPathSet::init();
+        for entry in 0..count {
+            if self.has_key(entry)
+                && reach.live.is_set(entry as usize)
+                && self.bundled.contains(self.key_of(entry))
+            {
+                live_bundled.map.put(self.key_of(entry), ())?;
+            }
+        }
+        let mut found = false;
+        for entry in 0..count {
+            let key = self.key_of(entry);
+            if !self.has_key(entry)
+                || !reach.live.is_set(entry as usize)
+                || !stops.iter().any(|above| is_below(key, above))
+            {
+                continue;
+            }
+            let list = self.lists[self.keyed[entry as usize] as usize];
+            for dep_id in list.begin()..list.end() {
+                let dep = &self.dependencies[dep_id as usize];
+                if dep.behavior.is_optional_peer()
+                    && !self.has_no_entry(dep_id)
+                    && let Ok((&slot, _)) = self.map.find_resolution(
+                        key,
+                        dep,
+                        self.string_buf,
+                        path_buf,
+                        Some(&live_bundled),
+                    )
+                {
+                    found |= reach.mark_slot(slot);
+                }
+            }
+        }
+        Ok(found)
+    }
 }
 
 pub(crate) fn parse_into_binary_lockfile(
@@ -3498,7 +3575,6 @@ fn load_entries(
         }
         // A dependency that an entry cannot resolve fails the load only if the entry is live.
         let mut failures: Vec<(u32, DependencyID, ResolveError)> = Vec::new();
-        reach.targets.reserve(dependencies.len());
         // Set for a second round, in which the live entries of `Dead::repeated` walk once more.
         let mut dead: Option<Dead> = None;
         loop {
@@ -3519,8 +3595,16 @@ fn load_entries(
                     };
                     pkg_id = slot.id;
                     reach.live.set(entry as usize);
-                } else if makers[pkg_id as usize] != entry {
-                    reach.walks[entry as usize].list_of = makers[pkg_id as usize];
+                } else {
+                    let maker = makers[pkg_id as usize];
+                    reach.walks_list_of(
+                        entry,
+                        if maker == entry {
+                            Slot::NO_ENTRY
+                        } else {
+                            maker
+                        },
+                    );
                 }
                 if let Some(Dead { entries, repeated }) = &dead
                     && (entries.is_set(entry as usize)
