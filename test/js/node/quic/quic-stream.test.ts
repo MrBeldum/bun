@@ -614,6 +614,7 @@ describe("receive backpressure", () => {
     { sender: "waits for the limit", length: 3 * WINDOW, end: true, packet: true },
     { sender: "ended its body at the limit", length: WINDOW, end: true, packet: false },
     { sender: "has room left", length: WINDOW - 1, end: false, packet: false },
+    { sender: "was told to stop", length: 3 * WINDOW, end: true, stop: true, packet: false },
   ])("a read outside a QUIC callback sends a packet at once ($packet) when the sender $sender", async row => {
     const shape: Shape = {
       ...serverBidi,
@@ -631,6 +632,7 @@ describe("receive backpressure", () => {
     expect(await pair.sent(held)).toBe(held);
     // Leave the callback that ended the last round trip.
     await new Promise<void>(resolve => setImmediate(resolve));
+    if (row.stop) pair.receiver.stopSending();
     const packets = () => pair.serverSession.endpoint.stats.packetsSent;
     const before = packets();
     // A reader pulls its first batch before `next()` returns.
