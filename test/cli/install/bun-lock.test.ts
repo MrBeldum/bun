@@ -1608,6 +1608,29 @@ describe("a bun.lock entry at a key where no dependency is looked up", () => {
         },
       },
     ],
+    [
+      // lockfileVersion 0 lists the dependencies of a workspace in its entry. The loader leaves them unresolved,
+      // but their entries are at the keys where they are looked up.
+      "for a dependency of a workspace in a lockfileVersion 0 file",
+      {
+        root: { name: "app" },
+        workspaces: { "packages/w": { name: "w", version: "1.0.0" } },
+        packages: {
+          peer,
+          w: ["w@workspace:packages/w", { dependencies: { peer: "^1.0.0", dep: "2.0.0" } }],
+          "w/dep": entry("dep@2.0.0"),
+        },
+        lockfileVersion: 0,
+      },
+      {
+        packages: ["<root>", "peer@1.0.0", "w@workspace:packages/w", "dep@2.0.0"],
+        resolved: {
+          "<root> > w": "w@workspace:packages/w",
+          "w@workspace:packages/w > peer": null,
+          "w@workspace:packages/w > dep": null,
+        },
+      },
+    ],
   ])("an entry %s is loaded", (_, lock, expected) => {
     const { packages, resolved } = load(lock);
     expect({ packages, resolved }).toEqual(expected);
