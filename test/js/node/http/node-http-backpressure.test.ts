@@ -2557,6 +2557,291 @@ describe("backpressure", () => {
         });
       });
     });
+
+    // Node sweeps the connections of a server that listens, every `connectionsCheckingInterval`. A request whose
+    // head is not complete after `headersTimeout`, or that is not complete after `requestTimeout`, gets a 408 and
+    // its connection is closed. For a listener that neither reads nor answers, that is what ends the connection:
+    // the body keeps the socket stopped, and a stopped socket does not get to the client's FIN.
+    describe("requestTimeout and headersTimeout", () => {
+      const ALLOW_HTTP1 = "http2.createSecureServer({ allowHTTP1: true }) with an HTTP/1.1 client";
+      const GIVEN = "server.emit('connection', socket) on an http.Server that also listens";
+      // The entry points whose server listens.
+      const sweeping: Record<string, Door> = {
+        http: doors.http,
+        https: doors.https,
+        [ALLOW_HTTP1]: doors[ALLOW_HTTP1],
+        [GIVEN]: {
+          async open(listener, options = {}) {
+            const server = http.createServer(options, listener);
+            await once(server.listen(0, "127.0.0.1"), "listening");
+            const acceptor = await listening(
+              net.createServer(socket => void server.emit("connection", socket)),
+              tcpClient,
+            );
+            return {
+              connect: acceptor.connect,
+              close() {
+                acceptor.close();
+                server.close();
+              },
+            };
+          },
+        },
+      };
+      const TIMED_OUT = "HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n";
+      const SWEEP = { connectionsCheckingInterval: 20 };
+      // A request head without its last line, and that line with the first half of the body.
+      const HEAD = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n";
+      const HALF = "\r\n12345";
+
+      // One connection to `server`. `closed` resolves with all that the server sent.
+      async function connect(server: { connect(): Promise<Duplex> }, bytes = "") {
+        const sock = await server.connect();
+        let received = "";
+        sock.on("data", (chunk: Buffer) => (received += chunk.toString("latin1")));
+        const closed = once(sock, "close").then(() => received);
+        if (bytes) sock.write(bytes);
+        return { sock, closed, received: () => received };
+      }
+
+      describe.each(Object.keys(sweeping))("%s", name => {
+        const door = sweeping[name];
+
+        it("closes a connection whose listener neither reads nor answers, also after its client left", async () => {
+          const UPLOAD = 8 * 1024 * 1024;
+          const events: string[] = [];
+          const stopped = Promise.withResolvers<void>();
+          const closed = Promise.withResolvers<void>();
+          // headersTimeout takes its default, which is requestTimeout when that is below 60 s.
+          const server = await door.open(
+            req => {
+              req.on("aborted", () => events.push("aborted"));
+              req.socket.once("pause", () => stopped.resolve());
+              req.socket.once("close", () => {
+                events.push("socket close");
+                closed.resolve();
+              });
+            },
+            { ...SWEEP, requestTimeout: 500 },
+          );
+          const client = await connect(server);
+          try {
+            client.sock.write(`POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: ${UPLOAD}\r\n\r\n`);
+            for (let sent = 0; sent < UPLOAD / 2; sent += BLOCK.byteLength) client.sock.write(BLOCK);
+            await stopped.promise;
+            // The client's FIN waits behind the bytes that the server does not read.
+            client.sock.destroy();
+            await closed.promise;
+            expect(events).toEqual(["aborted", "socket close"]);
+          } finally {
+            client.sock.destroy();
+            server.close();
+          }
+        });
+
+        it("answers 408 when the body does not arrive within requestTimeout", async () => {
+          const server = await door.open(() => {}, { ...SWEEP, requestTimeout: 200, headersTimeout: 0 });
+          const client = await connect(server, HEAD + HALF);
+          try {
+            expect(await client.closed).toBe(TIMED_OUT);
+          } finally {
+            client.sock.destroy();
+            server.close();
+          }
+        });
+
+        it("answers 408 when the head does not arrive within headersTimeout", async () => {
+          const server = await door.open(() => {}, { ...SWEEP, requestTimeout: 0, headersTimeout: 200 });
+          const client = await connect(server, HEAD);
+          try {
+            expect(await client.closed).toBe(TIMED_OUT);
+          } finally {
+            client.sock.destroy();
+            server.close();
+          }
+        });
+
+        it("does not apply headersTimeout to a request whose head is complete", async () => {
+          const dispatched = Promise.withResolvers<void>();
+          const server = await door.open(
+            (req, res) => {
+              dispatched.resolve();
+              req.resume().on("end", () => res.end("ok"));
+            },
+            { ...SWEEP, requestTimeout: 0, headersTimeout: 200 },
+          );
+          const complete = await connect(server, HEAD + "Connection: close\r\n" + HALF);
+          await Promise.race([dispatched.promise, complete.closed]);
+          // The clock: this head is not complete, so its 408 says that headersTimeout has passed.
+          const incomplete = await connect(server, HEAD);
+          try {
+            expect(await incomplete.closed).toBe(TIMED_OUT);
+            expect(complete.received()).toBe("");
+            complete.sock.write("67890");
+            expect(await complete.closed).toStartWith("HTTP/1.1 200 ");
+          } finally {
+            complete.sock.destroy();
+            incomplete.sock.destroy();
+            server.close();
+          }
+        });
+
+        it("does not apply requestTimeout between two requests", async () => {
+          const server = await door.open((req, res) => void (req.method === "GET" && res.end(req.url)), {
+            ...SWEEP,
+            requestTimeout: 200,
+            headersTimeout: 0,
+          });
+          const idle = await connect(server, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
+          // The clock: this request starts after the first one and times out a requestTimeout later.
+          const expired = await connect(server, HEAD + HALF);
+          try {
+            expect(await expired.closed).toBe(TIMED_OUT);
+            idle.sock.write("GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            const received = await idle.closed;
+            expect(received.match(/HTTP\/1\.1 \d+/g)).toEqual(["HTTP/1.1 200", "HTTP/1.1 200"]);
+            expect(received).toEndWith("/b");
+          } finally {
+            idle.sock.destroy();
+            expired.sock.destroy();
+            server.close();
+          }
+        });
+
+        it("does not write 408 into a response whose head is on the wire", async () => {
+          const server = await door.open(
+            (req, res) => {
+              res.writeHead(200, { "Content-Length": 10 });
+              res.write("12345");
+            },
+            { ...SWEEP, requestTimeout: 200, headersTimeout: 0 },
+          );
+          const client = await connect(server, HEAD + HALF);
+          try {
+            const received = await client.closed;
+            expect({ status: received.slice(0, 12), body: received.slice(received.indexOf("\r\n\r\n") + 4) }).toEqual({
+              status: "HTTP/1.1 200",
+              body: "12345",
+            });
+          } finally {
+            client.sock.destroy();
+            server.close();
+          }
+        });
+
+        type ServerSocket = net.Socket & { server: http.Server };
+        type TimeoutError = NodeJS.ErrnoException & { rawPacket?: unknown };
+
+        it("gives 'clientError' the timeout once when its listener destroys the socket with the error", async () => {
+          const seen: object[] = [];
+          const server = await door.open(
+            req => {
+              const socket = req.socket as ServerSocket;
+              socket.server.on("clientError", (error: TimeoutError, reported: net.Socket) => {
+                seen.push({
+                  code: error.code,
+                  message: error.message,
+                  rawPacket: error.rawPacket,
+                  socket: reported === socket ? "the socket of the request" : reported,
+                });
+                reported.destroy(error);
+              });
+            },
+            { ...SWEEP, requestTimeout: 200, headersTimeout: 0 },
+          );
+          const client = await connect(server, HEAD + HALF);
+          try {
+            expect(await client.closed).toBe("");
+            expect(seen).toEqual([
+              {
+                code: "ERR_HTTP_REQUEST_TIMEOUT",
+                message: "Request timeout",
+                rawPacket: undefined,
+                socket: "the socket of the request",
+              },
+            ]);
+          } finally {
+            client.sock.destroy();
+            server.close();
+          }
+        });
+
+        it("gives 'clientError' the timeout of a request once, and that of the next request on the connection again", async () => {
+          const reported: string[] = [];
+          const waiting: [number, () => void][] = [];
+          const reports = (count: number) =>
+            new Promise<void>(resolve => (reported.length >= count ? resolve() : void waiting.push([count, resolve])));
+          const names = new Map<object, string>();
+          let listening = false;
+          const server = await door.open(
+            req => {
+              if (listening) return;
+              listening = true;
+              // The listener leaves the socket open, so the request stays expired through the sweeps that follow.
+              (req.socket as ServerSocket).server.on("clientError", (error: TimeoutError, socket: net.Socket) => {
+                if (!names.has(socket)) names.set(socket, names.size === 0 ? "first" : "second");
+                reported.push(`${names.get(socket)} connection: ${error.code}`);
+                for (const [count, resolve] of waiting) if (reported.length >= count) resolve();
+              });
+            },
+            { ...SWEEP, requestTimeout: 200, headersTimeout: 0 },
+          );
+          const first = await connect(server, HEAD + HALF);
+          await reports(1);
+          // The clock: a request that starts now is reported a requestTimeout later, many sweeps after the first one.
+          const second = await connect(server, HEAD + HALF);
+          try {
+            await reports(2);
+            // The first connection completes its request and starts another one, which times out too.
+            first.sock.write("67890" + HEAD + HALF);
+            await reports(3);
+            expect(reported).toEqual([
+              "first connection: ERR_HTTP_REQUEST_TIMEOUT",
+              "second connection: ERR_HTTP_REQUEST_TIMEOUT",
+              "first connection: ERR_HTTP_REQUEST_TIMEOUT",
+            ]);
+          } finally {
+            first.sock.destroy();
+            second.sock.destroy();
+            server.close();
+          }
+        });
+      });
+
+      // The clock of a connection starts when the server gets it. On Linux, Bun's own listener gets a TCP connection
+      // that sends nothing about a second late (TCP_DEFER_ACCEPT), so this runs on the connections served from JS.
+      it.each([ALLOW_HTTP1, GIVEN])("answers 408 to a connection that sends nothing within headersTimeout: %s", async name => {
+        const server = await sweeping[name].open(() => {}, { ...SWEEP, requestTimeout: 0, headersTimeout: 200 });
+        const client = await connect(server);
+        try {
+          expect(await client.closed).toBe(TIMED_OUT);
+        } finally {
+          client.sock.destroy();
+          server.close();
+        }
+      });
+
+      it("does not sweep the connections that are given to a server that never listens", async () => {
+        const listener: RequestListener = (req, res) => void req.resume().on("end", () => res.end("ok"));
+        const options = { ...SWEEP, requestTimeout: 200 };
+        const given = await doors["server.emit('connection', socket) with a net.Socket"].open(listener, options);
+        const clock = await sweeping.http.open(() => {}, options);
+        const kept = await connect(given, HEAD + "Connection: close\r\n" + HALF);
+        // The clock: this request starts after the other one, so its 408 says that requestTimeout has passed for both.
+        const expired = await connect(clock, HEAD + HALF);
+        try {
+          expect(await expired.closed).toBe(TIMED_OUT);
+          expect(kept.received()).toBe("");
+          kept.sock.write("67890");
+          expect(await kept.closed).toStartWith("HTTP/1.1 200 ");
+        } finally {
+          kept.sock.destroy();
+          expired.sock.destroy();
+          given.close();
+          clock.close();
+        }
+      });
+    });
   });
 
   // An empty chunk adds no bytes, but it is still a write. While a 'drain' is
