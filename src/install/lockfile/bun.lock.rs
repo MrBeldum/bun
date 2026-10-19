@@ -2062,10 +2062,9 @@ struct Lookups<'a> {
     bundled: &'a PkgPathSet,
     /// An entry of `packages` that is not the first one of its package, in the order of the file.
     repeats: &'a [Repeat],
-    /// The dependency list, the name and the resolution of each package.
+    /// The dependency list and the name of each package.
     lists: &'a [DependencySlice],
     names: &'a [String],
-    resolutions: &'a [Resolution],
     /// The workspaces whose dependencies are looked up from their own folder.
     members: core::ops::Range<PackageID>,
     dependencies: &'a [Dependency],
@@ -2201,12 +2200,10 @@ impl Lookups<'_> {
             if let Some(scanned) = scanned.as_deref_mut() {
                 scanned[entry] = true;
             }
-            // The dependencies of the root and of a linked workspace are not looked up from
-            // an entry.
-            if package == 0
-                || (self.resolutions[package as usize].tag == ResolutionTag::Workspace
-                    && self.is_linked(package))
-            {
+            // The dependencies of the root and of a linked workspace are looked up before the
+            // turns of the entries. A `lockfileVersion` 0 file has no such workspace: the entry
+            // of a workspace lists them and its turn skips them, so they are looked up here only.
+            if package == 0 || (self.members.contains(&package) && self.is_linked(package)) {
                 continue;
             }
             let (key, list) = (self.key_of(entry as u32), self.lists[package as usize]);
@@ -3738,7 +3735,6 @@ fn load_entries(
                     repeats: &repeats,
                     lists: pkg_deps,
                     names: pkg_names,
-                    resolutions: pkg_resolutions,
                     members: members.clone(),
                     dependencies,
                     unresolved: &unresolved_rows,
