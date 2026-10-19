@@ -2,12 +2,19 @@
 
 #include "root.h"
 
+#include <JavaScriptCore/ArgList.h>
 #include <JavaScriptCore/TerminationDeadline.h>
 #include <JavaScriptCore/ThrowScope.h>
 #include <atomic>
 #include <optional>
 
+namespace JSC {
+class CyclicModuleRecord;
+}
+
 namespace Bun {
+
+class NodeVMGlobalObject;
 
 // One node:vm run — a Script, a module evaluation, or an afterEvaluate microtask checkpoint — that
 // its `timeout` and/or `breakOnSigint` options may cut short. Both work by requesting the VM's
@@ -31,12 +38,15 @@ public:
     // withdrawn and the ERR_SCRIPT_EXECUTION_* error thrown on `scope`. Otherwise nothing is touched and
     // whatever is pending — an ordinary exception, or a termination that is not this run's — is the
     // caller's to propagate. Either way the caller follows with RETURN_IF_EXCEPTION.
-    void finish(JSC::ThrowScope&);
+    // A run that was cut short also gives its error to the node:vm modules that its termination stopped, and to
+    // `moduleOfRun`, the module that the run evaluated, when it is not finished (NodeVMModule::errorModulesCutShort).
+    // The run is over when finish() starts: it runs no process.nextTick callback and no job of the main queue, and
+    // a run that a job of a context starts there is not nested in it.
+    void finish(JSC::ThrowScope&, JSC::CyclicModuleRecord* moduleOfRun = nullptr);
 
-    // After finish(): the run was unwound by the termination of a run it is nested in (that run's deadline
-    // fired or its SIGINT arrived while this one was on the stack). The termination is that run's and stays
-    // pending; a caller that keeps state past the unwind (a module mid-evaluation) records this error for it.
-    JSC::JSObject* errorForEnclosingRunCutShort() const;
+    // A termination unwound a checkpoint of the microtask queue of `context`, and with it the module body that
+    // a job of that queue was running. The run that the termination belongs to uses this in finish().
+    static void noteCheckpointCutShort(NodeVMGlobalObject* context);
 
     // SigintWatcher's signal thread, under its lock: record the SIGINT, then request m_vm's termination.
     JSC::VM& vm() const { return m_vm; }
@@ -44,6 +54,8 @@ public:
 
 private:
     void disarm(); // stop listening: nothing of this run's can fire once it returns
+    void addCheckpointCutShort(JSC::JSValue context);
+    void handCheckpointsCutShortToEnclosingRun();
     bool timedOut() const { return m_deadline && m_deadline->didFire(); }
     bool wasCutShort() const { return timedOut() || m_sigintReceived; }
     const NodeVMRunTermination* enclosingRunCutShort() const;
@@ -56,6 +68,9 @@ private:
     bool m_listeningForSigint { false };
     // The run this one is nested in, if any: runs nest on the stack, so the innermost is tracked per thread.
     NodeVMRunTermination* const m_enclosing;
+    // The contexts of noteCheckpointCutShort(). A run that the termination does not belong to hands them to the
+    // run that it is nested in.
+    std::optional<JSC::MarkedArgumentBuffer> m_checkpointsCutShort;
     bool m_finished { false };
 };
 

@@ -3,7 +3,11 @@
 #include "NodeVM.h"
 
 #include "JavaScriptCore/AbstractModuleRecord.h"
+#include "JavaScriptCore/JSModuleLoader.h"
 #include "JavaScriptCore/JSModuleNamespaceObject.h"
+
+#include <wtf/HashSet.h>
+#include <wtf/IterationStatus.h>
 
 namespace Bun {
 
@@ -36,12 +40,18 @@ public:
     static NodeVMModule* create(JSC::VM& vm, JSC::JSGlobalObject* globalObject, ArgList args);
 
     const WTF::String& identifier() const { return m_identifier; }
-    // The context's own module loader (its global object's), or `globalObject`'s without a context: the
-    // loader this module's record is created against.
-    JSC::JSModuleLoader* moduleLoader(JSC::JSGlobalObject*);
+    // The realm of the module's record: the global object of the module's context, or `globalObject` without a
+    // context. JSC queues the jobs of the record there, and the record uses that realm's module loader.
+    JSC::JSGlobalObject* moduleRealm(JSC::JSGlobalObject*);
 
-    Status status() const { return m_status; }
-    void status(Status value) { m_status = value; }
+    // Purposely not virtual. A module has the status and the error of its record: Link() and Evaluate() of any
+    // module that imports it change them, and so do the jobs of a top-level await. The status is the one that
+    // Node gives a module whose V8 record has the status of the record.
+    Status status() const;
+    // Empty unless the status is Errored.
+    JSC::JSValue evaluationError() const;
+    // Purposely not virtual. Dispatches to the correct subclass.
+    JSC::JSModuleRecord* moduleRecordIfExists() const;
 
     JSModuleNamespaceObject* namespaceObject(JSC::JSGlobalObject* globalObject);
     void namespaceObject(JSC::VM& vm, JSModuleNamespaceObject* value) { m_namespaceObject.set(vm, this, value); }
@@ -57,30 +67,67 @@ public:
 
     JSValue evaluate(JSGlobalObject* globalObject, uint32_t timeout, bool breakOnSigint);
 
-    // For top-level-await modules JSC finishes evaluation asynchronously
-    // (record status EvaluatingAsync -> Evaluated); pull the final state into
-    // m_status/m_evaluationException once the record has settled.
-    void reconcileEvaluationState(JSC::VM& vm);
+    bool hasAsyncGraph();
 
-    bool hasAsyncGraph() const;
-    void propagateLinked();
+    // A termination (the timeout or the SIGINT of a vm run) stops module code where it is, and is not an error
+    // that a module can have. The vm run that the termination belongs to calls this with the error that it
+    // throws (NodeVMRunTermination::finish), and these modules get that error:
+    // - every module that was on the stack of an Evaluate() that the termination unwound;
+    // - in a context of `checkpointsCutShort`, whose microtask checkpoint the termination unwound, every module
+    //   that no job can finish any more;
+    // - `moduleOfRun`, the module that the run evaluated, when the run did not finish it.
+    // A termination that stops the VM belongs to no run, and nothing is done. Node leaves such modules as V8
+    // does: vm-module-graph-evaluation-bun.test.ts says how.
+    static void errorModulesCutShort(JSC::VM&, JSC::JSValue error, const JSC::ArgList& checkpointsCutShort, JSC::CyclicModuleRecord* moduleOfRun);
 
-    JSC::Exception* evaluationException() const { return m_evaluationException.get(); }
+    // Calls `visit(record)` for `root` and for every record that `root` reaches through its requests. A request
+    // that has no module yet (the graph is not linked) goes to `missing(request)`. Either one ends the walk
+    // when it returns IterationStatus::Done. Iterative: a chain of imports is as deep as it is long.
+    template<typename Visit, typename Missing>
+    static void forEachRecordOfGraph(JSC::AbstractModuleRecord* root, const Visit& visit, const Missing& missing)
+    {
+        WTF::HashSet<JSC::AbstractModuleRecord*> visited;
+        WTF::Vector<JSC::AbstractModuleRecord*, 16> worklist;
+        worklist.append(root);
+
+        while (!worklist.isEmpty()) {
+            JSC::AbstractModuleRecord* record = worklist.takeLast();
+            if (!visited.add(record).isNewEntry)
+                continue;
+            if (visit(record) == WTF::IterationStatus::Done)
+                return;
+
+            const auto& loaded = record->loadedModules();
+            for (const auto& request : record->requestedModules()) {
+                if (JSC::AbstractModuleRecord* dependency = record->prelinkedRequestedModule(request)) {
+                    worklist.append(dependency);
+                    continue;
+                }
+                auto iter = loaded.find(JSC::ModuleMapKey { request.m_specifier.impl(), request.type() });
+                if (iter == loaded.end()) {
+                    if (missing(request) == WTF::IterationStatus::Done)
+                        return;
+                    continue;
+                }
+                if (JSC::AbstractModuleRecord* dependency = iter->value.m_module.get())
+                    worklist.append(dependency);
+            }
+        }
+    }
 
 protected:
     WTF::String m_identifier;
-    Status m_status = Status::Unlinked;
     WriteBarrier<JSModuleNamespaceObject> m_namespaceObject;
     WriteBarrier<JSObject> m_context;
-    WriteBarrier<Unknown> m_evaluationResult;
     WriteBarrier<Unknown> m_moduleWrapper;
     WTF::Vector<NodeVMModuleRequest> m_moduleRequests;
-    WTF::HashMap<WTF::String, WriteBarrier<JSObject>> m_resolveCache;
-    WriteBarrier<JSC::Exception> m_evaluationException;
+    // The modules that link() linked this one to, as the array that vm.ts made for the call. Nothing reads it.
+    // As in Node (ModuleWrap::Link, kLinkedRequestsSlot), a module keeps the modules that it is linked to alive.
+    // Until Link() gives the record of a dependency its executable, this is all that keeps alive a dependency that
+    // the program dropped, and with it the callbacks that its NodeVMScriptFetcher holds weakly.
+    WriteBarrier<JSArray> m_linkedModules;
 
     NodeVMModule(JSC::VM& vm, JSC::Structure* structure, WTF::String identifier, JSValue context, JSValue moduleWrapper);
-
-    void evaluateDependencies(JSGlobalObject* globalObject, AbstractModuleRecord* record, uint32_t timeout, bool breakOnSigint);
 
     DECLARE_EXPORT_INFO;
     DECLARE_VISIT_CHILDREN;
