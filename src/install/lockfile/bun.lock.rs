@@ -2189,10 +2189,12 @@ impl Lookups<'_> {
                 if folder.len() > key.len() {
                     break;
                 }
+                if reach.live[open.entry as usize] {
+                    continue;
+                }
                 let is_above =
                     folder.is_empty() || key == folder || (!is_member && is_below(key, folder));
                 if is_above
-                    && !reach.live[open.entry as usize]
                     && open.name == name
                     && !(is_stopped && self.stops_below(key, folder, stops, reach))
                 {
