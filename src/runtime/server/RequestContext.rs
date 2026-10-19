@@ -2876,6 +2876,13 @@ where
             // If we immediately have the value available, we can skip the extra event loop tick
             match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
                 jsc::PromiseResult::Pending => {
+                    // A lazy promise starts its work in its own `then()`, which a wait on the
+                    // cell never calls. A plain promise has this ID and skips the test.
+                    if response_value.structure_id() != this.promise_structure_id()
+                        && ctx.follow_own_then(this, response_value, promise)
+                    {
+                        return;
+                    }
                     let cell = ctx.create_promise_cell(this.global_this());
                     response_value.then_with_value(
                         this.global_this(),
@@ -2944,8 +2951,9 @@ where
     }
 
     /// Answers with what the `then()` of the promise a handler returned reports, if a class of that
-    /// promise has its own `then`: the state of such a cell is not its answer (an SDK's
-    /// `APIPromise` holds a placeholder). `false`: no class of it has, and the caller reads the cell.
+    /// promise has its own `then`: the state of such a cell is not its answer (a lazy promise stays
+    /// pending until `then()` starts its work, an SDK's `APIPromise` holds a placeholder).
+    /// `false`: no class of it has, and the caller reads the cell.
     #[cold]
     #[inline(never)]
     fn follow_own_then(
@@ -3872,6 +3880,11 @@ where
 
         match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
             jsc::PromiseResult::Pending => {
+                if promise_js.structure_id() != server.promise_structure_id()
+                    && ctx.follow_error_result_own_then(server, promise_js, promise, value, status)
+                {
+                    return;
+                }
                 ctx.flags.set_is_error_promise_pending(true);
                 let cell = ctx.create_promise_cell(server.global_this());
                 promise_js.then_with_value(

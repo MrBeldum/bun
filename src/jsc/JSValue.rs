@@ -433,6 +433,17 @@ impl JSValue {
         }
     }
 
+    /// The cell's `StructureID` — only valid when `is_cell()`. Cells with one ID have one
+    /// `Structure`: the same class, prototype and own property names. In Rust for the reason
+    /// `js_type` is; `JSC__JSGlobalObject__promiseStructureID` asserts the layout.
+    #[inline]
+    pub fn structure_id(self) -> u32 {
+        debug_assert!(self.is_cell());
+        // SAFETY: `self.0` is a non-null GC-heap cell pointer (caller contract); the header
+        // starts with the `StructureID`, an aligned, always-initialized `u32`.
+        unsafe { *(self.0 as *const u32) }
+    }
+
     /// `jsTypeLoose()` — `js_type` but maps non-cell numbers
     /// to `NumberObject` so callers can switch on `JSType` without a separate
     /// `is_number()` arm.

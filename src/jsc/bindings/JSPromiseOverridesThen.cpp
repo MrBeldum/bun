@@ -19,3 +19,11 @@ extern "C" [[ZIG_EXPORT(nothrow)]] bool JSC__JSPromise__overridesThen(JSC::JSPro
     }
     return false;
 }
+
+// What `JSValue::structure_id` reads for a promise of this realm that no class and no own property has reshaped.
+extern "C" [[ZIG_EXPORT(nothrow)]] uint32_t JSC__JSGlobalObject__promiseStructureID(JSC::JSGlobalObject* globalObject)
+{
+    static_assert(JSC::JSCell::structureIDOffset() == 0);
+    static_assert(sizeof(JSC::StructureID) == sizeof(uint32_t));
+    return globalObject->promiseStructure()->id().bits();
+}
