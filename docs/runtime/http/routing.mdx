@@ -22,7 +22,7 @@ Bun.serve({
 });
 ```
 
-Routes in `Bun.serve()` receive a `BunRequest` (which extends [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request)) and return a [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response) or `Promise<Response>`. Because routes use these `Request` and `Response` types, it is easier to use the same code for both sending and receiving HTTP requests.
+Routes in `Bun.serve()` receive a `BunRequest` (which extends [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request)) and return a [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response), a `Promise<Response>` or a thenable that resolves to a `Response`. Because routes use these `Request` and `Response` types, it is easier to use the same code for both sending and receiving HTTP requests.
 
 ```ts
 // Simplified for brevity
@@ -54,7 +54,7 @@ serve({
 
 ### Promise
 
-You can also return a `Promise<Response>` from a route handler.
+You can also return a `Promise<Response>` from a route handler. Any thenable works: Bun calls its `then()` once, as `await` does.
 
 ```ts
 import { sql, serve } from "bun";
@@ -269,7 +269,7 @@ Bun.serve({
 
 ## `fetch` request handler
 
-The `fetch` handler runs for incoming requests that no route matched. It receives a [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request) object and returns a [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response) or [`Promise<Response>`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise).
+The `fetch` handler runs for incoming requests that no route matched. It receives a [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request) object and returns a [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response), a [`Promise<Response>`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise) or a thenable that resolves to a `Response`.
 
 ```ts
 Bun.serve({

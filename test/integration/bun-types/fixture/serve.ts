@@ -92,3 +92,13 @@ Bun.serve({
   ],
   fetch: () => new Response(),
 });
+
+declare const thenable: PromiseLike<Response>;
+Bun.serve({
+  routes: {
+    "/function": () => thenable,
+    "/method": { GET: () => thenable },
+  },
+  fetch: () => thenable,
+  error: () => thenable,
+});

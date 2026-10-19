@@ -670,7 +670,7 @@ declare module "bun" {
 
     type HTTPMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS";
 
-    type Handler<Req extends Request, S, Res> = (request: Req, server: S) => MaybePromise<Res>;
+    type Handler<Req extends Request, S, Res> = (request: Req, server: S) => Res | PromiseLike<Res>;
 
     /**
      * Serve a directory tree at a URL prefix.
@@ -738,7 +738,11 @@ declare module "bun" {
            *
            * Respond to {@link Request} objects with a {@link Response} object.
            */
-          fetch?(this: Server<WebSocketData>, req: Request, server: Server<WebSocketData>): MaybePromise<Response>;
+          fetch?(
+            this: Server<WebSocketData>,
+            req: Request,
+            server: Server<WebSocketData>,
+          ): Response | PromiseLike<Response>;
 
           routes: Routes<WebSocketData, R>;
         }
@@ -748,7 +752,11 @@ declare module "bun" {
            *
            * Respond to {@link Request} objects with a {@link Response} object.
            */
-          fetch(this: Server<WebSocketData>, req: Request, server: Server<WebSocketData>): MaybePromise<Response>;
+          fetch(
+            this: Server<WebSocketData>,
+            req: Request,
+            server: Server<WebSocketData>,
+          ): Response | PromiseLike<Response>;
 
           routes?: Routes<WebSocketData, R>;
         };
@@ -800,7 +808,7 @@ declare module "bun" {
             this: Server<WebSocketData>,
             req: Request,
             server: Server<WebSocketData>,
-          ): MaybePromise<Response | void | undefined>;
+          ): Response | void | undefined | PromiseLike<Response | void | undefined>;
 
           routes: RoutesWithUpgrade<WebSocketData, R>;
         }
@@ -814,7 +822,7 @@ declare module "bun" {
             this: Server<WebSocketData>,
             req: Request,
             server: Server<WebSocketData>,
-          ): MaybePromise<Response | void | undefined>;
+          ): Response | void | undefined | PromiseLike<Response | void | undefined>;
 
           routes?: RoutesWithUpgrade<WebSocketData, R>;
         }
@@ -862,7 +870,10 @@ declare module "bun" {
        * }
        * ```
        */
-      error?: (this: Server<WebSocketData>, error: ErrorLike) => Response | Promise<Response> | void | Promise<void>;
+      error?: (
+        this: Server<WebSocketData>,
+        error: ErrorLike,
+      ) => Response | PromiseLike<Response> | void | PromiseLike<void>;
 
       /**
        * Uniquely identify a server instance with an ID

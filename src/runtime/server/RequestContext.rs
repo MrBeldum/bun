@@ -2947,7 +2947,22 @@ where
         // A truthy non-Response, non-Error, non-Promise value (object, string,
         // number, ...). The async twin (`handle_resolve`) reports this via
         // `render_missing_invalid_response`; do the same on the sync path.
-        ctx.render_missing_invalid_response(response_value);
+        ctx.on_other_value(this, response_value);
+    }
+
+    /// A handler returned `value`, which is not a Response, a promise or an Error. An object can be
+    /// a thenable: the promise that follows it calls its `then()`, or is fulfilled with the object
+    /// itself when it has none, which ends in the diagnostic like any other value.
+    #[cold]
+    #[inline(never)]
+    fn on_other_value(&self, this: &ThisServer, value: JSValue) {
+        if !value.is_object() {
+            self.render_missing_invalid_response(value);
+            return;
+        }
+        if let Some(follower) = promise_following(this.global_this(), value) {
+            self.on_followed_response(this, follower);
+        }
     }
 
     /// Answers with what the `then()` of the promise a handler returned reports, if a class of that
@@ -3858,6 +3873,13 @@ where
                             unsafe { self.protect_for_body_and_render(result, response) };
                             return;
                         }
+                    } else if result.is_object() {
+                        // It can be a thenable. The promise that follows an object without a
+                        // `then()` is fulfilled with it, which ends in the default page below.
+                        if let Some(follower) = promise_following(server.global_this(), result) {
+                            self.on_followed_error_result(server, follower, value, status);
+                        }
+                        return;
                     }
                 }
             }

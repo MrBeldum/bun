@@ -549,3 +549,95 @@ describe("a pending promise with its own then() that gives no Response", () => {
     });
   });
 });
+
+// A thenable is an object that is not a promise and has a then(): a promise of a library that
+// replaces `Promise` (zone.js, Bluebird), a query builder.
+describe.each(Object.keys(kinds) as Kind[])("%s returns a thenable", kind => {
+  test.concurrent("that reports in then()", async () => {
+    const thenable = { then: (resolve: (value: Response) => void) => resolve(new Response("thenable")) };
+    expect(await answer(kind, () => thenable)).toEqual(ok("thenable"));
+  });
+
+  test.concurrent("that reports later", async () => {
+    const thenable = {
+      then: (resolve: (value: Response) => void) => void setImmediate(() => resolve(new Response("thenable, later"))),
+    };
+    expect(await answer(kind, () => thenable)).toEqual(ok("thenable, later"));
+  });
+});
+
+describe("a thenable", () => {
+  test.concurrent("gets `then` read once and then() called once, with two functions", async () => {
+    const log: string[] = [];
+    const thenable = {
+      get then() {
+        log.push("get then");
+        return (...args: unknown[]) => {
+          log.push(`then(${args.map(arg => typeof arg).join(", ")})`);
+          (args[0] as (value: Response) => void)(new Response("spied"));
+        };
+      },
+    };
+    expect(await answer("fetch", () => thenable)).toEqual(ok("spied"));
+    expect(log).toEqual(["get then", "then(function, function)"]);
+  });
+
+  test.concurrent("is followed to the thenable it reports", async () => {
+    const inner = { then: (resolve: (value: Response) => void) => resolve(new Response("inner")) };
+    const outer = { then: (resolve: (value: unknown) => void) => resolve(inner) };
+    expect(await answer("fetch", () => outer)).toEqual(ok("inner"));
+  });
+
+  test.concurrent("is answered by its first report", async () => {
+    const thenable = {
+      then(resolve: (value: Response) => void, reject: (reason: unknown) => void) {
+        resolve(new Response("first"));
+        resolve(new Response("second"));
+        reject(new Error("third"));
+      },
+    };
+    expect(await answer("fetch", () => thenable)).toEqual(ok("first"));
+  });
+
+  test.concurrent("that rejects reaches error()", async () => {
+    const reason = new Error("rejected by then()");
+    const thenable = { then: (_: unknown, reject: (reason: unknown) => void) => reject(reason) };
+    expect(await answer("fetch", () => thenable)).toEqual({ status: 500, body: "from error()", errors: [reason] });
+  });
+
+  test.concurrent("whose then() throws reaches error()", async () => {
+    const thrown = new Error("thrown by then()");
+    const thenable = {
+      then() {
+        throw thrown;
+      },
+    };
+    expect(await answer("fetch", () => thenable)).toEqual({ status: 500, body: "from error()", errors: [thrown] });
+  });
+
+  test.concurrent("that never reports holds the request until the client leaves", async () => {
+    const { promise: called, resolve: onCall } = Promise.withResolvers<void>();
+    const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: () => ({ then: () => onCall() }) as any });
+    const controller = new AbortController();
+    const response = fetch(server.url, { signal: controller.signal });
+    await called;
+    controller.abort();
+    expect(await response.catch(error => error.name)).toBe("AbortError");
+    await server.stop();
+    expect(server.pendingRequests).toBe(0);
+  });
+
+  test.concurrent("a value without a then() to call still gets the diagnostic", async () => {
+    const { stdout, stderr, exitCode } = await run(`
+      const statuses = [];
+      for (const value of [{ forgot: "new Response" }, { then: "not a function" }, [], "a string", 42]) {
+        const server = Bun.serve({ port: 0, development: false, fetch: () => value });
+        statuses.push((await fetch(server.url)).status);
+        await server.stop(true);
+      }
+      console.log(JSON.stringify(statuses));
+    `);
+    expect(stderr.match(/Expected a Response object, but received/g)).toHaveLength(5);
+    expect({ stdout, exitCode }).toEqual({ stdout: "[204,204,204,204,204]\n", exitCode: 0 });
+  });
+});
