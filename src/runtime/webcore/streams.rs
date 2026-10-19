@@ -1407,20 +1407,12 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
     /// A write after the end takes nothing. On a revoked sink it also tells the source, which would otherwise run on against a sink that answers at once.
     #[cold]
     fn write_after_done(&mut self) -> Writable {
-        if self.state != HTTPServerWritableState::Revoked {
-            return Writable::Owned(0);
+        if self.state == HTTPServerWritableState::Revoked {
+            self.state = HTTPServerWritableState::Aborted;
+            // Through a stack copy, and nothing reads the sink after it: the cancel can run a teardown that frees this sink.
+            let mut source = self.source;
+            source.abort(CommonAbortReason::ConnectionClosed);
         }
-        if matches!(
-            self.source,
-            SourceHandle::ByteStream(_) | SourceHandle::FileReader(_)
-        ) {
-            // A native source waits for `notify_revoked`.
-            return Writable::Backpressure(0);
-        }
-        self.state = HTTPServerWritableState::Aborted;
-        // Through a stack copy, and nothing reads the sink after it: the cancel can run a teardown that frees this sink.
-        let mut source = self.source;
-        source.abort(CommonAbortReason::ConnectionClosed);
         Writable::Owned(0)
     }
 

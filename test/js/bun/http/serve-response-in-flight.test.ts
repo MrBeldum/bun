@@ -526,9 +526,9 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
   });
 
   // A producer that waits on the sink is cancelled, and then its write settles.
-  // The first chunk fills the socket buffer, so that the second write waits on
-  // every platform.
-  test("a direct stream that waits on a write", async () => {
+  // The first chunk fills the socket buffer, so that the second write waits.
+  // Windows Server 2019 takes both writes at once, so nothing waits there.
+  test.skipIf(isWindows)("a direct stream that waits on a write", async () => {
     const { head, ...result } = await largeBody(
       (req, { heard }) =>
         new Response(
