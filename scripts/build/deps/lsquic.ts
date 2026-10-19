@@ -134,6 +134,14 @@ export const lsquic: Dependency = {
     // H3_CLOSED_CRITICAL_STREAM and closes the connection, which kills the
     // requests the graceful stop was draining. Reject only request streams.
     "patches/lsquic/goaway-accept-uni-streams.patch",
+    // The limit a connection enforces for the streams its peer opens, and the
+    // window it sizes MAX_STREAMS credit from, were not the limit it
+    // advertises. A client took both from es_max_streams_in (gQUIC's MIDS,
+    // 100) and never read es_init_max_streams_{bidi,uni}: below 50 it never
+    // returned credit, above 100 it closed the connection on a stream it had
+    // allowed. Both roles computed the limit in 32 bits, so 2^30 wrapped to 0.
+    // Upstream master (18e6f6e) has the same lines.
+    "patches/lsquic/peer-stream-limits.patch",
   ],
 
   fetchDeps: ["zlib", "lshpack", "lsqpack", "boringssl"],
