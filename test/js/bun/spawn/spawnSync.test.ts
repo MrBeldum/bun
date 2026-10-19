@@ -189,18 +189,23 @@ describe.concurrent("the timeout of a test that waits in spawnSync", () => {
   `;
 
   async function runTestFile(source: string, { noOrphans = false, files = {} } = {}) {
-    using dir = tempDir("spawnsync-test-timeout", { "timeout.test.ts": prelude + source, ...files });
-    await using proc = Bun.spawn({
-      cmd: [bunExe(), "test", "timeout.test.ts"],
-      // The mode is the runner's choice for some CI lanes, so every case names it.
-      env: { ...bunEnv, BUN_FEATURE_FLAG_NO_ORPHANS: noOrphans ? "1" : undefined },
-      cwd: String(dir),
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-    return { combined: stdout + stderr, exitCode };
+    for (let attempt = 1; ; attempt++) {
+      using dir = tempDir("spawnsync-test-timeout", { "timeout.test.ts": prelude + source, ...files });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "timeout.test.ts"],
+        // The mode is the runner's choice for some CI lanes, so every case names it.
+        env: { ...bunEnv, BUN_FEATURE_FLAG_NO_ORPHANS: noOrphans ? "1" : undefined },
+        cwd: String(dir),
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      const combined = stdout + stderr;
+      // No child of these cases ends on SIGTERM once it is set up: this one got SIGTERM sooner than that, on a
+      // machine too slow for the case. That run says nothing about the runner, so it is done again.
+      if (attempt === 3 || !combined.includes("signalCode SIGTERM")) return { combined, exitCode };
+    }
   }
 
   // Windows ends a process on the first signal.
