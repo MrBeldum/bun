@@ -72,3 +72,23 @@ test.concurrent(
   },
   60_000,
 );
+
+// A `req.signal` abort listener runs after the server has given the response
+// up. A write to the direct stream's controller from there still reached that
+// response: the socket was freed with the write corked on it (ASAN:
+// heap-use-after-free in us_socket_group via AsyncSocket::uncork).
+test.concurrent(
+  "a req.signal abort listener that writes to a direct stream does not reach the closed response",
+  async () => {
+    const { stdout, stderr, exitCode, signalCode } = await runFixture("serve-abort-listener-write-fixture.ts");
+
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({
+      write: 0,
+      flush: 0,
+      cancel: "AbortError: The connection was closed.",
+      pendingRequests: 0,
+    });
+    expect({ exitCode, signalCode }).toEqual({ exitCode: 0, signalCode: null });
+  },
+);

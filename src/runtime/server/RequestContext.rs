@@ -366,6 +366,14 @@ fn as_response(value: JSValue) -> Option<*mut Response> {
     response::from_js(value).map(|p| p.cast::<Response>())
 }
 
+/// Which body writer `RequestContext::revoke_response_writer` cut off from `resp`; the writer stays in its slot.
+#[must_use = "pass to notify_revoked_writer: the producer has not been told"]
+enum RevokedWriter {
+    None,
+    Sink,
+    ByteStream,
+}
+
 /// Release the body's hold on a stream the sink is done with, and mark a
 /// `Locked` body used. Non-generic and out of line: the eight `RequestContext`
 /// monomorphizations share one copy.
@@ -385,6 +393,48 @@ fn release_body_stream(response: &mut Response, global_this: &JSGlobalObject) {
     let body_value = response.get_body_value();
     if matches!(body_value, Body::Value::Locked(_)) {
         *body_value = Body::Value::Used;
+    }
+}
+
+/// Non-generic and out of line, like [`release_body_stream`].
+#[inline(never)]
+fn fail_oversized_request_body(
+    body: Option<&mut Body::Value>,
+    stream_ref: &JsCell<readable_stream::Strong>,
+    global_this: &JSGlobalObject,
+) {
+    // `Some` when the handler reads the body as a stream.
+    let readable = stream_ref.get().get();
+    // Body first (a tee branch after `req.clone()`), before `end_request_streaming()`'s ConnectionClosed.
+    if let Some(body) = body {
+        if readable.is_none() || matches!(body, Body::Value::Locked(_)) {
+            let _ = body.to_error_instance(
+                Body::ValueError::Message(BunString::static_(
+                    "Request body exceeded maxRequestBodySize",
+                )),
+                global_this,
+            );
+        }
+    }
+
+    // Error the stream, so that a pending or future read rejects and does not hang.
+    let _strong = stream_ref.replace(readable_stream::Strong::default());
+    if let Some(readable) = readable {
+        readable.value.ensure_still_alive();
+        if let Some(bytes) = readable.ptr.bytes() {
+            let source = bytes.parent_const();
+            source.producer.set(WebCore::streams::SourceHandle::None);
+            // False unless `to_error_instance` above reached this same stream through the body.
+            if !bytes.has_received_last_chunk.get() {
+                let mut err = Body::ValueError::Message(BunString::static_(
+                    "Request body exceeded maxRequestBodySize",
+                ));
+                bytes.on_data(WebCore::streams::Result::Err(
+                    err.to_stream_error(global_this),
+                ));
+                err.reset();
+            }
+        }
     }
 }
 
@@ -1390,6 +1440,7 @@ where
     pub(crate) fn end_without_body(&self, close_connection: bool) {
         ctx_log!("endWithoutBody");
         if let Some(resp) = self.resp.get() {
+            debug_assert!(self.response_writer_is_revoked());
             self.detach_response();
             // uWS markDone() clears onAborted on end, so on_abort can never
             // run for this request; this is the last chance to reclaim an
@@ -1413,6 +1464,7 @@ where
 
     pub(crate) fn force_close(&self) {
         if let Some(resp) = self.resp.get() {
+            debug_assert!(self.response_writer_is_revoked());
             self.detach_response();
             self.reclaim_promise_cell();
             // SAFETY: FFI handle
@@ -1435,6 +1487,94 @@ where
             }
         }
         self.end_stream(self.should_close_connection());
+    }
+
+    /// Cuts the body writer off from `resp`. Stores only: [`Self::notify_revoked_writer`] tells the producer.
+    fn revoke_response_writer(&self) -> RevokedWriter {
+        if let Some(wrapper) = self.sink_mut() {
+            wrapper.sink.revoke_response();
+            return RevokedWriter::Sink;
+        }
+        if let Some(stream) = self.byte_stream.get() {
+            bun_ptr::BackRef::from(stream).revoke_sink();
+            return RevokedWriter::ByteStream;
+        }
+        RevokedWriter::None
+    }
+
+    /// Tells the producer behind a revoked writer that its response is gone; `true` when the writer was a sink.
+    #[allow(clippy::needless_pass_by_value)] // by value: the call consumes the `#[must_use]` token
+    fn notify_revoked_writer(&self, writer: RevokedWriter) -> bool {
+        debug_assert!(self.resp.get().is_none());
+        match writer {
+            RevokedWriter::None => false,
+            RevokedWriter::Sink => {
+                let Some(sink_ptr) = self.sink.get() else {
+                    return false;
+                };
+                // SAFETY: `sink_ptr` is the live JSSink allocated by do_render_stream
+                // (repr(transparent) over the sink). `notify_revoked` takes the raw
+                // pointer because the teardown it can re-enter frees the sink.
+                unsafe {
+                    ResponseStream::<SSL_ENABLED>::notify_revoked(
+                        sink_ptr.as_ptr().cast::<ResponseStream<SSL_ENABLED>>(),
+                    );
+                }
+                true
+            }
+            RevokedWriter::ByteStream => {
+                // `None`: an abort nested in the caller finished the stream.
+                if let Some(stream) = self.byte_stream.take() {
+                    bun_ptr::BackRef::from(stream).finish_revoked_sink();
+                    self.deref(); // the ref `do_render_with_body` took for the pipe
+                }
+                false
+            }
+        }
+    }
+
+    /// No body writer can still reach `resp`.
+    fn response_writer_is_revoked(&self) -> bool {
+        self.byte_stream
+            .get()
+            .is_none_or(|stream| bun_ptr::BackRef::from(stream).sink.get().is_none())
+            && self
+                .sink_mut()
+                .is_none_or(|wrapper| wrapper.sink.res.is_none())
+    }
+
+    /// The request body outgrew `maxRequestBodySize`: a 413 while no status is written, else the response in flight closes as incomplete.
+    #[cold]
+    #[inline(never)]
+    fn reject_oversized_request_body(&self) {
+        ctx_log!("rejectOversizedRequestBody");
+        debug_assert!(self.pin_count.get() > 0);
+        // First: a response body that the request body feeds must not answer the error below from `end_chunk`.
+        let writer = self.revoke_response_writer();
+
+        fail_oversized_request_body(
+            self.request_body_mut(),
+            &self.request_body_readable_stream_ref,
+            self.server().global_this(),
+        );
+
+        // The body error can run another request's `error()` handler, which can abort this one: read `resp` again.
+        if let Some(resp) = self.resp.get() {
+            if resp.has_responded() {
+                self.end_without_body(!MUX);
+            } else {
+                if self.flags.has_written_status() {
+                    self.close_incomplete_stream();
+                } else {
+                    self.do_write_status(413);
+                    self.end_without_body(!MUX);
+                }
+                self.set_signal_aborted(jsc::CommonAbortReason::ConnectionClosed);
+                // A read of the request body hears the limit error before the producer is cancelled.
+                self.server().vm().as_mut().drain_microtasks();
+            }
+        }
+        self.notify_revoked_writer(writer);
     }
 
     fn on_writable_complete_response_buffer(
@@ -1567,6 +1707,8 @@ where
             abort.deref();
         }
 
+        // Before `req.signal` fires: a listener must not write to the response that is gone.
+        let writer = this.revoke_response_writer();
         this.detach_response();
         let any_js_calls = core::cell::Cell::new(false);
         let global_this = server.global_this();
@@ -1596,30 +1738,13 @@ where
             shim::signal_release(signal);
         }
 
-        // if have sink, call onAborted on sink
-        if let Some(sink_ptr) = this.sink.get() {
-            // The sink abort runs the stream's JS onClose through its signal.
+        if this.notify_revoked_writer(writer) {
+            // The sink abort ran the stream's JS onClose through its signal.
             any_js_calls.set(true);
-            // SAFETY: `sink_ptr` is the live JSSink allocated by do_render_stream
-            // (repr(transparent) over the sink). `abort` takes the raw pointer
-            // because the teardown it can re-enter frees the sink.
-            unsafe {
-                ResponseStream::<SSL_ENABLED>::abort(
-                    sink_ptr.as_ptr().cast::<ResponseStream<SSL_ENABLED>>(),
-                );
-            }
             // Reject a parked request-body read while this abort still drains microtasks.
             let _ = this.end_request_streaming();
             this.reclaim_promise_cell();
             return;
-        }
-
-        // A natively piped body has nobody left to take it. The deref balances the ref
-        // `do_render_with_body` took for the pipe: `end_chunk`, which releases it otherwise,
-        // cannot run once the response is gone.
-        if let Some(stream) = this.byte_stream.take() {
-            shim::byte_stream_unpipe(stream);
-            this.deref();
         }
 
         // if we can, free the request now.
@@ -4158,53 +4283,7 @@ where
                 this.resume_request_body_socket();
 
                 let _exit = vm.enter_event_loop_scope();
-
-                // Body first (a tee branch after `req.clone()`), before endRequestStreaming()'s ConnectionClosed.
-                if let Some(body) = this.request_body_mut() {
-                    if matches!(body, Body::Value::Locked(_)) {
-                        let _ = body.to_error_instance(
-                            Body::ValueError::Message(BunString::static_(
-                                "Request body exceeded maxRequestBodySize",
-                            )),
-                            global_this,
-                        );
-                    }
-                }
-
-                // Release the strong stream ref like the `last` arm does, then
-                // error the stream so a pending or future read rejects instead
-                // of hanging forever.
-                let _strong = this
-                    .request_body_readable_stream_ref
-                    .replace(readable_stream::Strong::default());
-
-                readable.value.ensure_still_alive();
-                if let Some(bytes) = readable.ptr.bytes() {
-                    let source = bytes.parent_const();
-                    source.producer.set(WebCore::streams::SourceHandle::None);
-                    // False unless `to_error_instance` above reached this same stream through the body.
-                    if !bytes.has_received_last_chunk.get() {
-                        let mut err = Body::ValueError::Message(BunString::static_(
-                            "Request body exceeded maxRequestBodySize",
-                        ));
-                        bytes.on_data(WebCore::streams::Result::Err(
-                            err.to_stream_error(global_this),
-                        ));
-                        err.reset();
-                    }
-                }
-
-                // Route through the normal end path so this.resp is detached
-                // and the base ref released (see the buffering branch below).
-                // SAFETY: FFI handle
-                if let Some(resp) = this.resp.get() {
-                    if !resp.has_responded() {
-                        this.flags.set_has_written_status(true);
-                        // SAFETY: FFI handle
-                        resp.write_status(b"413 Payload Too Large");
-                    }
-                }
-                this.end_without_body(!MUX);
+                this.reject_oversized_request_body();
                 return;
             }
 
@@ -4283,34 +4362,7 @@ where
                 this.flags.set_is_waiting_for_request_body(false);
 
                 let _exit = vm.enter_event_loop_scope();
-                // Reject the pending body first so endRequestStreaming()
-                // below (via this.endWithoutBody) doesn't substitute a
-                // generic ConnectionClosed. toErrorInstance handles
-                // .Locked itself (rejects the promise, deinits the
-                // readable, calls onReceiveValue).
-                let _ = body.to_error_instance(
-                    Body::ValueError::Message(BunString::static_(
-                        "Request body exceeded maxRequestBodySize",
-                    )),
-                    global_this,
-                );
-
-                // Route through the normal end path so this.resp is
-                // detached and the base ref released. Writing directly on
-                // the raw uWS response left this.resp pointing at a
-                // completed (and soon freed) response — uWS markDone()
-                // clears onAborted so no abort ever fires to release the
-                // ref, and a later handleResolve()/handleReject() from an
-                // async handler would dereference the stale pointer.
-                // SAFETY: FFI handle
-                if let Some(resp) = this.resp.get() {
-                    if !resp.has_responded() {
-                        this.flags.set_has_written_status(true);
-                        // SAFETY: FFI handle
-                        resp.write_status(b"413 Payload Too Large");
-                    }
-                }
-                this.end_without_body(!MUX);
+                this.reject_oversized_request_body();
                 return;
             }
 

@@ -840,6 +840,12 @@ declare module "bun" {
 
       /**
        * The maximum size of a request body, in bytes
+       *
+       * A request with a larger body gets a `413` response. When the body
+       * exceeds the limit after the handler has run, `request.signal` aborts
+       * and a read of the body rejects. A response that has already started
+       * is cut short: the connection is reset (on HTTP/2, the stream is).
+       *
        * @default 1024 * 1024 * 128 // 128MB
        */
       maxRequestBodySize?: number;
