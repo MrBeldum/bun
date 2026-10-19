@@ -1405,6 +1405,10 @@ impl Lockfile {
         let moved_a_row = cloner.flush()?;
         drop(cloner);
 
+        if !manager.appended_task_packages.is_empty() {
+            clean_remap_appended_task_packages_cold(manager, &package_id_mapping);
+        }
+
         new.trusted_dependencies = old_trusted_dependencies;
         new.scripts = old_scripts;
         new.meta_hash = old.meta_hash;
@@ -1472,6 +1476,24 @@ fn clean_verbose_report_cold(old: &Lockfile, new: &Lockfile, timer: Option<&Time
         // SAFETY: only entered when `log_level.is_verbose()`, which set `timer = Some(..)`.
         bun_core::fmt::fmt_duration_one_decimal(timer.unwrap().read()),
     );
+}
+
+/// A dependency that is resolved after the clean binds to the package of a git or tarball task that
+/// is done (`appended_by_task`). If the clean dropped that package, the task has to run again.
+#[cold]
+#[inline(never)]
+fn clean_remap_appended_task_packages_cold(manager: &mut PackageManager, mapping: &[PackageID]) {
+    let mut dropped: Vec<crate::package_manager_task::Id> = Vec::new();
+    for (task_id, package_id) in manager.appended_task_packages.iter_mut() {
+        match mapping.get(*package_id as usize) {
+            Some(&kept) if kept != invalid_package_id => *package_id = kept,
+            _ => dropped.push(*task_id),
+        }
+    }
+    for task_id in dropped {
+        let _ = manager.appended_task_packages.remove(&task_id);
+        let _ = manager.network_dedupe_map.remove(&task_id);
+    }
 }
 
 #[cold]
