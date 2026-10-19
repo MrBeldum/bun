@@ -1,7 +1,7 @@
 // Programs about which `bun check` and `tsc` once said something else, with what `tsc` 7.0.2 prints for them.
 // `differential-cases.json` has the same programs, and there `tsc` itself is the oracle. That needs the `typescript7`
 // package, and a debug build runs one in forty of them.
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { bunExe, tempDir } from "harness";
 import { endChildren, longLimit, spawn } from "../children";
 import { env as withoutAgents } from "./differential";
@@ -28,8 +28,7 @@ const options = {
   module: "esnext",
   moduleResolution: "bundler",
 };
-const tsconfig = (more: object = {}, others: object = {}) =>
-  JSON.stringify({ compilerOptions: { ...options, ...more }, ...others });
+const tsconfig = (more: object = {}) => JSON.stringify({ compilerOptions: { ...options, ...more } });
 
 /** What `bun check` prints for a project of `files`, by line, and its exit code. */
 async function check(files: Record<string, string>, args: string[] = []) {
@@ -52,9 +51,11 @@ async function check(files: Record<string, string>, args: string[] = []) {
 }
 
 // A debug build that was just linked is read from the disk by the first process, and starts twenty processes together
-// too slowly for the five seconds that a test has by default. So the first one is not on the time of a test, and the
-// tests start one at a time.
-await check({ "tsconfig.json": tsconfig(), "a.ts": `export {};\n` });
+// too slowly for the five seconds that a test has by default. So a hook with the limit of a process starts the first
+// one, and the tests start one at a time.
+beforeAll(async () => {
+  await check({ "tsconfig.json": tsconfig(), "a.ts": `export {};\n` });
+}, longLimit);
 
 describe("bun check", () => {
   // `getTypeReferenceType`: an alias that `resolveSymbol` does not follow, because it is also a value or has exports

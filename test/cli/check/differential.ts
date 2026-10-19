@@ -120,8 +120,8 @@ export function programsThatOnceDiffered(part: number, parts: number) {
               throw error;
             }
           });
-        // A test that runs no program passes. `ONLY` may name none.
-        expect(cases.length).toBeGreaterThan(0);
+        // A test that runs no program passes, and `ONLY` may name none.
+        if (only) expect(cases.length).toBeGreaterThan(0);
         const different: Record<string, object> = {};
         await inTurns(cases, async ([name, it]) => {
           const cwd = join(root, name);
