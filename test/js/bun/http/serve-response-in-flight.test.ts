@@ -525,6 +525,37 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
     expect(result.body).toBeLessThan(large.length);
   });
 
+  // A producer that waits on the sink is cancelled, and then its write settles.
+  // The first chunk fills the socket buffer, so that the second write waits on
+  // every platform.
+  test("a direct stream that waits on a write", async () => {
+    const { head, ...result } = await largeBody(
+      (req, { heard }) =>
+        new Response(
+          new ReadableStream({
+            type: "direct",
+            async pull(c: any) {
+              c.write(large.subarray(0, 1024 * 1024));
+              heard("write")(await c.write(large));
+            },
+            cancel: heard("cancel"),
+          } as any),
+        ),
+    );
+    expect(result).toEqual({
+      statusLine: "HTTP/1.1 200 OK",
+      headersEnded: true,
+      body: expect.any(Number),
+      terminated: false,
+      closed: "reset",
+      heard: ["abort", `cancel:${aborted}`, `write:${large.length}`],
+      errorCb: 0,
+      pendingRequests: 0,
+      next: "HTTP/1.1 200 OK",
+    });
+    expect(result.body).toBeLessThan(large.length);
+  });
+
   const cancelled = `after the abort: ${aborted}`;
   // A loop that waits on the sink hears the cancel. One that has seen the abort by then ends its stream first.
   const stopped = {

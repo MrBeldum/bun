@@ -1418,7 +1418,9 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
             return Writable::Backpressure(0);
         }
         self.state = HTTPServerWritableState::Aborted;
-        self.source.abort(CommonAbortReason::ConnectionClosed);
+        // Through a stack copy, and nothing reads the sink after it: the cancel can run a teardown that frees this sink.
+        let mut source = self.source;
+        source.abort(CommonAbortReason::ConnectionClosed);
         Writable::Owned(0)
     }
 
