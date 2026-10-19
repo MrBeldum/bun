@@ -215,6 +215,8 @@ describe("css", () => {
           .w:is(:global(.a .b)) { color: green }
           :local(.c .d) { .q2& { color: blue } }
           :global(:global(.e .f)) { .q3& { color: pink } }
+          :global(:global(span)) { .x2& { color: black } }
+          .w3:is(:global(:global(.e .f))) { color: white }
           .p:global(.a .b) { .q4& { color: purple } }
           :global(.g) { .n& { color: tan } .n2 & { color: teal } }
           .w2:is(:global(.g)) { color: navy }
@@ -235,6 +237,8 @@ describe("css", () => {
             .w_HASH:is(.a .b) { color: green; }
             .q2_HASH:is(.c_HASH .d_HASH) { color: #00f; }
             .q3_HASH:is(.e .f) { color: pink; }
+            .x2_HASH:is(span) { color: #000; }
+            .w3_HASH:is(.e .f) { color: #fff; }
             .q4_HASH:is(.p_HASH.a .b) { color: purple; }
             .n_HASH.g { color: tan; }
             .n2_HASH .g { color: teal; }
