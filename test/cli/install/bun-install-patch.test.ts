@@ -1021,9 +1021,11 @@ index 0000000000000000000000000000000000000000..2f9a147b6e5d17254f1bfce0d4e109a2
 describe.concurrent.each(["hoisted", "isolated"] as const)(
   "relinking a patched package whose folder cannot be renamed aside (%s linker)",
   linker => {
-    // Root renames and deletes in a directory whatever its mode says (CAP_DAC_OVERRIDE).
-    const setpriv = isRoot ? Bun.which("setpriv") : null;
-    const unprivileged = setpriv ? [setpriv, "--bounding-set", "-dac_override,-dac_read_search"] : [];
+    // Root renames and deletes in a directory whatever its mode says (CAP_DAC_OVERRIDE). So does
+    // the root of a user namespace, which the mount test is.
+    const setpriv = Bun.which("setpriv");
+    const withoutDacOverride = setpriv ? [setpriv, "--bounding-set", "-dac_override,-dac_read_search"] : [];
+    const unprivileged = isRoot ? withoutDacOverride : [];
 
     const packageJson = JSON.stringify({
       name: "relink-test",
@@ -1134,26 +1136,17 @@ new file mode 100644
         await chmod(locked, 0o555);
         await chmod(parent, 0o555);
         await Bun.write(join(dir, "patches", "is-odd@3.0.1.patch"), generationPatch("B"));
-        let result;
         try {
-          result = await install(dir, env);
+          expect(await install(dir, env)).toMatchObject({ stderr: "", exitCode: 0 });
         } finally {
           await chmod(parent, 0o755);
           await chmod(locked, 0o755);
         }
-        if (result.exitCode === 0) {
-          expect(result.stderr).toBe("");
-          expect(await installedState(dir)).toEqual({
-            markers: 1,
-            files: ["index.js", "locked", "package.json"],
-            generation: "B",
-          });
-        } else {
-          // The copy itself can still be refused. Then nothing that passes as installed is left.
-          expect(result.stderr).toContain("EACCES");
-          const entries = await readdir(join(dir, packagePath));
-          expect(entries.filter(name => name.startsWith(".bun-tag-") || name === "package.json")).toEqual([]);
-        }
+        expect(await installedState(dir)).toEqual({
+          markers: 1,
+          files: ["index.js", "locked", "package.json"],
+          generation: "B",
+        });
 
         await Bun.write(join(dir, "patches", "is-odd@3.0.1.patch"), generationPatch("A"));
         expect(await install(dir, env)).toMatchObject({ stderr: "", exitCode: 0 });
@@ -1189,7 +1182,7 @@ new file mode 100644
         // The parent is read-only as well: the kernel reports that before it reports the mount.
         await chmod(parent, 0o555);
         try {
-          expect(await install(dir, env, [...mounted(packagePath), ...unprivileged])).toMatchObject({
+          expect(await install(dir, env, [...mounted(packagePath), ...withoutDacOverride])).toMatchObject({
             stderr: "",
             exitCode: 0,
           });

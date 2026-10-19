@@ -2465,7 +2465,10 @@ mod posix_impl {
             }
         }
         // A mount of another file system. A bind mount of the same one is not told apart.
-        let parent = fstatat(dir, bun_core::zstr!("."))?;
+        let parent = match bun_paths::dirname(path.as_bytes()) {
+            Some(parent) => fstatat(dir, &bun_core::ZBox::from_bytes(parent))?,
+            None => fstatat(dir, bun_core::zstr!("."))?,
+        };
         let child = lstatat(dir, path)?;
         Ok(child.st_dev != parent.st_dev)
     }

@@ -325,18 +325,14 @@ describe.skipIf(!isWindows)("install backends on Windows", () => {
       stderr: "inherit",
       stdin: "ignore",
     });
+    const decoder = new TextDecoder();
     let output = "";
     for await (const chunk of holder.stdout) {
-      output += new TextDecoder().decode(chunk, { stream: true });
+      output += decoder.decode(chunk, { stream: true });
       if (output.includes("HELD") || output.includes("MISSED")) break;
     }
     expect(output).toContain("HELD");
-    try {
-      return await install(projectDir, "copyfile");
-    } finally {
-      holder.kill();
-      await holder.exited;
-    }
+    return await install(projectDir, "copyfile");
   }
 
   // The copyfile and the symlink backend share one walk. It creates directories

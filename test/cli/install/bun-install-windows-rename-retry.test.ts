@@ -303,21 +303,6 @@ describe.skipIf(!isWindows).concurrent("bun install renames into the cache while
     expect(await blocker.finish()).toContain("HELD");
 
     expect(result).toMatchObject({ exitCode: 0 });
-    // DIAGNOSTIC (temporary): which of the 300 files is missing, and what the folder holds.
-    {
-      const present = new Set(readdirSync(join(installed, "files")));
-      const missing = Array.from({ length: 300 }, (_, i) => `${i}.txt`).filter(name => !present.has(name));
-      console.log(
-        "DIAG missing:",
-        JSON.stringify(missing),
-        "top:",
-        JSON.stringify(readdirSync(installed)),
-        "stdout:",
-        result.stdout,
-        "stderr:",
-        result.stderr,
-      );
-    }
     expect({
       packageJson: existsSync(join(installed, "package.json")),
       binExe: existsSync(join(installed, "bin.exe")),

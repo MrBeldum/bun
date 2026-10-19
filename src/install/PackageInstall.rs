@@ -1088,7 +1088,7 @@ impl LinkBatch {
                 tree_dir,
                 &job.destination_dir_subpath,
                 job.random,
-                IfMounted::Unmark,
+                Replacement::Files,
             ) {
                 Ok(old) => old,
                 Err(err) => {
@@ -2106,13 +2106,14 @@ impl PackageFiles<'_> {
 /// What `move_aside` names begin with. What is left of one if bun dies stays until `bun prune`.
 pub(crate) const MOVED_ASIDE_PREFIX: &str = ".old-";
 
-/// What `move_aside` does with a mount point (a Docker volume): what is in one is not bun's to delete.
+/// What takes the place of the directory `move_aside` moves.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IfMounted {
-    /// Return the rename's error: a link has to replace the whole directory.
-    Fail,
-    /// Delete only the files `verify` reads.
-    Unmark,
+pub(crate) enum Replacement {
+    /// A copy of the package. A mount point (a Docker volume) keeps what is not bun's to delete,
+    /// and loses only the files `verify` reads.
+    Files,
+    /// A link, which needs the whole directory gone. A mount point fails.
+    Link,
 }
 
 /// Renames `subpath`, if it is there, to a name in `destination_dir` made of `random`. On any thread.
@@ -2122,7 +2123,7 @@ pub(crate) fn move_aside(
     destination_dir: &Dir,
     subpath: &ZStr,
     random: u64,
-    if_mounted: IfMounted,
+    replacement: Replacement,
 ) -> sys::Maybe<Option<bun_core::ZBox>> {
     let old = bun_core::ZBox::from_vec(
         format!(
@@ -2138,7 +2139,7 @@ pub(crate) fn move_aside(
     };
     // `EBUSY`: a mount point on Linux before 5.8, where `statx` cannot say.
     if refused.get_errno() == sys::E::EBUSY || sys::is_mount_point(destination_dir.fd(), subpath)? {
-        if if_mounted == IfMounted::Fail {
+        if replacement == Replacement::Link {
             return Err(refused);
         }
         let dir = destination_dir.open_at_with(
@@ -2148,6 +2149,10 @@ pub(crate) fn move_aside(
         let unmarked = unmark(&dir);
         dir.close();
         return unmarked.map(|()| None);
+    }
+    // Only overlayfs (`EXDEV`) lets a delete do what the rename could not.
+    if replacement == Replacement::Link && refused.get_errno() != sys::E::EXDEV {
+        return Err(refused);
     }
     empty_in_place(destination_dir, subpath).map(|()| None)
 }
@@ -2226,13 +2231,13 @@ impl<'a> PackageInstall<'a> {
     pub(crate) fn uninstall_before_install(
         &self,
         destination_dir: &Dir,
-        if_mounted: IfMounted,
+        replacement: Replacement,
     ) -> sys::Maybe<()> {
         let Some(temp_path) = move_aside(
             destination_dir,
             self.destination_dir_subpath,
             bun_core::fast_random(),
-            if_mounted,
+            replacement,
         )?
         else {
             return Ok(());
@@ -2287,10 +2292,9 @@ impl<'a> PackageInstall<'a> {
         destination_dir: &Dir,
     ) -> InstallResult {
         let dest_path = self.destination_dir_subpath;
-        // A link replaces the whole folder: a mount point that stays is not to be touched.
         if !skip_delete
             && dest_path.as_bytes() != b"."
-            && let Err(err) = self.uninstall_before_install(destination_dir, IfMounted::Fail)
+            && let Err(err) = self.uninstall_before_install(destination_dir, Replacement::Link)
         {
             return InstallResult::fail(err.into(), Step::RemovingOldDir);
         }
@@ -2558,7 +2562,7 @@ impl<'a> PackageInstall<'a> {
     ) -> InstallResult {
         if !skip_delete
             && self.destination_dir_subpath.as_bytes() != b"."
-            && let Err(err) = self.uninstall_before_install(destination_dir, IfMounted::Unmark)
+            && let Err(err) = self.uninstall_before_install(destination_dir, Replacement::Files)
         {
             return InstallResult::fail(err.into(), Step::RemovingOldDir);
         }
@@ -2677,14 +2681,22 @@ impl PackageFiles<'_> {
                 ..*self
             }
             .install_into(destination_dir, method_, resolution_tag, owner);
-            if let failure @ InstallResult::Failure(_) = staged {
+            if let InstallResult::Failure(failure) = staged {
                 let _ = destination_dir.delete_tree(staging.as_bytes());
-                return failure;
-            }
-            if rename_staging_into_place(destination_dir.fd(), staging, dest).is_ok() {
+                // A parent that refuses new entries (macOS clonefile makes the staging directory
+                // itself) still lets a package that is there be linked into.
+                if !matches!(
+                    failure.err,
+                    crate::Error::Sys(bun_errno::SystemErrno::EACCES | bun_errno::SystemErrno::EPERM)
+                        | crate::Error::AccessDenied
+                ) {
+                    return InstallResult::Failure(failure);
+                }
+            } else if rename_staging_into_place(destination_dir.fd(), staging, dest).is_ok() {
                 return InstallResult::Success;
+            } else {
+                let _ = destination_dir.delete_tree(staging.as_bytes());
             }
-            let _ = destination_dir.delete_tree(staging.as_bytes());
         }
         // No staging (`Staging::Off`, `dest` is occupied, the rename is refused): link in place.
         let result = self.install_into(destination_dir, method_, resolution_tag, owner);

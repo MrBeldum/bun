@@ -526,11 +526,11 @@ pub(crate) fn remove_placed_package(
         &node_modules,
         &bun_core::ZBox::from_bytes(alias),
         bun_core::fast_random(),
-        package_install::IfMounted::Unmark,
+        package_install::Replacement::Files,
     ) {
         Ok(Some(old)) => node_modules.delete_tree(old.as_bytes()),
-        Ok(None) => Ok(()),
-        Err(_) => node_modules.delete_tree(alias),
+        // Unmarked or gone. What `verify` reads could not go: the copy stays whole.
+        Ok(None) | Err(_) => Ok(()),
     };
     crate::prune::prune_bins(&node_modules);
 }
