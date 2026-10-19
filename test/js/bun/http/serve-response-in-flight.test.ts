@@ -13,7 +13,7 @@ import { EventEmitter, once } from "node:events";
 import net from "node:net";
 import { join } from "node:path";
 import { baseHeaders, F, frame, RawH2, T } from "./serve-http2-helpers";
-import { END_OF_STATUS_LINE, get, LIMIT, upload, type Upload } from "./serve-response-in-flight-fixture";
+import { END_OF_STATUS_LINE, get, LIMIT, released, upload, type Upload } from "./serve-response-in-flight-fixture";
 
 const never = () => new Promise<never>(() => {});
 
@@ -372,12 +372,7 @@ async function run(row: Row, { development = false, secure = false, held = false
       });
     },
   });
-  // With a deadline: a request that the server never lets go shows in the result, not as a timeout.
-  const released = async () => {
-    const deadline = Date.now() + 2000;
-    while (server.pendingRequests > 0 && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
-  };
-  const request = held ? { ...row, hold: released } : row;
+  const request = held ? { ...row, hold: true, released: () => released(server) } : row;
   const { wire, closed } = await upload(server.port!, secure, request, clientClosed.resolve);
   await Promise.all(waitFor);
   const [head, ...rest] = wire.split("\r\n\r\n");
@@ -551,11 +546,11 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
       "producer:listener": stopped,
       // A timer writes until req.signal.aborted: it is not in the stream when the cancel comes.
       "producer:timer": { ...stopped, cancel: cancelled },
-      // write(), flush() and end() after the abort: the producer ends its stream, so nothing is left to cancel.
+      // write() and flush(true) after the abort wait for the cancel, and then answer 0.
       "producer:late": {
         ...stopped,
-        heard: ["abort", "write:0", "flush:0", "flush(true):0", "end:0", "producer ended"],
-        cancel: "none",
+        heard: ["abort", "write:waits", "flush:0", "write:0", "flush(true):0", "producer ended"],
+        cancel: cancelled,
       },
     };
     expect(await scenarios(...Object.keys(expected))).toEqual({
@@ -579,6 +574,8 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
       "generator": { closed: "reset", heard: ["the client left"], listeners: 0, pendingRequests: 0 },
       "report:guarded": reported,
       "report:unguarded": reported,
+      // Its stream takes one more report and is cancelled. It used to be pulled for ever.
+      "report:from pull()": { ...reported, heard: [`cancel:${aborted}`] },
     };
     expect(await scenarios(...Object.keys(expected))).toEqual({
       stdout: expected,
@@ -649,7 +646,10 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
           bodyOfX.resolve(req.body!);
           await answer.promise;
           let controller: any;
-          req.signal.addEventListener("abort", () => void heard.push(`abort, write:${controller.write("late")}`));
+          // A write from the listener waits for the cancel: it does not reach the response.
+          req.signal.addEventListener("abort", () => {
+            heard.push(`abort, write:${controller.write("late") instanceof Promise ? "waits" : "does not wait"}`);
+          });
           return new Response(
             new ReadableStream({
               type: "direct",
@@ -698,7 +698,7 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
     expect(result).toEqual({
       x: { rejected: "ECONNRESET" },
       y: { status: 500, body: "err" },
-      heard: [`error():${tooLarge}`, "write:7", "abort, write:0", `cancel:${aborted}`],
+      heard: [`error():${tooLarge}`, "write:7", "abort, write:waits", `cancel:${aborted}`],
       pendingRequests: 0,
     });
   });

@@ -20,13 +20,22 @@ export type Upload = {
   // Body bytes (within the limit) sent with the request head.
   first?: string;
   path?: string;
-  // The client stops reading behind the overflow until this settles, so the
-  // response stays in flight whatever the socket buffers can take. Its FIN
-  // leaves when it reads on. On macOS a client that has megabytes in flight is
-  // not always told of a reset when it sends nothing afterwards: this FIN is
-  // answered with a reset in that case.
-  hold?: () => Promise<unknown>;
+  // For a response that can have megabytes in flight. Settles when the server
+  // has let the request go: the FIN of the upload leaves then, not behind the
+  // overflow. On macOS such a client is not always told of a reset when it
+  // sends nothing afterwards, and this FIN is answered with a reset.
+  released?: () => Promise<unknown>;
+  // With `released`: the client also stops reading until then, so the response
+  // stays in flight whatever the socket buffers can take.
+  hold?: boolean;
 };
+
+// Settles when `server` has let every request go. With a deadline: a request
+// that it never lets go shows in the result, not as a timeout.
+export async function released(server: { pendingRequests: number }) {
+  const deadline = Date.now() + 2000;
+  while (server.pendingRequests > 0 && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+}
 
 const connect = (port: number, secure: boolean, onConnect: () => void): net.Socket =>
   secure
@@ -42,7 +51,7 @@ const connect = (port: number, secure: boolean, onConnect: () => void): net.Sock
 export function upload(
   port: number,
   secure: boolean,
-  { marker, first = "", path = "/", hold }: Upload,
+  { marker, first = "", path = "/", released, hold }: Upload,
   onClose = () => {},
 ) {
   const chunks: Buffer[] = [];
@@ -58,10 +67,10 @@ export function upload(
       chunks.push(d);
       if (overflowed || !Buffer.concat(chunks).includes(marker!)) return;
       overflowed = true;
-      if (!hold) return void sock.end(OVERFLOW);
+      if (!released) return void sock.end(OVERFLOW);
       sock.write(OVERFLOW);
-      sock.pause();
-      hold().finally(() => {
+      if (hold) sock.pause();
+      released().finally(() => {
         sock.resume();
         sock.end();
       });
@@ -117,7 +126,7 @@ async function producer(run: (c: any, req: Request, heard: string[]) => Promise<
       );
     },
   });
-  const { closed } = await upload(server.port!, false, { marker: "chunk" });
+  const { closed } = await upload(server.port!, false, { marker: "chunk", released: () => released(server) });
   return { closed, heard, cancel, pendingRequests: server.pendingRequests, next: await get(server.port!) };
 }
 
@@ -156,6 +165,39 @@ async function report(guarded: boolean) {
   return { body: body(wire), closed, pendingRequests: server.pendingRequests, next: await get(server.port!) };
 }
 
+// A default stream that reports a failed read of the request body from
+// `pull()`, and goes on: the next pull reads, fails and reports again.
+async function reportFromPull() {
+  const heard: string[] = [];
+  using server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    maxRequestBodySize: LIMIT,
+    fetch(req) {
+      if (req.method === "GET") return new Response("ok");
+      const reader = req.body!.getReader();
+      let pulls = 0;
+      return new Response(
+        new ReadableStream({
+          async pull(c) {
+            if (pulls++ === 0) return c.enqueue("progress: reading the upload\n");
+            try {
+              const { done, value } = await reader.read();
+              if (done) return c.close();
+              c.enqueue(`read: ${value.length} bytes\n`);
+            } catch (err) {
+              c.enqueue(`upload failed: ${(err as Error).message}\n`);
+            }
+          },
+          cancel: reason => void heard.push(`cancel:${reason}`),
+        }),
+      );
+    },
+  });
+  const { wire, closed } = await upload(server.port!, false, { marker: "progress" });
+  return { body: body(wire), closed, heard, pendingRequests: server.pendingRequests, next: await get(server.port!) };
+}
+
 const chunk = Buffer.alloc(16 * 1024, "chunk");
 
 const scenarios: Record<string, () => Promise<unknown>> = {
@@ -190,14 +232,16 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           }, 1);
         }),
     ),
-  // What the controller answers once the response is gone.
+  // What the controller answers once the response is gone. A write waits
+  // until the producer is told, so a producer cannot run on against it.
   "producer:late": () =>
     producer(async (c, req, heard) => {
       c.write(chunk);
       await c.flush();
       await once(req.signal, "abort");
-      heard.push(`write:${c.write(chunk)}`, `flush:${c.flush()}`, `flush(true):${await c.flush(true)}`);
-      heard.push(`end:${await c.end()}`);
+      const write = c.write(chunk);
+      heard.push(`write:${write instanceof Promise ? "waits" : write}`, `flush:${c.flush()}`);
+      heard.push(`write:${await write}`, `flush(true):${await c.flush(true)}`);
     }),
 
   // The generator of docs/runtime/streams.mdx, with a first chunk.
@@ -231,6 +275,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
 
   "report:guarded": () => report(true),
   "report:unguarded": () => report(false),
+  "report:from pull()": reportFromPull,
 
   // The body of request A is the response body of request B, which has written
   // a chunk. A crosses the limit: A gets the 413, and B's body fails with the

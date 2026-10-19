@@ -1157,6 +1157,8 @@ impl SourceHandle {
 pub(crate) enum HTTPServerWritableState {
     Writing,
     Done,
+    /// `Aborted`, and the source has not been told yet: a `write()` or a `flush(true)` waits for `notify_revoked`.
+    Revoked,
     Aborted,
 }
 
@@ -1349,7 +1351,10 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
     }
 
     pub(crate) fn is_aborted(&self) -> bool {
-        self.state == HTTPServerWritableState::Aborted
+        matches!(
+            self.state,
+            HTTPServerWritableState::Revoked | HTTPServerWritableState::Aborted
+        )
     }
 
     /// `Aborted` is already done and stays `Aborted`; callers still read
@@ -1397,6 +1402,23 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
             return Writable::Pending(core::ptr::from_mut(&mut self.pending));
         }
         Writable::Owned(len)
+    }
+
+    /// A write after the end takes nothing. On a revoked sink it also waits, so that a source that has not been told cannot run on against it.
+    #[cold]
+    fn write_after_done(&mut self) -> Writable {
+        if self.state != HTTPServerWritableState::Revoked {
+            return Writable::Owned(0);
+        }
+        if matches!(
+            self.source,
+            SourceHandle::ByteStream(_) | SourceHandle::FileReader(_)
+        ) {
+            return Writable::Backpressure(0);
+        }
+        self.pending.consumed = 0;
+        self.pending.result = Writable::Owned(0);
+        Writable::Pending(core::ptr::from_mut(&mut self.pending))
     }
 
     fn send_without_auto_flusher(&mut self, buf: &[u8]) -> bool {
@@ -1732,6 +1754,13 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
             return self.flush_from_js_no_wait();
         }
 
+        if self.state == HTTPServerWritableState::Revoked {
+            if self.pending_flush().is_none() {
+                self.wrote_at_start_of_flush = self.wrote;
+            }
+            return bun_sys::Result::Ok(self.park_pending_flush(cx.global()));
+        }
+
         if let Some(prom) = self.pending_flush() {
             // A prior `flush(true)` is already waiting on the drain. Push any
             // data buffered since (below highWaterMark) so it reaches uWS now
@@ -1786,7 +1815,7 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
 
     pub fn write(&mut self, data: &StreamResult) -> Writable {
         if self.is_done() || self.requested_end {
-            return Writable::Owned(0);
+            return self.write_after_done();
         }
 
         let bytes = data.slice();
@@ -1826,7 +1855,7 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
 
     pub(crate) fn write_latin1(&mut self, data: &StreamResult) -> Writable {
         if self.is_done() || self.requested_end {
-            return Writable::Owned(0);
+            return self.write_after_done();
         }
 
         if self.res.is_none() || self.any_res().unwrap().has_responded() {
@@ -1884,7 +1913,7 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
 
     pub(crate) fn write_utf16(&mut self, data: &StreamResult) -> Writable {
         if self.is_done() || self.requested_end {
-            return Writable::Owned(0);
+            return self.write_after_done();
         }
 
         if self.res.is_none() || self.any_res().unwrap().has_responded() {
@@ -1989,7 +2018,9 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
     /// The response is gone: this sink never writes again. Stores only: [`Self::notify_revoked`] tells the source.
     pub(crate) fn revoke_response(&mut self) {
         bun_core::scoped_log!(HTTPServerWritableLog, "revokeResponse()");
-        self.state = HTTPServerWritableState::Aborted;
+        if self.state != HTTPServerWritableState::Aborted {
+            self.state = HTTPServerWritableState::Revoked;
+        }
         self.res = None;
         self.unregister_auto_flusher();
     }
@@ -2004,6 +2035,8 @@ impl<const SSL: bool> HTTPServerWritable<SSL> {
         // SAFETY: caller contract — `this` is live, and every access here is scoped
         // so no borrow spans the signal close below, which may free `*this`.
         debug_assert!(unsafe { (*this).is_aborted() });
+        // SAFETY: as above. Before the promises settle: a write that re-enters from there must not wait again.
+        unsafe { (*this).state = HTTPServerWritableState::Aborted };
 
         // SAFETY: as above; exclusive borrow scoped to the call.
         unsafe { (*this).flush_promise() };
