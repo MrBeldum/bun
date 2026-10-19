@@ -574,8 +574,7 @@ impl<'a> LoadResult<'a> {
         )
     }
 
-    // Callers reach this only after `handleLoadLockfileErrors` has exited on
-    // the `NotFound`/`Err` arms, so the variant is known-`Ok`.
+    // Callers rule out `NotFound` and `Err` before they call this.
     bun_core::enum_unwrap!(pub LoadResult, Ok => fn ok / ok_mut -> LoadResultOk<'a>);
 }
 
