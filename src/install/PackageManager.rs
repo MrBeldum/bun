@@ -221,6 +221,7 @@ pub use self::package_manager_options::Options;
 pub use self::install_with_manager::install_with_manager;
 pub use self::package_json_editor as PackageJSONEditor;
 pub use self::update_request::UpdateRequest;
+use self::workspace_manifests::ScratchManifests;
 pub use self::workspace_package_json_cache::WorkspacePackageJSONCache;
 pub use super::package_installer::PackageInstaller;
 
@@ -1103,6 +1104,11 @@ impl PackageManager {
         nothing: &str,
     ) -> lockfile::LoadResult<'_> {
         let Some(parts) = self.load_lockfile_or_exit_if_broken::<ATTEMPT_OTHER>() else {
+            // `bun install` saves no lockfile for a project with nothing to lock.
+            if let Some(empty) = ScratchManifests::empty_lockfile(self) {
+                *self.lockfile = empty;
+                return lockfile::LoadResult::NotFound;
+            }
             if self.options.log_level != package_manager_options::LogLevel::Silent {
                 if nothing.is_empty() {
                     Output::err_generic("missing lockfile", ());
@@ -2053,6 +2059,8 @@ pub fn user_cache_directory(env: &dot_env::Loader, cwd: &[u8]) -> Option<Box<[u8
 struct PackageJsonWalk<'a> {
     cwd: &'a [u8],
     next_dir: Option<&'a [u8]>,
+    /// Passes over a package.json in a shared directory without the warning.
+    quiet: bool,
     /// `<dir>/package.json` for the directory that `next` returned last. It's a `Vec` because the
     /// cwd alone can fill a path buffer.
     path: Vec<u8>,
@@ -2063,6 +2071,7 @@ impl<'a> PackageJsonWalk<'a> {
         Self {
             cwd,
             next_dir: Some(cwd),
+            quiet: false,
             path: Vec::with_capacity(cwd.len() + b"/package.json".len()),
         }
     }
@@ -2086,10 +2095,12 @@ impl<'a> PackageJsonWalk<'a> {
                 && dir.len() != self.cwd.len()
                 && is_shared_directory(dir)
             {
-                bun_core::warn!(
-                    "ignoring package.json in <b>{}<r>: directory is writable by other users",
-                    bstr::BStr::new(dir),
-                );
+                if !self.quiet {
+                    bun_core::warn!(
+                        "ignoring package.json in <b>{}<r>: directory is writable by other users",
+                        bstr::BStr::new(dir),
+                    );
+                }
                 continue;
             }
             return Some((dir, opened));
@@ -2400,6 +2411,20 @@ pub fn project_directory(cwd: &[u8]) -> Option<&[u8]> {
         &mut None,
     )
     .map(|(project, _)| project)
+}
+
+/// Returns the nearest directory above `dir` that has a package.json.
+fn package_json_above(dir: &[u8]) -> Option<&[u8]> {
+    let mut walk = PackageJsonWalk::new(dir);
+    walk.next_dir = bun_core::dirname(dir);
+    // `init` is the one that warns about a package.json in a shared directory.
+    walk.quiet = true;
+    while let Some((above, opened)) = walk.next(bun_sys::O::RDONLY) {
+        if !opened.is_err_and(|err| !err.is_unreadable_file(&walk.path) && !err.is_directory()) {
+            return Some(above);
+        }
+    }
+    None
 }
 
 /// Returns `&'static mut PackageManager` — the process-singleton (held in

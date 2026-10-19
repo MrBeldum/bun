@@ -16,8 +16,23 @@ use crate::{
 
 use super::PackageManager;
 use super::add_remove_with_filter::{WorkspaceTarget, fetch_entry, root_package_json_path};
+use super::install_with_manager::exit_on_empty_package_json;
+use super::package_manager_options::LogLevel;
 use super::workspace_package_json_cache::GetJSONOptions;
 use super::workspace_selection::WorkspaceGraph;
+
+/// A package.json with only these keys says how to read the files next to it.
+const OF_A_FOLDER: [&[u8]; 9] = [
+    b"type",
+    b"main",
+    b"module",
+    b"browser",
+    b"exports",
+    b"imports",
+    b"types",
+    b"typings",
+    b"sideEffects",
+];
 
 /// Root + member package.json files parsed the way `bun install` parses them, into a throw-away lockfile.
 /// Errors the parse only logs (an invalid catalog range, say) fail it, as in `bun install`.
@@ -59,6 +74,61 @@ impl ScratchManifests {
             features,
         )?;
         self.fail_on_logged_errors()
+    }
+
+    /// Returns the root-only lockfile if the root package.json alone shows there is nothing to lock.
+    pub(crate) fn empty_lockfile(manager: &mut PackageManager) -> Option<Lockfile> {
+        let path = root_package_json_path();
+        let silent = manager.options.log_level == LogLevel::Silent;
+        // `parse_root` exits if it can't read the file. `bun pm cache pack` runs without one.
+        let entry = (manager.workspace_package_json_cache)
+            .get_with_path(&mut bun_ast::Log::init(), &path, Default::default())
+            .unwrap()
+            .ok()?;
+        // `bun install` reads an empty file as `{}`, but it may be a truncated one.
+        if entry.source.contents.is_empty() {
+            if silent {
+                Global::exit(1);
+            }
+            exit_on_empty_package_json(&path);
+        }
+        // The workspaces may be missing from disk. A root that is not an object is no manifest.
+        if !entry.root.is_object() || entry.root.get(b"workspaces").is_some() {
+            return None;
+        }
+        let (mut keys, mut marks) = (0, 0);
+        entry.root.for_each_property(|key, _, _| {
+            keys += 1;
+            marks += usize::from(OF_A_FOLDER.contains(&key));
+        });
+
+        let mut scratch = ScratchManifests::new();
+        scratch.parse_root(manager, Features::main()).ok()?;
+        // Only an install reads the workspaces that pnpm-workspace.yaml lists.
+        if scratch.root.dependencies.len > 0
+            || bun_sys::exists_z(bun_core::zstr!("pnpm-workspace.yaml"))
+        {
+            return None;
+        }
+        // A package.json with only those keys belongs to a folder of the project above it.
+        if keys > 0
+            && marks == keys
+            && !manager.options.global
+            && let Some(above) = super::package_json_above(bun_core::dirname(&path)?)
+        {
+            if !silent {
+                Output::err_generic("missing lockfile", ());
+                bun_core::note!(
+                    "<b>{}<r> only has fields like \"type\". The project may be in <b>{}<r>",
+                    BStr::new(&path),
+                    BStr::new(above),
+                );
+            }
+            Global::exit(1);
+        }
+        (scratch.lockfile.append_package(&scratch.root)).unwrap_or_oom();
+        scratch.lockfile.resolve(&mut scratch.log).unwrap_or_oom();
+        Some(scratch.lockfile)
     }
 
     /// Doesn't read any workspace. Uses bun.lock's workspace paths, but not its versions, which may
