@@ -9,11 +9,12 @@ use crate::api::bun::process::{self as spawn, Rusage, SpawnOptions, Status};
 use crate::cli::Command;
 use crate::cli::filter_arg as FilterArg;
 use crate::cli::run_command::{ConfigureEnvOptions, RunCommand};
-use bun_collections::StringHashMap;
+use bun_collections::{StringHashMap, strongly_connected_components};
 use bun_core::{Global, Output};
 use bun_core::{ZStr, strings};
 use bun_event_loop::EventLoopHandle;
 use bun_event_loop::MiniEventLoop::{self as MiniEventLoopMod, MiniEventLoop};
+use bun_install::dependency::Behavior;
 use bun_install::lifecycle_script_runner::ScriptArgv;
 use bun_io::{BufferedReader, ReadState};
 use bun_sys as sys;
@@ -28,7 +29,7 @@ struct ScriptConfig {
     combined: &'static ZStr, // interned via `cli_dupe` into the process-lifetime CLI arena
     // Owned dep names; `DependencyMap.source_buf` would dangle once the
     // parsed `PackageJSON` (which owns the file bytes) drops.
-    deps: Vec<Box<[u8]>>,
+    deps: Vec<(Box<[u8]>, Behavior)>,
 
     // $PATH must be set per script because it contains
     // node_modules/.bin
@@ -916,13 +917,13 @@ pub(crate) fn run_scripts_with_filter(
             let combined = ZStr::from_buf(interned, combined_len);
 
             let dep_source_buf: &[u8] = &package.json.dependencies.source_buf;
-            let deps: Vec<Box<[u8]>> = package
+            let deps: Vec<(Box<[u8]>, Behavior)> = package
                 .json
                 .dependencies
                 .map
-                .keys()
+                .values()
                 .iter()
-                .map(|k| Box::<[u8]>::from(k.slice(dep_source_buf)))
+                .map(|dep| (dep.name.slice(dep_source_buf).into(), dep.behavior))
                 .collect();
 
             scripts.push(ScriptConfig {
@@ -1072,7 +1073,7 @@ pub(crate) fn run_scripts_with_filter(
     // compute dependencies (TODO: maybe we should do this only in a workspace?)
     for handle in state.handles.iter_mut() {
         let config = handle.config;
-        for name in &config.deps {
+        for (name, _) in &config.deps {
             // is it a workspace dependency?
             if let Some(pkgs) = map.get(&**name) {
                 for &dep in pkgs {
@@ -1092,18 +1093,14 @@ pub(crate) fn run_scripts_with_filter(
             break;
         }
     }
-    // if there is, we ignore dependency order completely
     if has_cycle_flag {
-        for handle in state.handles.iter_mut() {
-            handle.dependents.clear();
-            handle.remaining_dependencies = 0;
-        }
+        wait_around_cycles(&mut state.handles);
     }
 
     // set up dependencies between pre/post scripts
     // this is done after the cycle check because we don't want these to be removed if there is a cycle
     for i in 0..state.handles.len() - 1 {
-        if state.handles[i].config.package_name == state.handles[i + 1].config.package_name {
+        if is_chained(state.handles[i].config, state.handles[i + 1].config) {
             let next_ptr: *mut ProcessHandle = &raw mut state.handles[i + 1];
             state.handles[i].dependents.push(next_ptr);
             state.handles[i + 1].remaining_dependencies += 1;
@@ -1169,4 +1166,84 @@ fn has_cycle(current: &mut ProcessHandle) -> bool {
     }
     current.visit_state = VisitState::Visited;
     false
+}
+
+/// Whether `next` waits for `previous` as the next script of its `pre`/main/`post` chain. The
+/// scripts of one package follow each other, and packages are told apart by name.
+fn is_chained(previous: &ScriptConfig, next: &ScriptConfig) -> bool {
+    previous.package_name == next.package_name
+}
+
+/// Replaces the waits between the scripts when the dependencies of their packages have a cycle.
+/// Packages that depend on each other can't wait for each other, so they become one group. No
+/// script waits for a script of its own group, and every script waits for all scripts of each
+/// other group that its group depends on.
+#[inline(never)]
+fn wait_around_cycles(handles: &mut [ProcessHandle]) {
+    let first = handles.as_ptr();
+    // For each handle: the handles of the packages that its package depends on, and whether the
+    // package lists them in `devDependencies` or `optionalDependencies`.
+    let mut dependencies: Vec<Vec<(usize, bool)>> = vec![Vec::new(); handles.len()];
+    for (dependency, handle) in handles.iter().enumerate() {
+        let name = &handle.config.package_name;
+        for &dependent in &handle.dependents {
+            // SAFETY: `dependents` only holds pointers to elements of `handles`.
+            let dependent = unsafe { dependent.cast_const().offset_from_unsigned(first) };
+            let listed = &handles[dependent].config.deps;
+            let is_dev_or_optional = listed
+                .iter()
+                .find(|(dependency_name, _)| dependency_name == name)
+                .is_some_and(|(_, behavior)| !behavior.is_prod());
+            dependencies[dependent].push((dependency, is_dev_or_optional));
+        }
+    }
+    // The link to the previous script of a chain counts too. Two packages can have the same name,
+    // and then a cycle can go through the chain that joins them.
+    let find_groups = |dependencies: &[Vec<(usize, bool)>]| {
+        let waits_for = |list: &Vec<(usize, bool)>| -> Vec<u32> {
+            list.iter()
+                .map(|&(dependency, _)| dependency as u32)
+                .collect()
+        };
+        let mut edges: Vec<Vec<u32>> = dependencies.iter().map(waits_for).collect();
+        for i in 1..handles.len() {
+            if is_chained(handles[i - 1].config, handles[i].config) {
+                edges[i].push(i as u32 - 1);
+            }
+        }
+        strongly_connected_components(&edges)
+    };
+    // Inside a cycle, `devDependencies` and `optionalDependencies` give way to `dependencies`: if
+    // the tests of `core` use a plugin that depends on `core`, then `core` still goes first.
+    let (group_of, _) = find_groups(&dependencies);
+    for (i, list) in dependencies.iter_mut().enumerate() {
+        list.retain(|&(dependency, is_dev_or_optional)| {
+            !is_dev_or_optional || group_of[dependency] != group_of[i]
+        });
+    }
+    let (group_of, groups) = find_groups(&dependencies);
+
+    for handle in handles.iter_mut() {
+        handle.dependents.clear();
+        handle.remaining_dependencies = 0;
+    }
+    // For each group, the last group that was made to wait for it.
+    let mut last_waiting = vec![usize::MAX; groups.len()];
+    for (waiting, members) in groups.iter().enumerate() {
+        for &(dependency, _) in members.iter().flat_map(|&member| &dependencies[member]) {
+            let awaited = group_of[dependency] as usize;
+            if awaited == waiting
+                || std::mem::replace(&mut last_waiting[awaited], waiting) == waiting
+            {
+                continue;
+            }
+            for &member in members {
+                let dependent: *mut ProcessHandle = &raw mut handles[member];
+                for &dependency in &groups[awaited] {
+                    handles[dependency].dependents.push(dependent);
+                }
+                handles[member].remaining_dependencies += groups[awaited].len();
+            }
+        }
+    }
 }

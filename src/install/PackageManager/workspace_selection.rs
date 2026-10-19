@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use bstr::BStr;
-use bun_collections::{DynamicBitSet, HashMap, index_sort};
+use bun_collections::{DynamicBitSet, HashMap, index_sort, strongly_connected_components};
 use bun_core::{Global, Output, UnwrapOrOom as _, strings};
 use bun_glob::Prepared;
 use bun_paths::path_buffer_pool;
@@ -391,54 +391,42 @@ impl WorkspaceGraph {
         graph
     }
 
-    /// Candidate indices, each after those it depends on. A cycle is broken at one of its members.
+    /// Candidate indices, each after those it depends on. The candidates of a dependency cycle are
+    /// next to each other, after everything else they depend on.
     pub(crate) fn dependency_order(&self) -> Vec<u32> {
         let n = self.dependencies.len();
         let mut remaining: Vec<usize> = self.dependencies.iter().map(Vec::len).collect();
         let mut order: Vec<u32> = Vec::with_capacity(n);
-        let mut queued = bitset(n);
         let mut queue: VecDeque<u32> = VecDeque::new();
         for i in 0..n {
             if remaining[i] == 0 {
-                queued.set(i);
                 queue.push_back(i as u32);
             }
         }
 
-        loop {
-            while let Some(u) = queue.pop_front() {
-                order.push(u);
-                for &v in &self.dependents[u as usize] {
-                    if queued.is_set(v as usize) {
-                        continue;
-                    }
-                    remaining[v as usize] -= 1;
-                    if remaining[v as usize] == 0 {
-                        queued.set(v as usize);
-                        queue.push_back(v);
-                    }
+        while let Some(u) = queue.pop_front() {
+            order.push(u);
+            for &v in &self.dependents[u as usize] {
+                remaining[v as usize] -= 1;
+                if remaining[v as usize] == 0 {
+                    queue.push_back(v);
                 }
             }
-            if order.len() == n {
-                return order;
-            }
-            // The sort is stuck on a cycle. Follow unmet dependencies until one repeats, which
-            // means that candidate is on the cycle.
-            let mut on_walk = bitset(n);
-            let mut cur = (0..n)
-                .find(|&i| !queued.is_set(i))
-                .expect("order.len() < n");
-            while !on_walk.is_set(cur) {
-                on_walk.set(cur);
-                cur = self.dependencies[cur]
-                    .iter()
-                    .map(|&d| d as usize)
-                    .find(|&d| !queued.is_set(d))
-                    .expect("remaining[cur] > 0");
-            }
-            queued.set(cur);
-            queue.push_back(cur as u32);
         }
+        if order.len() == n {
+            return order;
+        }
+        // Every candidate that's left is on a cycle or depends on one. A cycle's number is higher
+        // than the number of everything it depends on.
+        let (component_of, _) = strongly_connected_components(&self.dependencies);
+        let mut rest: Vec<u32> = (0..n as u32)
+            .filter(|&i| remaining[i as usize] != 0)
+            .collect();
+        index_sort::sort_indices(&mut rest, &mut |a, b| {
+            component_of[a as usize].cmp(&component_of[b as usize])
+        });
+        order.extend(rest);
+        order
     }
 
     pub fn from_dependency_names<D, I>(names: &[&[u8]], mut dependency_names: D) -> WorkspaceGraph

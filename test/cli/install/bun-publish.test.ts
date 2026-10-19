@@ -3761,6 +3761,38 @@ describe.concurrent("--recursive and --filter", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("a dependency cycle comes after another cycle that it depends on", async () => {
+    using registry = workspaceRegistry();
+    // p <-> q and x <-> y. Only `p` lists `x`.
+    using dir = workspace(registry.mock, {
+      p: { name: "rec-p", version: "1.0.0", dependencies: { "rec-q": "workspace:*", "rec-x": "workspace:*" } },
+      q: { name: "rec-q", version: "1.0.0", dependencies: { "rec-p": "workspace:*" } },
+      x: { name: "rec-x", version: "1.0.0", dependencies: { "rec-y": "workspace:*" } },
+      y: { name: "rec-y", version: "1.0.0", dependencies: { "rec-x": "workspace:*" } },
+    });
+
+    const { err, exitCode } = await publish(
+      env,
+      String(dir),
+      "-F",
+      "rec-p",
+      "-F",
+      "rec-q",
+      "-F",
+      "rec-x",
+      "-F",
+      "rec-y",
+    );
+    expect(err).toBe("");
+    expect(registry.asked.filter(request => request.startsWith("PUT "))).toEqual([
+      "PUT rec-x",
+      "PUT rec-y",
+      "PUT rec-p",
+      "PUT rec-q",
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
   test("a script that fails while packing publishes nothing", async () => {
     using registry = workspaceRegistry();
     // `c` is packed last
