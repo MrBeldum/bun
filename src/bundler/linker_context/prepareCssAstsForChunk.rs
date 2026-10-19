@@ -407,9 +407,7 @@ fn wrap_rules_with_conditions(
                     continue;
                 } else {
                     // Generate "@layer foo;" instead of "@layer foo {}"
-                    // `ast.rules.v` can be the shallow-copied header that aliases
-                    // the source stylesheet's buffer (see the `ptr::read` above).
-                    // A drop would free that buffer, so leak the header.
+                    // `ast.rules.v` can alias the source sheet's buffer, so leak the header.
                     let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut ast.rules.v));
                     do_block_rule = false;
                 }

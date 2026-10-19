@@ -161,8 +161,7 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
             for import_rule in repr.imports.iter() {
                 let record = &self.all_import_records[source_index.get() as usize]
                     [import_rule.import_record_idx as usize];
-                // `HtmlManifest`: `bundle_v2` gives that kind to an import of an
-                // `.html` file from a server-side target.
+                // `bundle_v2` sets `HtmlManifest` on an `.html` import from a server-side target.
                 debug_assert!(matches!(
                     record.kind,
                     ImportKind::At | ImportKind::AtConditional | ImportKind::HtmlManifest
@@ -170,13 +169,9 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
 
                 // Follow internal dependencies
                 if record.source_index.is_valid() {
-                    // If this import has conditions, fork our state so that the entire
-                    // imported stylesheet subtree is wrapped in all of the conditions
+                    // Conditions wrap the whole imported subtree, so fork our state
                     if import_rule.has_conditions() {
-                        // Fork our state. `visit` stores a bitwise copy of
-                        // `nested_conditions` into `self.order`; the slab is
-                        // arena-owned, so wrap the local header in
-                        // `ManuallyDrop` to avoid a double-free.
+                        // `visit` keeps a bitwise copy of this arena-owned list, so do not drop it
                         let mut nested_conditions = core::mem::ManuallyDrop::new(
                             deep_clone_conditions(wrapping_conditions, self.arena),
                         );
@@ -195,9 +190,7 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
                             &mut nested_conditions,
                             wrapping_import_records,
                         );
-                        // `nested_import_records` is *not* passed to `visit` (the
-                        // outer `wrapping_import_records` is), so it is uniquely
-                        // owned here — drop it normally to free the buffer.
+                        // `visit` got the outer records, so this clone is uniquely owned
                         drop(nested_import_records);
                         continue;
                     }
@@ -211,11 +204,7 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
 
                 // Record external depednencies
                 if !record.flags.contains(ImportRecordFlags::IS_INTERNAL) {
-                    // If this import has conditions, append it to the list of overall
-                    // conditions for this external import. Note that an external import
-                    // may actually have multiple sets of conditions that can't be
-                    // merged. When this happens we need to generate a nested imported
-                    // CSS file using a data URL.
+                    // Condition sets that cannot merge become a nested data URL import
                     if import_rule.has_conditions() {
                         let mut all_conditions =
                             deep_clone_conditions(wrapping_conditions, self.arena);

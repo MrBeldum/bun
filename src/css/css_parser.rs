@@ -657,8 +657,7 @@ pub trait CustomAtRuleParser {
         is_nested: bool,
     ) -> CssResult<Self::AtRule>;
 
-    /// Returns true when the rule got an import record. The rule then goes
-    /// to [`StyleSheet::imports`] and not to the rule list.
+    /// Returns true when the rule got an import record and belongs in [`StyleSheet::imports`].
     fn on_import_rule(this: &mut Self, import_rule: &mut ImportRule, start: u32, end: u32) -> bool;
     fn on_layer_rule(this: &mut Self, layers: &SmallList<LayerName, 1>);
     fn enclosing_layer_length(this: &mut Self) -> u32;
@@ -2307,17 +2306,7 @@ pub(crate) fn fill_property_bit_set(
 pub struct StyleSheet<AtRule> {
     /// A list of top-level rules within the style sheet.
     pub rules: CssRuleList<AtRule>,
-    /// The `@import` rules of a `parse_bundler` sheet, in source order. Such a
-    /// sheet has no `CssRule::Import` in `rules` and never prints one: the
-    /// bundler inlines a stylesheet, hoists an external import, and drops an
-    /// import of any other file. `minify` does not visit this list, and the
-    /// position of an `@import` among the `@layer` statements in `rules` is
-    /// not kept. Empty for `StyleSheet::parse`, which keeps each `@import` in
-    /// `rules`.
-    ///
-    /// An `@import` after an unknown at-rule statement (`@tailwind base;`) is
-    /// valid (css-cascade-5) and is in this list. esbuild and lightningcss
-    /// do not inline that import. They leave the rule in the output.
+    /// The `@import` rules of a `parse_bundler` sheet, which has no `CssRule::Import` in `rules`.
     pub imports: Vec<ImportRule>,
     pub sources: Vec<Box<[u8]>>,
     pub source_map_urls: Vec<Option<Box<[u8]>>>,
