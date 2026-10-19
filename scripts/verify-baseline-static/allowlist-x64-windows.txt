@@ -989,6 +989,23 @@ strspn
 
 
 # ----------------------------------------------------------------------------
+# MSVC CRT libm error handler. Data-in-.text false positive, NOT a gate.
+#
+# _powf_special comes from the static UCRT, so its code is the same in every
+# link, and the scan passes on most of them. It is scalar C: a `switch (code)`
+# over the special cases of powf, which MSVC lowers to a jump table of 4-byte
+# image-relative RVAs in .text after the function, as for the strspn family
+# above. Only those RVAs change with link layout. With the function at RVA
+# 0x0521c4xx the scan reported one VPCMPEQD ymm (AVX2) at offset 1 of a table
+# slot, where such an RVA has the bytes `C4 21 05`: a 3-byte VEX prefix, with
+# the first byte of the next slot as the opcode. Blanket-pass, for the reason
+# given above.
+# (1 symbol)
+# ----------------------------------------------------------------------------
+_powf_special
+
+
+# ----------------------------------------------------------------------------
 # JSC LLInt. Data-in-.text false positive, NOT a gate.
 #
 # ENABLE(LLINT_EMBEDDED_OPCODE_ID) is on for x86_64 (WTF/wtf/PlatformEnable.h),
