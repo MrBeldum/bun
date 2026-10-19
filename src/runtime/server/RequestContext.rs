@@ -388,8 +388,7 @@ fn release_body_stream(response: &mut Response, global_this: &JSGlobalObject) {
     }
 }
 
-/// A promise that settles as `value`'s own `then()` reports. A microtask makes that one call.
-/// `None`: the VM is stopping. Non-generic and out of line, like [`release_body_stream`].
+/// A promise that settles as `value`'s own `then()` reports. `None`: the VM is stopping.
 #[cold]
 #[inline(never)]
 fn promise_following(global_this: &JSGlobalObject, value: JSValue) -> Option<JSValue> {
@@ -862,8 +861,7 @@ where
         self.render_missing();
     }
 
-    // `inline(always)`: `on_followed_response` is a second, cold caller, and the reaction
-    // (`on_resolve`) must keep its copy inline.
+    // `inline(always)`: the second caller is cold, and `on_resolve` must keep its copy inline.
     #[inline(always)]
     fn handle_resolve(&self, global_this: &JSGlobalObject, value: JSValue) {
         if self.is_aborted_or_ended() || self.did_upgrade_web_socket() {
@@ -2876,8 +2874,7 @@ where
             // If we immediately have the value available, we can skip the extra event loop tick
             match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
                 jsc::PromiseResult::Pending => {
-                    // A lazy promise starts its work in its own `then()`, which a wait on the
-                    // cell never calls. A plain promise has this ID and skips the test.
+                    // A plain promise has this ID. Another one can start its work in its own `then()`.
                     if response_value.structure_id() != this.promise_structure_id()
                         && ctx.follow_own_then(this, response_value, promise)
                     {
@@ -2950,9 +2947,7 @@ where
         ctx.on_other_value(this, response_value);
     }
 
-    /// A handler returned `value`, which is not a Response, a promise or an Error. An object can be
-    /// a thenable: the promise that follows it calls its `then()`, or is fulfilled with the object
-    /// itself when it has none, which ends in the diagnostic like any other value.
+    /// A handler returned `value`: not a Response, a promise or an Error. An object can be a thenable.
     #[cold]
     #[inline(never)]
     fn on_other_value(&self, this: &ThisServer, value: JSValue) {
@@ -2965,10 +2960,7 @@ where
         }
     }
 
-    /// Answers with what the `then()` of the promise a handler returned reports, if a class of that
-    /// promise has its own `then`: the state of such a cell is not its answer (a lazy promise stays
-    /// pending until `then()` starts its work, an SDK's `APIPromise` holds a placeholder).
-    /// `false`: no class of it has, and the caller reads the cell.
+    /// Answers with what the promise's own `then()` reports, if a class of it has one. `false`: read the cell.
     #[cold]
     #[inline(never)]
     fn follow_own_then(
@@ -2986,8 +2978,7 @@ where
         true
     }
 
-    /// [`Self::on_response`] for `follower`, the promise that follows what the handler returned
-    /// through that value's own `then()`. The call of `then()` is a microtask: this is its checkpoint.
+    /// [`Self::on_response`] for the promise that follows a handler result. Its `then()` runs in this drain.
     #[cold]
     #[inline(never)]
     fn on_followed_response(&self, this: &ThisServer, follower: JSValue) {
@@ -3874,8 +3865,7 @@ where
                             return;
                         }
                     } else if result.is_object() {
-                        // It can be a thenable. The promise that follows an object without a
-                        // `then()` is fulfilled with it, which ends in the default page below.
+                        // An object can be a thenable. One without a `then()` ends in the default page.
                         if let Some(follower) = promise_following(server.global_this(), result) {
                             self.on_followed_error_result(server, follower, value, status);
                         }
@@ -3967,8 +3957,7 @@ where
         true
     }
 
-    /// [`Self::on_followed_response`] for what `error()` returned. A `follower` that settles here
-    /// without a Response ends in the default page for `value`, the error `error()` was called with.
+    /// [`Self::on_followed_response`] for what `error()` returned. No Response: the default page for `value`.
     #[cold]
     #[inline(never)]
     fn on_followed_error_result(

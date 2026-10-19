@@ -243,7 +243,6 @@ pub(crate) struct NewServer<const SSL: bool, const DEBUG: bool> {
     pub(crate) vm: bun_ptr::BackRef<jsc::VirtualMachine>,
     pub global_this: *const jsc::JSGlobalObject,
     /// `JSValue::structure_id` of a plain promise of `global_this`, read once in [`Self::init`].
-    /// A promise a handler returns with another ID can have a class with its own `then`.
     pub(crate) promise_structure_id: u32,
     /// Packed tagged-pointer wire-format `AnyServer` for this
     /// server (`u49` heap addr | `u15` variant tag), computed once in

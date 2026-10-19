@@ -3,8 +3,7 @@
 #include <JavaScriptCore/JSPromise.h>
 #include <JavaScriptCore/JSPromisePrototype.h>
 
-// A class of the promise has its own `then`, so the state of the cell is not what its `then()` gives.
-// A replaced `Promise.prototype.then` does not count: `await` does not call it either. Runs no script.
+// A class of the promise has its own `then`. A replaced `Promise.prototype.then` does not count. Runs no script.
 extern "C" [[ZIG_EXPORT(nothrow)]] bool JSC__JSPromise__overridesThen(JSC::JSPromise* promise)
 {
     auto& vm = promise->vm();
