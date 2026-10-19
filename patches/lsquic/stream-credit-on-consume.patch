@@ -13,9 +13,9 @@
 + * connection's window is credited by the read, as before.
 + *
 + * lsquic_stream_credit() reports @param n bytes of that payload as consumed.
-+ * It returns 1 if the peer had used up its limit: a MAX_STREAM_DATA frame is
-+ * then queued and goes out when the connection is next ticked.  Otherwise it
-+ * returns 0, and the next frame that arrives on the stream moves the limit.
++ * The limit then moves by the rule of a read: once less than half of the
++ * window is left.  It returns 1 if it moved: a MAX_STREAM_DATA frame is
++ * queued and goes out when the connection is next ticked.
 + */
 +void
 +lsquic_stream_credit_on_consume (lsquic_stream_t *s);
@@ -77,7 +77,7 @@
  
 --- a/src/liblsquic/lsquic_stream.c
 +++ b/src/liblsquic/lsquic_stream.c
-@@ -1524,6 +1524,50 @@
+@@ -1524,6 +1524,42 @@
  }
  
  
@@ -93,42 +93,34 @@
 +lsquic_stream_credit (struct lsquic_stream *stream, uint64_t n)
 +{
 +    struct lsquic_sfcw *const fc = &stream->fc;
-+    uint64_t limit;
 +
 +    if (n > fc->sf_unconsumed)
 +        n = fc->sf_unconsumed;
 +    fc->sf_unconsumed -= n;
 +    /* No larger limit is of use to the peer.  After a reset sf_read_off is
 +     * the final size, which lsquic_sfcw_consume_rem() gave to the
-+     * connection. */
++     * connection: stream_consumed_bytes() would take it back. */
 +    if (n == 0 || (stream->stream_flags
 +                & (STREAM_FIN_RECVD|STREAM_RST_RECVD|STREAM_U_READ_DONE)))
 +        return 0;
-+    limit = fc->sf_read_off - fc->sf_unconsumed + fc->sf_max_recv_win;
 +    if (stream->sm_qflags & SMQF_SEND_WUF)
 +    {
 +        /* Not on the wire yet: the frame takes the limit it finds. */
-+        fc->sf_recv_off = limit;
++        fc->sf_recv_off = fc->sf_read_off - fc->sf_unconsumed
++                                                    + fc->sf_max_recv_win;
 +        return 0;
 +    }
-+    /* The peer can still send.  Its next frame moves the limit in the tick
-+     * that reads it (lsquic_stream_update_sfcw), as without this function. */
-+    if (fc->sf_max_recv_off < fc->sf_recv_off)
-+        return 0;
-+    fc->sf_recv_off = limit;
-+    if (!(stream->sm_qflags & SMQF_SENDING_FLAGS))
-+        TAILQ_INSERT_TAIL(&stream->conn_pub->sending_streams, stream,
-+                                                        next_send_stream);
-+    stream->sm_qflags |= SMQF_SEND_WUF;
-+    maybe_conn_to_tickable_if_writeable(stream, 1);
-+    return 1;
++    /* As after a read: the limit moves once less than half of the window is
++     * left. */
++    stream_consumed_bytes(stream);
++    return !!(stream->sm_qflags & SMQF_SEND_WUF);
 +}
 +
 +
  static ssize_t
  read_data_frames (struct lsquic_stream *stream, int do_filtering,
          size_t (*readf)(void *, const unsigned char *, size_t, int), void *ctx)
-@@ -1567,6 +1611,11 @@
+@@ -1567,6 +1603,11 @@
                      stream->sm_sfi->sfi_decr_left(stream, nread);
                  data_frame->df_read_off += nread;
                  stream->read_offset += nread;
@@ -140,7 +132,7 @@
                  total_nread += nread;
                  short_read = nread < toread;
              }
-@@ -4504,9 +4553,14 @@
+@@ -4504,9 +4545,14 @@
       * emits both frames) must still reach the wire. */
      const enum stream_q_flags had_ss =
                              stream->sm_qflags & SMQF_SEND_STOP_SENDING;

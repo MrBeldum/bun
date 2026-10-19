@@ -607,40 +607,6 @@ describe("receive backpressure", () => {
     expect(queued(pair.receiver)).toBeLessThanOrEqual(WINDOW);
   });
 
-  // Inside a QUIC callback the endpoint sends what is queued when the callback
-  // ends. A read outside of one starts the send itself, and only for a sender
-  // that waits for the limit.
-  test.each([
-    { sender: "waits for the limit", length: 3 * WINDOW, end: true, packet: true },
-    { sender: "ended its body at the limit", length: WINDOW, end: true, packet: false },
-    { sender: "has room left", length: WINDOW - 1, end: false, packet: false },
-    { sender: "was told to stop", length: 3 * WINDOW, end: true, stop: true, packet: false },
-  ])("a read outside a QUIC callback sends a packet at once ($packet) when the sender $sender", async row => {
-    const shape: Shape = {
-      ...serverBidi,
-      // No answer: the stream stays open after the body ends.
-      onServerStream: (stream, ends) => ends.receiver.resolve(stream),
-      async onClient(client, ends) {
-        const stream = keep(await client.createBidirectionalStream({}));
-        stream.writer.writeSync(ends.payload);
-        if (row.end) stream.writer.endSync();
-        ends.sender.resolve(stream);
-      },
-    };
-    await using pair = await open(shape, pattern(row.length));
-    const held = Math.min(row.length, WINDOW);
-    expect(await pair.sent(held)).toBe(held);
-    // Leave the callback that ended the last round trip.
-    await new Promise<void>(resolve => setImmediate(resolve));
-    if (row.stop) pair.receiver.stopSending();
-    const packets = () => pair.serverSession.endpoint.stats.packetsSent;
-    const before = packets();
-    // A reader pulls its first batch before `next()` returns.
-    const first = pair.receiver[Symbol.asyncIterator]().next();
-    expect(packets() > before).toBe(row.packet);
-    await first;
-  });
-
   // Fits one packet, so each is one chunk of the receiver's queue, and a
   // batch of the reader is 16 of them.
   const piece = pattern(1100);
@@ -680,14 +646,41 @@ describe("receive backpressure", () => {
     return { taken: taken.promise, rest: () => (resume.resolve(), done) };
   }
 
+  // The limit moves when the reader has taken more than half of the window.
+  // Inside a QUIC callback the endpoint sends the new limit when the callback
+  // ends. A read outside of one has to start the send itself.
+  test.each([
+    { reader: "takes more than half of the window", window: 20, packet: true },
+    { reader: "takes less than half of the window", window: 40, packet: false },
+    // One piece of room: a stream at its limit sends its FIN with the next limit.
+    { reader: "starts after the end of the body", window: 21, end: true, packet: false },
+    { reader: "starts after stopSending()", window: 20, stop: true, packet: false },
+  ])("a read outside a QUIC callback sends a packet at once ($packet) when the reader $reader", async row => {
+    // 20 pieces wait in a window of `row.window` pieces.
+    await using pair = await pieces(20, row.window * piece.length);
+    if (row.end) {
+      pair.sender.writer.endSync();
+      await pair.roundTrip();
+    }
+    // Leave the callback that ended the last round trip.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (row.stop) pair.receiver.stopSending();
+    const packets = () => pair.serverSession.endpoint.stats.packetsSent;
+    const before = packets();
+    // A reader pulls its first batch, 16 pieces, before `next()` returns.
+    const first = pair.receiver[Symbol.asyncIterator]().next();
+    expect(packets() > before).toBe(row.packet);
+    await first;
+  });
+
   // The limit is one window past what the reader took, not one window past
   // what bun read from lsquic.
   test("a reader that stops part-way leaves the sender one window past what it took", async () => {
-    const window = WINDOW / 2;
+    // 15 pieces are half of this window: the last piece of the batch is the
+    // one that moves the limit.
+    const window = 30 * piece.length;
     const rest = pattern(3 * window);
     const payload = Buffer.concat([...Array(20).fill(piece), rest]);
-    // The sender has room left, so its next frame moves the limit. lsquic
-    // moves one only after more than half of the window is used: 16 pieces.
     await using pair = await pieces(20, window);
     expect(queued(pair.receiver)).toBe(20 * piece.length);
 
@@ -702,17 +695,16 @@ describe("receive backpressure", () => {
     expect(queued(pair.receiver)).toBe(window);
   });
 
-  // A batch that is read inside a QUIC callback moves the limit in one frame,
-  // which goes out when the callback ends. lsquic's reset of the write side
-  // drops what a stream has queued to send. Without that frame the sender
-  // waits for ever, and with the limit of the first chunk only it stops
-  // early: 15 pieces are not more than half of this window.
+  // Inside a QUIC callback the new limit waits for the end of the callback.
+  // The reader takes 16 pieces and the 11th moves the limit: the frame has to
+  // carry the limit of the 16th. lsquic's reset of the write side drops what
+  // a stream has queued to send, and the sender would wait for that frame for
+  // ever.
   test("a batch read in a QUIC callback moves the limit by the whole batch, also past resetStream()", async () => {
-    const window = 30 * piece.length;
+    const window = 20 * piece.length;
     const rest = pattern(3 * window);
-    const payload = Buffer.concat([...Array(30).fill(piece), rest]);
-    // The sender has used its limit.
-    await using pair = await pieces(30, window);
+    const payload = Buffer.concat([...Array(20).fill(piece), rest]);
+    await using pair = await pieces(20, window);
 
     const started = Promise.withResolvers<ReturnType<typeof readOneBatch>>();
     const echo = pair.serverSession.onstream;
