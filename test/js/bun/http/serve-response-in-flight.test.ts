@@ -525,18 +525,19 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
     expect(result.body).toBeLessThan(large.length);
   });
 
+  const cancelled = `after the abort: ${aborted}`;
+  // A loop that waits on the sink hears the cancel. One that has seen the abort by then ends its stream first.
+  const stopped = {
+    closed: "reset",
+    heard: ["abort", "producer ended"],
+    cancel: expect.stringMatching(/^(none|after the abort: AbortError: The connection was closed\.)$/),
+    pendingRequests: 0,
+    next: "HTTP/1.1 200 OK",
+  };
+
   // A producer that watches `req.signal` stops. `write()` and `flush()` return 0
   // once the response is gone: without the abort, these loops never yield.
   test("a direct stream whose producer watches req.signal stops", async () => {
-    const cancelled = `after the abort: ${aborted}`;
-    // A loop that waits on the sink hears the cancel. One that has seen the abort by then ends its stream first.
-    const stopped = {
-      closed: "reset",
-      heard: ["abort", "producer ended"],
-      cancel: expect.stringMatching(/^(none|after the abort: AbortError: The connection was closed\.)$/),
-      pendingRequests: 0,
-      next: "HTTP/1.1 200 OK",
-    };
     const expected = {
       // while (!req.signal.aborted) await controller.write(chunk)
       "producer:write": stopped,
@@ -546,12 +547,26 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
       "producer:listener": stopped,
       // A timer writes until req.signal.aborted: it is not in the stream when the cancel comes.
       "producer:timer": { ...stopped, cancel: cancelled },
-      // write() and flush(true) after the abort wait for the cancel, and then answer 0.
+    };
+    expect(await scenarios(...Object.keys(expected))).toEqual({
+      stdout: expected,
+      stderr: announced(...Object.keys(expected)),
+      exitCode: 0,
+    });
+  });
+
+  // `write()` returns 0 once the destination has gone away: that is the
+  // documented end of a producer. The first such write also cancels it.
+  test("a direct stream whose producer watches for write() to return 0 stops", async () => {
+    const expected = {
+      // write() and flush() after the abort.
       "producer:late": {
         ...stopped,
-        heard: ["abort", "write:waits", "flush:0", "write:0", "flush(true):0", "producer ended"],
+        heard: ["abort", "write:0", "flush:0", "flush(true):0", "producer ended"],
         cancel: cancelled,
       },
+      // while (controller.write(line) !== 0) await controller.flush(), after a failed read of the request body.
+      "producer:zero": { ...stopped, cancel: cancelled },
     };
     expect(await scenarios(...Object.keys(expected))).toEqual({
       stdout: expected,
@@ -574,7 +589,7 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
       "generator": { closed: "reset", heard: ["the client left"], listeners: 0, pendingRequests: 0 },
       "report:guarded": reported,
       "report:unguarded": reported,
-      // Its stream takes one more report and is cancelled. It used to be pulled for ever.
+      // The pump calls this pull() again as long as the sink takes a write: the write that reports cancels it.
       "report:from pull()": { ...reported, heard: [`cancel:${aborted}`] },
     };
     expect(await scenarios(...Object.keys(expected))).toEqual({
@@ -646,10 +661,7 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
           bodyOfX.resolve(req.body!);
           await answer.promise;
           let controller: any;
-          // A write from the listener waits for the cancel: it does not reach the response.
-          req.signal.addEventListener("abort", () => {
-            heard.push(`abort, write:${controller.write("late") instanceof Promise ? "waits" : "does not wait"}`);
-          });
+          req.signal.addEventListener("abort", () => void heard.push(`abort, write:${controller.write("late")}`));
           return new Response(
             new ReadableStream({
               type: "direct",
@@ -698,7 +710,8 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
     expect(result).toEqual({
       x: { rejected: "ECONNRESET" },
       y: { status: 500, body: "err" },
-      heard: [`error():${tooLarge}`, "write:7", "abort, write:waits", `cancel:${aborted}`],
+      // The write from the abort listener does not reach the response, and it cancels the producer.
+      heard: [`error():${tooLarge}`, "write:7", `cancel:${aborted}`, "abort, write:0"],
       pendingRequests: 0,
     });
   });

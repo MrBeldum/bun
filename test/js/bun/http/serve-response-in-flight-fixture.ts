@@ -30,12 +30,15 @@ export type Upload = {
   hold?: boolean;
 };
 
-// Settles when `server` has let every request go. With a deadline: a request
-// that it never lets go shows in the result, not as a timeout.
-export async function released(server: { pendingRequests: number }) {
+// Waits for `condition`, with a deadline: what never happens shows in the
+// result, not as a timeout.
+export async function eventually(condition: () => boolean) {
   const deadline = Date.now() + 2000;
-  while (server.pendingRequests > 0 && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+  while (!condition() && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
 }
+
+// Settles when `server` has let every request go.
+export const released = (server: { pendingRequests: number }) => eventually(() => server.pendingRequests === 0);
 
 const connect = (port: number, secure: boolean, onConnect: () => void): net.Socket =>
   secure
@@ -127,6 +130,8 @@ async function producer(run: (c: any, req: Request, heard: string[]) => Promise<
     },
   });
   const { closed } = await upload(server.port!, false, { marker: "chunk", released: () => released(server) });
+  // A producer that is not in its stream at the cancel (a timer) ends on a later turn.
+  await eventually(() => heard.some(what => what.startsWith("producer ")));
   return { closed, heard, cancel, pendingRequests: server.pendingRequests, next: await get(server.port!) };
 }
 
@@ -232,16 +237,24 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           }, 1);
         }),
     ),
-  // What the controller answers once the response is gone. A write waits
-  // until the producer is told, so a producer cannot run on against it.
+  // What the controller answers once the response is gone. The first write
+  // also cancels the producer.
   "producer:late": () =>
     producer(async (c, req, heard) => {
       c.write(chunk);
       await c.flush();
       await once(req.signal, "abort");
-      const write = c.write(chunk);
-      heard.push(`write:${write instanceof Promise ? "waits" : write}`, `flush:${c.flush()}`);
-      heard.push(`write:${await write}`, `flush(true):${await c.flush(true)}`);
+      heard.push(`write:${c.write(chunk)}`, `flush:${c.flush()}`, `flush(true):${await c.flush(true)}`);
+    }),
+  // The documented end of a producer: `write()` returns 0 once the destination
+  // has gone away. This one reports the failed upload until then, and it does
+  // not wait on a write.
+  "producer:zero": () =>
+    producer(async (c, req) => {
+      c.write(chunk);
+      await c.flush();
+      await req.text().catch(() => {});
+      while (c.write("upload failed, retry\n") !== 0) await c.flush();
     }),
 
   // The generator of docs/runtime/streams.mdx, with a first chunk.
