@@ -388,6 +388,16 @@ fn release_body_stream(response: &mut Response, global_this: &JSGlobalObject) {
     }
 }
 
+/// A promise that settles as `value`'s own `then()` reports. A microtask makes that one call.
+/// `None`: the VM is stopping. Non-generic and out of line, like [`release_body_stream`].
+#[cold]
+#[inline(never)]
+fn promise_following(global_this: &JSGlobalObject, value: JSValue) -> Option<JSValue> {
+    let follower = jsc::JSPromise::create(global_this);
+    follower.resolve(global_this, value).ok()?;
+    Some(follower.to_js())
+}
+
 // ─── sibling-subtree shims ───────────────────────────────────────────────────
 // These forward to methods that exist in webcore/ but are currently inside
 // impl blocks that fail to compile (codegen gc-slot stubs, opaque AbortSignal).
@@ -852,6 +862,9 @@ where
         self.render_missing();
     }
 
+    // `inline(always)`: `on_followed_response` is a second, cold caller, and the reaction
+    // (`on_resolve`) must keep its copy inline.
+    #[inline(always)]
     fn handle_resolve(&self, global_this: &JSGlobalObject, value: JSValue) {
         if self.is_aborted_or_ended() || self.did_upgrade_web_socket() {
             Self::discard_response_body(global_this, value);
@@ -2786,6 +2799,7 @@ where
     //
     // - If you return a Promise, we drain the microtask queue once
     // - If you return a streaming Response, we drain the microtask queue (possibly the 2nd time this task!)
+    // - If what you return has its own `then()`, we drain once more, for the microtask that calls it
     //
     // Like a task, the handler and these drains run with the event loop entered
     // (the dispatchers hold `enter_event_loop_scope_without_checkpoint`), so a
@@ -2881,13 +2895,17 @@ where
                     }
 
                     if fulfilled_value.is_empty_or_undefined_or_null() {
-                        ctx.render_missing_invalid_response(fulfilled_value);
+                        if !ctx.follow_own_then(this, response_value, promise) {
+                            ctx.render_missing_invalid_response(fulfilled_value);
+                        }
                         return;
                     }
                     // `fulfilled_value` is rooted via ensure_still_alive() /
                     // protect() below for as long as `response` is used.
                     let Some(response) = as_response(fulfilled_value) else {
-                        ctx.render_missing_invalid_response(fulfilled_value);
+                        if !ctx.follow_own_then(this, response_value, promise) {
+                            ctx.render_missing_invalid_response(fulfilled_value);
+                        }
                         return;
                     };
 
@@ -2923,6 +2941,66 @@ where
         // number, ...). The async twin (`handle_resolve`) reports this via
         // `render_missing_invalid_response`; do the same on the sync path.
         ctx.render_missing_invalid_response(response_value);
+    }
+
+    /// Answers with what the `then()` of the promise a handler returned reports, if a class of that
+    /// promise has its own `then`: the state of such a cell is not its answer (an SDK's
+    /// `APIPromise` holds a placeholder). `false`: no class of it has, and the caller reads the cell.
+    #[cold]
+    #[inline(never)]
+    fn follow_own_then(
+        &self,
+        this: &ThisServer,
+        promise_value: JSValue,
+        promise: jsc::AnyPromise,
+    ) -> bool {
+        if !promise.overrides_then() {
+            return false;
+        }
+        if let Some(follower) = promise_following(this.global_this(), promise_value) {
+            self.on_followed_response(this, follower);
+        }
+        true
+    }
+
+    /// [`Self::on_response`] for `follower`, the promise that follows what the handler returned
+    /// through that value's own `then()`. The call of `then()` is a microtask: this is its checkpoint.
+    #[cold]
+    #[inline(never)]
+    fn on_followed_response(&self, this: &ThisServer, follower: JSValue) {
+        let _keep = jsc::EnsureStillAlive(follower);
+        if self.drain_microtasks().is_err() {
+            return;
+        }
+        // `then` and `then()` are user code: the request can be gone, as after the handler.
+        if self.is_aborted_or_ended() {
+            self.discard_handler_result(this.global_this(), follower);
+            return;
+        }
+        if self.resp.get().is_some_and(|resp| resp.is_closed()) {
+            self.on_connection_closed_during_dispatch(this, follower);
+            return;
+        }
+        if self.did_upgrade_web_socket() {
+            self.discard_handler_result(this.global_this(), follower);
+            return;
+        }
+        let Some(promise) = follower.as_any_promise() else {
+            return;
+        };
+        match promise.unwrap(this.global_this().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
+            jsc::PromiseResult::Pending => {
+                let cell = self.create_promise_cell(this.global_this());
+                follower.then_with_value(
+                    this.global_this(),
+                    cell,
+                    Self::ON_RESOLVE,
+                    Self::ON_REJECT,
+                );
+            }
+            jsc::PromiseResult::Fulfilled(value) => self.handle_resolve(this.global_this(), value),
+            jsc::PromiseResult::Rejected(err) => self.handle_reject(err),
+        }
     }
 
     pub(crate) fn handle_resolve_stream(&self) {
@@ -3807,7 +3885,10 @@ where
                 // `fulfilled_value` is rooted via ensure_still_alive() below for
                 // as long as `response` is used.
                 let Some(response) = as_response(fulfilled_value) else {
-                    ctx.finish_running_error_handler(value, status);
+                    if !ctx.follow_error_result_own_then(server, promise_js, promise, value, status)
+                    {
+                        ctx.finish_running_error_handler(value, status);
+                    }
                     return;
                 };
 
@@ -3828,6 +3909,54 @@ where
                 ctx.finish_running_error_handler(err, status);
                 return;
             }
+        }
+    }
+
+    /// [`Self::follow_own_then`] for the promise `error()` returned.
+    #[cold]
+    #[inline(never)]
+    fn follow_error_result_own_then(
+        &self,
+        server: &ThisServer,
+        promise_value: JSValue,
+        promise: jsc::AnyPromise,
+        value: JSValue,
+        status: u16,
+    ) -> bool {
+        if !promise.overrides_then() {
+            return false;
+        }
+        if let Some(follower) = promise_following(server.global_this(), promise_value) {
+            self.on_followed_error_result(server, follower, value, status);
+        }
+        true
+    }
+
+    /// [`Self::on_followed_response`] for what `error()` returned. A `follower` that settles here
+    /// without a Response ends in the default page for `value`, the error `error()` was called with.
+    #[cold]
+    #[inline(never)]
+    fn on_followed_error_result(
+        &self,
+        server: &ThisServer,
+        follower: JSValue,
+        value: JSValue,
+        status: u16,
+    ) {
+        let _keep = jsc::EnsureStillAlive(follower);
+        if self.drain_microtasks().is_err() {
+            return;
+        }
+        if self.is_aborted_or_ended() || self.did_upgrade_web_socket() {
+            self.discard_handler_result(server.global_this(), follower);
+            return;
+        }
+        if self.resp.get().is_some_and(|resp| resp.is_closed()) {
+            self.on_connection_closed_during_dispatch(server, follower);
+            return;
+        }
+        if let Some(promise) = follower.as_any_promise() {
+            self.process_on_error_promise(follower, promise, value, status);
         }
     }
 

@@ -249,6 +249,11 @@ impl JSPromise {
         JSC__JSPromise__setHandled(self)
     }
 
+    /// A class of this promise has its own `then`, so the state of the cell is not what its `then()` gives.
+    pub fn overrides_then(&self) -> bool {
+        crate::cpp::JSC__JSPromise__overridesThen(self)
+    }
+
     /// Create a new resolved promise resolving to a given value.
     ///
     /// Note: If you want the result as a `JSValue`, use `resolved_promise_value` instead.

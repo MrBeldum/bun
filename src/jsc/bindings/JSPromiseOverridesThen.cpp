@@ -1,0 +1,21 @@
+#include "root.h"
+#include <JavaScriptCore/JSCInlines.h>
+#include <JavaScriptCore/JSPromise.h>
+#include <JavaScriptCore/JSPromisePrototype.h>
+
+// A class of the promise has its own `then`, so the state of the cell is not what its `then()` gives.
+// A replaced `Promise.prototype.then` does not count: `await` does not call it either. Runs no script.
+extern "C" [[ZIG_EXPORT(nothrow)]] bool JSC__JSPromise__overridesThen(JSC::JSPromise* promise)
+{
+    auto& vm = promise->vm();
+    JSC::JSObject* promisePrototype = promise->realm()->promisePrototype();
+    for (JSC::JSObject* object = promise; object != promisePrototype;) {
+        if (object->type() == JSC::ProxyObjectType || object->getDirectOffset(vm, vm.propertyNames->then) != JSC::invalidOffset)
+            return true;
+        JSC::JSValue prototype = object->getPrototypeDirect();
+        if (!prototype.isObject())
+            return false;
+        object = JSC::asObject(prototype);
+    }
+    return false;
+}

@@ -58,6 +58,12 @@ impl AnyPromise {
         any_promise_dispatch!(self, |p| p.set_handled())
     }
 
+    /// See [`JSPromise::overrides_then`].
+    #[inline]
+    pub fn overrides_then(self) -> bool {
+        JSPromise::opaque_ref(self.as_js_promise()).overrides_then()
+    }
+
     #[inline]
     pub fn resolve(self, global_this: &JSGlobalObject, value: JSValue) -> JsResult<()> {
         any_promise_dispatch!(self, |p| p.resolve(global_this, value))
