@@ -2307,9 +2307,11 @@ pub(crate) fn fill_property_bit_set(
 pub struct StyleSheet<AtRule> {
     /// A list of top-level rules within the style sheet.
     pub rules: CssRuleList<AtRule>,
-    /// The `@import` rules of a `parse_bundler` sheet, in source order. The
-    /// bundler inlines or hoists each one, so such a sheet has no
-    /// `CssRule::Import` in `rules` and does not print them. Empty for
+    /// The `@import` rules of a `parse_bundler` sheet, in source order. Such a
+    /// sheet has no `CssRule::Import` in `rules` and never prints one: the
+    /// bundler inlines a stylesheet, hoists an external import, and drops an
+    /// import of any other file. The position of an `@import` among the
+    /// `@layer` statements in `rules` is not kept. Empty for
     /// `StyleSheet::parse`, which keeps each `@import` in `rules`.
     ///
     /// An `@import` after an unknown at-rule statement (`@tailwind base;`) is

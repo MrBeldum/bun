@@ -161,10 +161,12 @@ pub(crate) fn find_imported_files_in_css_order<'a>(
             for import_rule in repr.imports.iter() {
                 let record = &self.all_import_records[source_index.get() as usize]
                     [import_rule.import_record_idx as usize];
-                debug_assert!(
-                    !matches!(record.kind, ImportKind::Url | ImportKind::Composes),
-                    "an @import rule holds the index of its own import record"
-                );
+                // `HtmlManifest`: `bundle_v2` gives that kind to an import of an
+                // `.html` file from a server-side target.
+                debug_assert!(matches!(
+                    record.kind,
+                    ImportKind::At | ImportKind::AtConditional | ImportKind::HtmlManifest
+                ));
 
                 // Follow internal dependencies
                 if record.source_index.is_valid() {

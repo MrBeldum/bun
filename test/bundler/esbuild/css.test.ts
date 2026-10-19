@@ -243,6 +243,19 @@ describe("bundler", () => {
       },
       out: `@import "https://example.com/x.css";@tailwind base;.k{color:red}`,
     },
+    // Create React App documents "@import-normalize;" as the first line of a stylesheet.
+    ExternalThenLocal: {
+      files: {
+        "/entry.css": /* css */ `
+          @import-normalize;
+          @import url("https://example.com/fonts.css");
+          @import "./local.css";
+          .k { color: red }
+        `,
+        "/local.css": `.l { color: blue }`,
+      },
+      out: `@import "https://example.com/fonts.css";.l{color:#00f}@import-normalize;.k{color:red}`,
+    },
     // The importer is wrapped in the conditions of its own import. The wrapper must not hold an "@import".
     ImporterWithConditions: {
       files: {
@@ -381,6 +394,78 @@ describe("bundler", () => {
       api.expectFile("/out/" + chunks[0]).toBe(importAfterUnknownAtRule.Simple.out + "\n");
     },
   });
+
+  // A CSS module holds "@import" records and "composes" records in one list.
+  // "@value" is an unknown at-rule here.
+  for (const splitting of [false, true]) {
+    itBundled(`css/CSSAtImportAfterUnknownAtRuleInCSSModule${splitting ? "Splitting" : ""}`, {
+      files: {
+        "/entry.js": /* js */ `
+          import styles from "./m.module.css";
+          console.log(styles.box);
+        `,
+        "/m.module.css": /* css */ `
+          @value primary: red;
+          @import "./shared.css";
+          .box { composes: other from "./o.module.css"; color: blue }
+        `,
+        "/o.module.css": /* css */ `
+          @value gap: 4px;
+          @import "./deep.css";
+          .other { background: green }
+        `,
+        "/shared.css": `.shared { color: red }`,
+        "/deep.css": `.deep { color: red }`,
+      },
+      outdir: "/out",
+      splitting,
+      onAfterBundle(api) {
+        api.expectFile("/out/entry.css").toBe(`/* shared.css */
+.shared {
+  color: red;
+}
+
+/* deep.css */
+.deep {
+  color: red;
+}
+
+/* o.module.css */
+@value gap: 4px;
+
+.other_WK10Lw {
+  background: green;
+}
+
+/* m.module.css */
+@value primary: red;
+
+.box_5WBUVQ {
+  color: #00f;
+}
+`);
+      },
+    });
+  }
+
+  // An "@import" of a file that is not a stylesheet is not inlined and not
+  // printed. esbuild fails this build: `Cannot import "notes.txt" into a CSS file`.
+  for (const [name, before] of [
+    ["", ""],
+    ["AfterUnknownAtRule", "@tailwind base;"],
+  ]) {
+    itBundled(`css/CSSAtImportOfTextFile${name}`, {
+      files: {
+        "/entry.css": `${before}\n@import "./notes.txt";\n.k { color: red }`,
+        "/notes.txt": `notes`,
+      },
+      outfile: "/out.css",
+      minifyWhitespace: true,
+      onAfterBundle(api) {
+        api.expectFile("/out.css").toBe(`${before}.k{color:red}\n`);
+      },
+    });
+  }
 
   // Without bundling nothing inlines the file, so the "@import" rule stays.
   test("css @import after an unknown at-rule prints with --no-bundle", async () => {

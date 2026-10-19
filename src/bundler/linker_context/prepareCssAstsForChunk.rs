@@ -336,10 +336,10 @@ fn prepare_css_asts_for_chunk_impl(c: &LinkerContext, chunk: &mut Chunk, bump: &
                             [source_index.get() as usize]
                             .as_deref()
                             .expect("css ast present");
-                        // SAFETY: bitwise shallow copy of the
-                        // stylesheet header. All interior allocations are arena-owned and never
-                        // freed via this view, so the duplicated `Vec`/`Vec` headers are
-                        // sound for the read-only use below.
+                        // SAFETY: bitwise shallow copy of the stylesheet header. The
+                        // copy aliases the global-heap `Vec`s of the source sheet. It
+                        // is never dropped, grown or written through: `CssChunk::drop`
+                        // forgets it, and the bundle drops the source sheet once.
                         css_chunk.asts[i] = unsafe { core::ptr::read(original_stylesheet) };
                         break 'ast &mut css_chunk.asts[i];
                     };
@@ -416,10 +416,9 @@ fn wrap_rules_with_conditions(
                     continue;
                 } else {
                     // Generate "@layer foo;" instead of "@layer foo {}"
-                    // `ast.rules.v` may be the shallow-copied / offset-resliced
-                    // header aliasing the source stylesheet's buffer (see the
-                    // `ptr::read` / `Vec::from_raw_parts` above) — dropping it
-                    // would free into another allocation; leak the header instead.
+                    // `ast.rules.v` can be the shallow-copied header that aliases
+                    // the source stylesheet's buffer (see the `ptr::read` above).
+                    // A drop would free that buffer, so leak the header.
                     let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut ast.rules.v));
                     do_block_rule = false;
                 }
