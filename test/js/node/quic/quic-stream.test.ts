@@ -550,11 +550,11 @@ describe("receive backpressure", () => {
 
   // How much of `payload` the stream still delivers, and whether it is the same bytes.
   // `betweenBatches` runs after each batch that the reader gets.
-  async function delivered(stream: any, payload: Buffer, betweenBatches?: () => unknown) {
+  async function delivered(stream: any, payload: Buffer, betweenBatches?: (batch: Uint8Array[]) => unknown) {
     const chunks: Uint8Array[] = [];
     for await (const batch of stream) {
       chunks.push(...batch);
-      await betweenBatches?.();
+      await betweenBatches?.(batch);
     }
     const got = Buffer.concat(chunks);
     return { length: got.length, same: got.equals(payload) };
@@ -608,41 +608,127 @@ describe("receive backpressure", () => {
   });
 
   // Inside a QUIC callback the endpoint sends what is queued when the callback
-  // ends. A reader outside of one has to start that itself, or the frame waits
-  // for the next timer of the connection.
-  test("a read outside a QUIC callback sends the new window at once", async () => {
-    const payload = pattern(3 * WINDOW);
-    await using pair = await open(serverBidi, payload);
-    expect(await pair.sent(WINDOW)).toBe(WINDOW);
-    // Any packet makes the endpoint send what is queued, and lsquic answers a
-    // packet with an acknowledgement up to 25 ms later (max_ack_delay). No
-    // event reports the last one, so wait them out: after this only the read
-    // can start a send.
-    await Bun.sleep(60);
-    const read = delivered(pair.receiver, payload);
-    // The frame is on the loopback socket when the first pull returns, so the
-    // sender has it within a few turns of the event loop.
-    for (let turns = 0; turns < 20 && Number(pair.sender.stats.bytesSent) === WINDOW; turns++) {
-      await new Promise<void>(resolve => setImmediate(resolve));
-    }
-    expect(Number(pair.sender.stats.bytesSent)).toBeGreaterThan(WINDOW);
-    expect(await read).toEqual({ length: payload.length, same: true });
+  // ends. A read outside of one starts the send itself, and only for a sender
+  // that waits for the limit.
+  test.each([
+    { sender: "waits for the limit", length: 3 * WINDOW, end: true, packet: true },
+    { sender: "ended its body at the limit", length: WINDOW, end: true, packet: false },
+    { sender: "has room left", length: WINDOW - 1, end: false, packet: false },
+  ])("a read outside a QUIC callback sends a packet at once ($packet) when the sender $sender", async row => {
+    const shape: Shape = {
+      ...serverBidi,
+      // No answer: the stream stays open after the body ends.
+      onServerStream: (stream, ends) => ends.receiver.resolve(stream),
+      async onClient(client, ends) {
+        const stream = keep(await client.createBidirectionalStream({}));
+        stream.writer.writeSync(ends.payload);
+        if (row.end) stream.writer.endSync();
+        ends.sender.resolve(stream);
+      },
+    };
+    await using pair = await open(shape, pattern(row.length));
+    const held = Math.min(row.length, WINDOW);
+    expect(await pair.sent(held)).toBe(held);
+    // Leave the callback that ended the last round trip.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const packets = () => pair.serverSession.endpoint.stats.packetsSent;
+    const before = packets();
+    // A reader pulls its first batch before `next()` returns.
+    const first = pair.receiver[Symbol.asyncIterator]().next();
+    expect(packets() > before).toBe(row.packet);
+    await first;
   });
 
-  // The pull queues a MAX_STREAM_DATA for the next tick. lsquic's reset of the
-  // write side drops what a stream has queued to send, and the sender would
-  // wait for that frame for ever.
-  test("resetStream() right after a read does not stop the sender", async () => {
-    const payload = pattern(1024 * 1024);
-    const shape = { ...serverBidi, onServerStream: (stream: any, ends: Ends) => ends.receiver.resolve(stream) };
-    await using pair = await open(shape, payload);
-    await pair.sent(WINDOW);
-    let reset = false;
-    const read = delivered(pair.receiver, payload, () => {
-      if (!reset) pair.receiver.resetStream();
-      reset = true;
+  // Fits one packet, so each is one chunk of the receiver's queue, and a
+  // batch of the reader is 16 of them.
+  const piece = pattern(1100);
+  const batch = 16 * piece.length;
+
+  // A client's stream with `count` pieces on it, each sent by itself, and a
+  // receive window of `window`. Nothing reads it and nothing ends it.
+  async function pieces(count: number, window: number) {
+    const shape: Shape = {
+      ...serverBidi,
+      serverParams: { initialMaxStreamDataBidiRemote: window },
+      onServerStream: (stream, ends) => ends.receiver.resolve(stream),
+      async onClient(client, ends) {
+        const stream = keep(await client.createBidirectionalStream({}));
+        stream.writer.writeSync(piece);
+        ends.sender.resolve(stream);
+      },
+    };
+    const pair = await open(shape, piece);
+    await pair.roundTrip();
+    for (let sent = 1; sent < count; sent++) {
+      pair.sender.writer.writeSync(piece);
+      await pair.roundTrip();
+    }
+    return pair;
+  }
+
+  // Starts a reader of `stream` that stops after its first batch. `taken` is
+  // the size of that batch, and `rest()` reads on to the end.
+  function readOneBatch(stream: any, payload: Buffer) {
+    const taken = Promise.withResolvers<number>();
+    const resume = Promise.withResolvers<void>();
+    const done = delivered(stream, payload, chunks => {
+      taken.resolve(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
+      return resume.promise;
     });
-    expect(await read).toEqual({ length: payload.length, same: true });
+    return { taken: taken.promise, rest: () => (resume.resolve(), done) };
+  }
+
+  // The limit is one window past what the reader took, not one window past
+  // what bun read from lsquic.
+  test("a reader that stops part-way leaves the sender one window past what it took", async () => {
+    const window = WINDOW / 2;
+    const rest = pattern(3 * window);
+    const payload = Buffer.concat([...Array(20).fill(piece), rest]);
+    // The sender has room left, so its next frame moves the limit. lsquic
+    // moves one only after more than half of the window is used: 16 pieces.
+    await using pair = await pieces(20, window);
+    expect(queued(pair.receiver)).toBe(20 * piece.length);
+
+    const reader = readOneBatch(pair.receiver, payload);
+    expect(await reader.taken).toBe(batch);
+    pair.sender.writer.writeSync(rest);
+    pair.sender.writer.endSync();
+    expect(await pair.sent(batch + window)).toBe(batch + window);
+    expect(queued(pair.receiver)).toBe(window);
+
+    expect(await reader.rest()).toEqual({ length: payload.length, same: true });
+    expect(queued(pair.receiver)).toBe(window);
+  });
+
+  // A batch that is read inside a QUIC callback moves the limit in one frame,
+  // which goes out when the callback ends. lsquic's reset of the write side
+  // drops what a stream has queued to send. Without that frame the sender
+  // waits for ever, and with the limit of the first chunk only it stops
+  // early: 15 pieces are not more than half of this window.
+  test("a batch read in a QUIC callback moves the limit by the whole batch, also past resetStream()", async () => {
+    const window = 30 * piece.length;
+    const rest = pattern(3 * window);
+    const payload = Buffer.concat([...Array(30).fill(piece), rest]);
+    // The sender has used its limit.
+    await using pair = await pieces(30, window);
+
+    const started = Promise.withResolvers<ReturnType<typeof readOneBatch>>();
+    const echo = pair.serverSession.onstream;
+    pair.serverSession.onstream = (stream: any) => {
+      pair.serverSession.onstream = echo;
+      echo(stream);
+      started.resolve(readOneBatch(pair.receiver, payload));
+      pair.receiver.resetStream();
+    };
+    await pair.roundTrip();
+    const reader = await started.promise;
+    expect(await reader.taken).toBe(batch);
+    pair.sender.writer.writeSync(rest);
+    pair.sender.writer.endSync();
+    expect(await pair.sent(batch + window)).toBe(batch + window);
+    expect(queued(pair.receiver)).toBe(window);
+
+    expect(await reader.rest()).toEqual({ length: payload.length, same: true });
   });
 
   // lsquic takes the send limit of a bidirectional stream from the role of
@@ -650,7 +736,9 @@ describe("receive backpressure", () => {
   // see the window that the receiver gave it. Such a stream keeps the old
   // rule, or a held limit would end the session with a flow control error.
   test("a bidirectional stream that the server opened is not held back", async () => {
-    const payload = pattern(90000);
+    const head = pattern(90000);
+    const tail = pattern(2 * WINDOW);
+    const payload = Buffer.concat([head, tail]);
     const shape: Shape = {
       name: "",
       alpn: "quic-test",
@@ -662,15 +750,23 @@ describe("receive backpressure", () => {
       },
       onServerSession(session, ends) {
         session.opened.then(async () => {
-          ends.sender.resolve(keep(await session.createBidirectionalStream({ body: ends.payload })));
+          const stream = keep(await session.createBidirectionalStream({}));
+          stream.writer.writeSync(head);
+          ends.sender.resolve(stream);
         }, ends.sender.reject);
       },
     };
-    await using pair = await open(shape, payload);
-    await pair.sender.closed;
-    await pair.roundTrip();
-    expect(queued(pair.receiver)).toBe(payload.length);
-    expect(await delivered(pair.receiver, payload)).toEqual({ length: payload.length, same: true });
+    await using pair = await open(shape, head);
+    expect(await pair.sent(head.length)).toBe(head.length);
+    expect(queued(pair.receiver)).toBe(head.length);
+
+    // What the reader takes does not count for this stream: the limit moves
+    // as before when more arrives.
+    const reader = readOneBatch(pair.receiver, payload);
+    await reader.taken;
+    pair.sender.writer.writeSync(tail);
+    pair.sender.writer.endSync();
+    expect(await reader.rest()).toEqual({ length: payload.length, same: true });
   });
 
   // A client that resumes a session opens streams before the handshake ends.
