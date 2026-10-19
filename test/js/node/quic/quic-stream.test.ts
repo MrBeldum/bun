@@ -607,6 +607,28 @@ describe("receive backpressure", () => {
     expect(queued(pair.receiver)).toBeLessThanOrEqual(WINDOW);
   });
 
+  // Inside a QUIC callback the endpoint sends what is queued when the callback
+  // ends. A reader outside of one has to start that itself, or the frame waits
+  // for the next timer of the connection.
+  test("a read outside a QUIC callback sends the new window at once", async () => {
+    const payload = pattern(3 * WINDOW);
+    await using pair = await open(serverBidi, payload);
+    expect(await pair.sent(WINDOW)).toBe(WINDOW);
+    // Any packet makes the endpoint send what is queued, and lsquic answers a
+    // packet with an acknowledgement up to 25 ms later (max_ack_delay). No
+    // event reports the last one, so wait them out: after this only the read
+    // can start a send.
+    await Bun.sleep(60);
+    const read = delivered(pair.receiver, payload);
+    // The frame is on the loopback socket when the first pull returns, so the
+    // sender has it within a few turns of the event loop.
+    for (let turns = 0; turns < 20 && Number(pair.sender.stats.bytesSent) === WINDOW; turns++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    expect(Number(pair.sender.stats.bytesSent)).toBeGreaterThan(WINDOW);
+    expect(await read).toEqual({ length: payload.length, same: true });
+  });
+
   // The pull queues a MAX_STREAM_DATA for the next tick. lsquic's reset of the
   // write side drops what a stream has queued to send, and the sender would
   // wait for that frame for ever.
