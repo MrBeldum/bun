@@ -901,48 +901,44 @@ describe.concurrent("--no-bundle picks the loader from the file name", () => {
     return { stdout, stderr, exitCode };
   }
 
-  let printed = 0;
-  /** The default export of the module `code`, which a build printed. */
-  async function defaultExport(cwd: string, code: string) {
-    const file = path.join(cwd, `printed-${printed++}.mjs`);
-    await Bun.write(file, code);
-    return (await import(file)).default;
-  }
-
   const xml = `<config env="production"><port>3000</port></config>`;
-  const xmlValue = { config: { "@env": "production", port: "3000" } };
   const markdown = "# port 3000\n";
-  const markdownValue = "<h1>port 3000</h1>\n";
+  const jsonc = `{ /* comment */ "port": 3000, }`;
+  const printed = {
+    json: "var port = 3000;\n\nexport {\n  port\n};\nexport default { port };\n",
+    data: "var port = 3000;\n\nexport {\n  port\n};\nexport default {\n  port\n};\n",
+    xml: 'var config = {\n  "@env": "production",\n  port: "3000"\n};\n\nexport {\n  config\n};\nexport default {\n  config\n};\n',
+    text: 'export default "port 3000";\n',
+    markdown: "export default `<h1>port 3000</h1>\n`;\n",
+    ts: "export default 3000;\n",
+  };
 
-  const modules: [name: string, contents: string, value: unknown][] = [
+  const modules: [name: string, contents: string, output: string][] = [
     // Every default extension of a data loader.
-    ["d.json", `{ "port": 3000 }`, { port: 3000 }],
-    ["d.jsonc", `{ /* comment */ "port": 3000, }`, { port: 3000 }],
-    ["d.json5", `{ port: 3000 }`, { port: 3000 }],
-    ["d.toml", `port = 3000\n`, { port: 3000 }],
-    ["d.yaml", `port: 3000\n`, { port: 3000 }],
-    ["d.yml", `port: 3000\n`, { port: 3000 }],
-    ["d.xml", xml, xmlValue],
-    ["d.txt", `port 3000`, "port 3000"],
-    ["d.text", `port 3000`, "port 3000"],
-    ["d.md", markdown, markdownValue],
-    ["d.markdown", markdown, markdownValue],
+    ["d.json", `{ "port": 3000 }`, printed.json],
+    ["d.jsonc", jsonc, printed.json],
+    ["d.json5", `{ port: 3000 }`, printed.data],
+    ["d.toml", `port = 3000\n`, printed.data],
+    ["d.yaml", `port: 3000\n`, printed.data],
+    ["d.yml", `port: 3000\n`, printed.data],
+    ["d.xml", xml, printed.xml],
+    ["d.txt", `port 3000`, printed.text],
+    ["d.text", `port 3000`, printed.text],
+    ["d.md", markdown, printed.markdown],
+    ["d.markdown", markdown, printed.markdown],
     // An extension in another case still names its loader.
-    ["D.XML", xml, xmlValue],
-    ["README.MD", markdown, markdownValue],
-    ["U.TS", `export default 3000 as number;\n`, 3000],
+    ["D.XML", xml, printed.xml],
+    ["README.MD", markdown, printed.markdown],
+    ["U.TS", `export default 3000 as number;\n`, printed.ts],
     // JSONC by file name.
-    ["bun.lock", `{ "lockfileVersion": 1, }`, { lockfileVersion: 1 }],
-    ["tsconfig.json", `{ /* comment */ "compilerOptions": {}, }`, { compilerOptions: {} }],
-    ["package.json", `{ /* comment */ "name": "pkg", }`, { name: "pkg" }],
+    ["bun.lock", jsonc, printed.json],
+    ["tsconfig.json", jsonc, printed.json],
+    ["package.json", jsonc, printed.json],
   ];
 
-  test.each(modules)("%s is a module", async (name, contents, value) => {
+  test.each(modules)("%s prints its module", async (name, contents, output) => {
     using dir = tempDir("no-bundle-loader-module", { [name]: contents });
-    const { stdout, stderr, exitCode } = await noBundle(String(dir), `./${name}`);
-    expect(stderr).toBe("");
-    expect(await defaultExport(String(dir), stdout)).toEqual(value);
-    expect(exitCode).toBe(0);
+    expect(await noBundle(String(dir), `./${name}`)).toEqual({ stdout: output, stderr: "", exitCode: 0 });
   });
 
   test("a malformed .xml file fails the build", async () => {
@@ -962,13 +958,18 @@ describe.concurrent("--no-bundle picks the loader from the file name", () => {
     expect([toDir.stderr, toFile.stderr]).toEqual(["", ""]);
     expect([toDir.exitCode, toFile.exitCode]).toEqual([0, 0]);
 
-    expect(fs.readdirSync(path.join(String(dir), "src")).sort()).toEqual(["config.xml", "readme.md"]);
-    expect(fs.readdirSync(path.join(String(dir), "dist")).sort()).toEqual(["config.js", "readme.js"]);
-    expect(fs.readdirSync(path.join(String(dir), "single"))).toEqual(["config.mjs"]);
     const written = (file: string) => Bun.file(path.join(String(dir), file)).text();
-    expect(await defaultExport(String(dir), await written("dist/config.js"))).toEqual(xmlValue);
-    expect(await defaultExport(String(dir), await written("dist/readme.js"))).toEqual(markdownValue);
-    expect(await defaultExport(String(dir), await written("single/config.mjs"))).toEqual(xmlValue);
+    expect({
+      src: fs.readdirSync(path.join(String(dir), "src")).sort(),
+      "dist/config.js": await written("dist/config.js"),
+      "dist/readme.js": await written("dist/readme.js"),
+      "single/config.mjs": await written("single/config.mjs"),
+    }).toEqual({
+      src: ["config.xml", "readme.md"],
+      "dist/config.js": printed.xml,
+      "dist/readme.js": printed.markdown,
+      "single/config.mjs": printed.xml,
+    });
   });
 
   test("a --loader entry for the extension wins", async () => {
@@ -978,18 +979,14 @@ describe.concurrent("--no-bundle picks the loader from the file name", () => {
       // The file loader copies the entry point. It does not parse it.
       noBundle(String(dir), "./bad.xml", "--loader", ".xml:file"),
     ]);
-    expect([asText.stderr, asFile.stderr]).toEqual(["", ""]);
-    expect(await defaultExport(String(dir), asText.stdout)).toBe(xml);
-    expect([asText.exitCode, asFile.exitCode]).toEqual([0, 0]);
+    expect(asText).toEqual({ stdout: `export default '${xml}';\n`, stderr: "", exitCode: 0 });
+    expect([asFile.stderr, asFile.exitCode]).toEqual(["", 0]);
   });
 
   test("a data: URL entry point does not take the dataurl loader", async () => {
     using dir = tempDir("no-bundle-loader-data-url", {});
     const url = "data:text/javascript,export default 3000;//.js";
-    const { stdout, stderr, exitCode } = await noBundle(String(dir), "--root", ".", url);
-    expect(stderr).toBe("");
-    expect(await defaultExport(String(dir), stdout)).toBe(3000);
-    expect(exitCode).toBe(0);
+    expect(await noBundle(String(dir), "--root", ".", url)).toEqual({ stdout: printed.ts, stderr: "", exitCode: 0 });
   });
 
   const unsupported: [name: string, loader: string, flags: string[]][] = [
@@ -1000,10 +997,11 @@ describe.concurrent("--no-bundle picks the loader from the file name", () => {
 
   test.each(unsupported)("%s with the %s loader is an error", async (name, loader, flags) => {
     using dir = tempDir("no-bundle-loader-unsupported", { [name]: "abc" });
-    const { stdout, stderr, exitCode } = await noBundle(String(dir), `./${name}`, ...flags);
-    expect(stderr).toContain(`error: The "${loader}" loader is not supported with --no-bundle: "${name}"`);
-    expect(stdout).toBe("");
-    expect(exitCode).toBe(1);
+    expect(await noBundle(String(dir), `./${name}`, ...flags)).toEqual({
+      stdout: "",
+      stderr: `error: The "${loader}" loader is not supported with --no-bundle: "${name}"\n`,
+      exitCode: 1,
+    });
   });
 });
 
