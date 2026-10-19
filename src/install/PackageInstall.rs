@@ -2687,8 +2687,9 @@ impl PackageFiles<'_> {
                 // itself) still lets a package that is there be linked into.
                 if !matches!(
                     failure.err,
-                    crate::Error::Sys(bun_errno::SystemErrno::EACCES | bun_errno::SystemErrno::EPERM)
-                        | crate::Error::AccessDenied
+                    crate::Error::Sys(
+                        bun_errno::SystemErrno::EACCES | bun_errno::SystemErrno::EPERM
+                    ) | crate::Error::AccessDenied
                 ) {
                     return InstallResult::Failure(failure);
                 }
