@@ -1,6 +1,7 @@
 // https://github.com/oven-sh/bun/issues/15734
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, tempDir } from "harness";
+import { writeFileSync } from "fs";
+import { bunEnv, bunExe, isLinux, tempDir } from "harness";
 import { join, sep } from "path";
 
 // `bun build --compile` copies + rewrites the whole bun binary (~1GB under
@@ -404,6 +405,117 @@ describe.concurrent("compile --asset and /$bunfs/ directory semantics", () => {
       const [stderr, code] = await Promise.all([proc.stderr.text(), proc.exited]);
       expect(stderr).toContain(expected);
       expect(code).not.toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  // A string argument of Bun.spawn is UTF-8, so `sh` makes the arguments that are not: a glob
+  // gives the name of a file, and `printf` turns octal escapes into bytes. `$0` is bun.
+  async function sh(cwd: string, script: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: ["sh", "-c", script, bunExe(), ...args],
+      cwd,
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, code };
+  }
+
+  /** Writes a file in `folder`. Its name is the parts in order: text, or one byte. */
+  function writeNamed(folder: string, name: (string | number)[], contents: string) {
+    const parts = name.map(part => (typeof part === "string" ? Buffer.from(part) : Buffer.from([part])));
+    writeFileSync(Buffer.concat([Buffer.from(folder + sep), ...parts]), contents);
+  }
+
+  const replacement = (count: number) => Buffer.alloc(count * 3, "\uFFFD").toString();
+
+  // Only Linux file systems accept a name that is not valid UTF-8.
+  test.skipIf(!isLinux)(
+    "a name that is not valid UTF-8 is embedded with U+FFFD, and that name opens the file",
+    async () => {
+      using dir = tempDir("bunfs-not-utf8", {
+        "index.ts": /* ts */ `
+          import fs from "node:fs";
+          const root = import.meta.dir + "/public";
+          const files: Record<string, string> = {};
+          for (const name of fs.readdirSync(root)) files[name] = fs.readFileSync(root + "/" + name, "utf8");
+          console.log(JSON.stringify({ main: Bun.main, files }));
+        `,
+        "public/plain.txt": "plain",
+        "out/.keep": "",
+      });
+      const assets = join(String(dir), "public");
+      writeNamed(assets, [...Array(120).fill(0xe9), ".txt"], "120 bytes");
+      writeNamed(assets, ["a", 0xe9, ".txt"], "one byte");
+      writeNamed(assets, ["b", 0xe3, 0x81, ".txt"], "cut sequence");
+      writeNamed(assets, ["c", 0xed, 0xa0, 0x80, ".txt"], "surrogate");
+
+      // The entry point takes the name of the executable: 100 bytes 0xE9.
+      const outfile = "out/" + Buffer.alloc(400, "\\351").toString();
+      const build = await sh(
+        String(dir),
+        `"$0" build --compile ./index.ts --asset ./public --outfile "$(printf "$1")"`,
+        outfile,
+      );
+      if (build.code !== 0) throw new Error(`compile failed (exit ${build.code})\n${build.stdout}\n${build.stderr}`);
+
+      const { stdout, stderr, code } = await sh("/tmp", `exec "$1"/out/*`, String(dir));
+      expect(stderr).toBe("");
+      expect(JSON.parse(stdout)).toEqual({
+        main: "/$bunfs/root/" + replacement(100),
+        files: {
+          [replacement(120) + ".txt"]: "120 bytes",
+          ["a" + replacement(1) + ".txt"]: "one byte",
+          ["b" + replacement(1) + ".txt"]: "cut sequence",
+          ["c" + replacement(3) + ".txt"]: "surrogate",
+          "plain.txt": "plain",
+        },
+      });
+      expect(code).toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!isLinux)(
+    "two names that differ only in bytes that are not valid UTF-8 are a build error",
+    async () => {
+      using dir = tempDir("bunfs-not-utf8-clash", {
+        "index.ts": `console.log("unreachable");`,
+        "public/z.png": "third",
+        "entry/.keep": "",
+      });
+      const assets = join(String(dir), "public");
+      writeNamed(assets, ["a", 0xe9, ".png"], "first");
+      writeNamed(assets, ["a", 0xe8, ".png"], "second");
+      writeNamed(join(String(dir), "entry"), ["ap", 0xe8, "p"], "not the entry point");
+
+      const [asset, positional, entry, api] = await Promise.all([
+        sh(String(dir), `"$0" build --compile ./index.ts --outfile app1 --asset ./public`),
+        sh(String(dir), `"$0" build --compile ./index.ts ./public/* --outfile app2`),
+        sh(String(dir), `"$0" build --compile ./index.ts --outfile "$(printf 'ap\\351p')" --asset ./entry/*`),
+        Bun.build({
+          entrypoints: [join(String(dir), "index.ts")],
+          throw: false,
+          compile: { outfile: join(String(dir), "app3"), assets: [assets] },
+        }),
+      ]);
+
+      expect(asset.stderr).toContain(`collides with another embedded file at "public/a\uFFFD.png"`);
+      expect(asset.code).toBe(1);
+
+      // The bundler names one chunk after each entry point: `public/a\xe8.js` and `public/a\xe9.js`.
+      expect(positional.stderr).toMatch(
+        /a\\xe[89]\.png" collides with "[^"]*a\\xe[89]\.png": both would be embedded as "public\/a\uFFFD\.js"/,
+      );
+      expect(positional.code).toBe(1);
+
+      expect(entry.stderr).toContain("same path as the entry point");
+      expect(entry.code).toBe(1);
+
+      expect(api.logs.map(String).join("\n")).toContain(`collides with another embedded file at "public/a\uFFFD.png"`);
+      expect(api.success).toBe(false);
     },
     TIMEOUT,
   );

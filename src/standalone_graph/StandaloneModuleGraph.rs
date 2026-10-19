@@ -4,6 +4,7 @@
 
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
+use std::borrow::Cow;
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -1442,9 +1443,20 @@ fn encode_text_module(
     )
 }
 
-/// The embedded bunfs key for an output file, relative to the prefix.
+/// An output file's path relative to the prefix.
 fn module_dest_path(output_file: &OutputFile) -> &[u8] {
     bun_core::strings::remove_leading_dot_slash(&output_file.dest_path)
+}
+
+/// The name a file with this `dest_path` is embedded under, relative to the prefix. A lookup at
+/// run time compares bytes with the UTF-8 of a JS string, so each sequence that is not valid
+/// UTF-8 is stored as U+FFFD.
+pub fn embedded_name(dest_path: &[u8]) -> Cow<'_, [u8]> {
+    let dest_path = bun_core::strings::remove_leading_dot_slash(dest_path);
+    match bstr::ByteSlice::to_str_lossy(dest_path) {
+        Cow::Borrowed(name) => Cow::Borrowed(name.as_bytes()),
+        Cow::Owned(name) => Cow::Owned(name.into_bytes()),
+    }
 }
 
 /// Every region of the serialized graph is addressed by a `StringPointer`, a `u32` offset and
@@ -1459,6 +1471,24 @@ fn max_graph_bytes() -> usize {
     limit
 }
 
+pub(crate) enum ToBytesError {
+    /// The output files at these two indices are different files with one embedded name.
+    NameCollision { first: usize, second: usize },
+    Other(crate::Error),
+}
+
+impl From<crate::Error> for ToBytesError {
+    fn from(error: crate::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<bun_alloc::AllocError> for ToBytesError {
+    fn from(error: bun_alloc::AllocError) -> Self {
+        Self::Other(error.into())
+    }
+}
+
 pub(crate) fn to_bytes(
     target: &CompileTarget,
     prefix: &[u8],
@@ -1467,7 +1497,7 @@ pub(crate) fn to_bytes(
     compile_exec_argv: &[u8],
     flags: Flags,
     runtime_options: RuntimeOptions,
-) -> crate::Result<Vec<u8>> {
+) -> Result<Vec<u8>, ToBytesError> {
     // RAII trace handle ends on drop.
     let _serialize_trace = bun_perf::trace(bun_perf::PerfEvent::StandaloneModuleGraphSerialize);
 
@@ -1523,6 +1553,55 @@ pub(crate) fn to_bytes(
         return Ok(Vec::new());
     }
 
+    let mut module_files: Vec<&OutputFile> = Vec::with_capacity(module_count);
+    let mut entry_point_file: Option<&OutputFile> = None;
+    // `Graph::from_bytes` keys files by name; a repeat would shift `entry_point_id`.
+    let mut seen_names: StringArrayHashMap<()> = StringArrayHashMap::new();
+    // The names that differ from the file's `dest_path`, in the order of `output_files`.
+    let mut replaced_names: Vec<(&OutputFile, Vec<u8>)> = Vec::new();
+
+    for (index, output_file) in output_files.iter().enumerate() {
+        if !output_file.output_kind.is_file_in_standalone_mode() {
+            continue;
+        }
+
+        if !matches!(output_file.value, options::OutputFileValue::Buffer { .. }) {
+            continue;
+        }
+
+        let name = embedded_name(&output_file.dest_path);
+        let seen = seen_names.get_or_put(&name)?;
+        if seen.found_existing {
+            let first = module_files[seen.index];
+            // Same `[name]` and `[hash]` means the same bytes: keep the first copy.
+            if module_dest_path(first) == module_dest_path(output_file) {
+                continue;
+            }
+            let first = output_files
+                .iter()
+                .position(|file| core::ptr::eq(file, first))
+                .unwrap();
+            return Err(ToBytesError::NameCollision {
+                first,
+                second: index,
+            });
+        }
+        if let Cow::Owned(name) = name {
+            // The count above is of `dest_path`.
+            string_builder.cap += name
+                .len()
+                .saturating_sub(module_dest_path(output_file).len());
+            replaced_names.push((output_file, name));
+        }
+        if entry_point_file.is_none() && is_entry_point(output_file) {
+            entry_point_file = Some(output_file);
+        }
+        module_files.push(output_file);
+    }
+    let Some(entry_point_file) = entry_point_file else {
+        return Ok(Vec::new());
+    };
+
     string_builder.cap +=
         (size_of::<CompiledModuleGraphFile>() + size_of::<u32>()) * output_files.len();
     string_builder.cap += TRAILER.len();
@@ -1533,35 +1612,6 @@ pub(crate) fn to_bytes(
 
     string_builder.allocate()?;
 
-    let mut module_files: Vec<&OutputFile> = Vec::with_capacity(module_count);
-    let mut entry_point_file: Option<&OutputFile> = None;
-    // `Graph::from_bytes` keys files by path; a repeat would shift `entry_point_id`.
-    let mut seen_paths: StringArrayHashMap<()> = StringArrayHashMap::new();
-
-    for output_file in output_files {
-        if !output_file.output_kind.is_file_in_standalone_mode() {
-            continue;
-        }
-
-        if !matches!(output_file.value, options::OutputFileValue::Buffer { .. }) {
-            continue;
-        }
-
-        // Same `[name]` and `[hash]` means the same bytes: keep the first copy.
-        if seen_paths
-            .get_or_put(module_dest_path(output_file))?
-            .found_existing
-        {
-            continue;
-        }
-        if entry_point_file.is_none() && is_entry_point(output_file) {
-            entry_point_file = Some(output_file);
-        }
-        module_files.push(output_file);
-    }
-    let Some(entry_point_file) = entry_point_file else {
-        return Ok(Vec::new());
-    };
     // Every per-module region below is written in load order (entry point's
     // static imports first, then dynamic imports breadth-first) so the modules
     // a process actually loads share pages instead of each dragging in its own.
@@ -1832,11 +1882,21 @@ pub(crate) fn to_bytes(
     }
 
     for (module, output_file) in modules.iter_mut().zip(&module_files) {
-        module.name = string_builder.fmt_append_count_z(format_args!(
-            "{}{}",
-            bstr::BStr::new(prefix),
-            bstr::BStr::new(module_dest_path(output_file))
-        ));
+        // `replaced_names` is in the order of `output_files`, so it is sorted by address.
+        let replaced = replaced_names
+            .binary_search_by_key(&core::ptr::from_ref(*output_file), |(file, _)| {
+                core::ptr::from_ref(*file)
+            });
+        let name = match replaced {
+            Ok(index) => replaced_names[index].1.as_slice(),
+            Err(_) => module_dest_path(output_file),
+        };
+        let prefix_ptr = string_builder.append_count(prefix);
+        let name_ptr = string_builder.append_count_z(name);
+        module.name = StringPointer {
+            offset: prefix_ptr.offset,
+            length: prefix_ptr.length + name_ptr.length,
+        };
         // The bytecode cache was generated under the bytecode output file's
         // path; the runtime must present exactly the same path to hit it.
         if output_file.bytecode_index != u32::MAX {
@@ -1923,7 +1983,7 @@ pub(crate) fn to_bytes(
     // Every region above is addressed by a `StringPointer`, so `len` itself has to fit in u32
     // or the `as u32` casts that built those pointers have wrapped.
     if string_builder.len > max_graph_bytes() {
-        return Err(crate::Error::ModuleGraphTooLarge);
+        return Err(crate::Error::ModuleGraphTooLarge.into());
     }
 
     let offsets = Offsets {
@@ -2867,7 +2927,24 @@ pub fn to_executable(
         runtime_options,
     ) {
         Ok(b) => b,
-        Err(e) => {
+        Err(ToBytesError::NameCollision { first, second }) => {
+            let first = &output_files[first];
+            let second = &output_files[second];
+            // An entry point's chunk has the path of the entry point.
+            fn source(file: &OutputFile) -> &[u8] {
+                match file.src_path.text {
+                    b"" => module_dest_path(file),
+                    path => path,
+                }
+            }
+            return Ok(CompileResult::fail_fmt(format_args!(
+                "{:?} collides with {:?}: both would be embedded as {:?}, because a name that is not valid UTF-8 is stored with U+FFFD in place of each invalid sequence",
+                bstr::BStr::new(source(second)),
+                bstr::BStr::new(source(first)),
+                bstr::BStr::new(&embedded_name(&second.dest_path)),
+            )));
+        }
+        Err(ToBytesError::Other(e)) => {
             return Ok(CompileResult::fail_fmt(format_args!(
                 "failed to generate module graph bytes: {}",
                 bstr::BStr::new(e.name())
