@@ -58,7 +58,7 @@ export function upload(
       sock.end(OVERFLOW);
       if (hold) {
         sock.pause();
-        hold().then(() => sock.resume());
+        hold().finally(() => sock.resume());
       }
     });
     sock.on("error", () => (closed = "reset"));
