@@ -149,6 +149,7 @@ static void us_internal_connect_timer_arm(struct us_loop_t *loop) {
     /* Round up: uv measures from its cached loop time, so a truncated delay
      * fires before the deadline. An early fire re-arms from the callback. */
     long long ms = (deadline - (long long) us_internal_monotonic_ns() + 999999LL) / 1000000LL;
+    US_TEMP_DIAL_TRACE("timer arm ms=%lld", ms);
     us_timer_set(loop->data.connect_timer, (void (*)(struct us_timer_t *)) connect_timer_cb, ms > 0 ? (int) ms : 1, 0);
 }
 #endif
@@ -160,6 +161,7 @@ void us_internal_connect_attempt_schedule(struct us_connecting_socket_t *c) {
     }
     struct us_loop_t *loop = c->loop;
     c->next_attempt_ns = (long long) us_internal_monotonic_ns() + LIBUS_CONNECT_ATTEMPT_DELAY_NS;
+    US_TEMP_DIAL_TRACE("schedule c=%p loop_deadline_was=%lld", (void *) c, loop->data.connect_next_attempt_ns);
     /* Every delay is the same length, so a new deadline is never earlier than
      * one already armed. */
     if (loop->data.connect_next_attempt_ns < 0) {
@@ -175,6 +177,7 @@ void us_internal_connect_attempts_if_due(struct us_loop_t *loop) {
         return;
     }
     long long now = (long long) us_internal_monotonic_ns();
+    US_TEMP_DIAL_TRACE("due check now_minus_deadline_us=%lld", (now - loop->data.connect_next_attempt_ns) / 1000LL);
     if (now < loop->data.connect_next_attempt_ns) {
 #ifdef LIBUS_USE_LIBUV
         us_internal_connect_timer_arm(loop);
@@ -194,6 +197,7 @@ void us_internal_connect_attempts_if_due(struct us_loop_t *loop) {
              * lists stay intact while they are walked. */
             if (c->next_attempt_ns <= now && c->connecting_head != NULL) {
                 c->next_attempt_ns = 0;
+                us_internal_temp_dial_reason = "timer";
                 if (us_internal_socket_start_next_attempt(c)) {
                     us_internal_connect_attempt_schedule(c);
                 }
@@ -604,6 +608,7 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int eof, in
                         connect_error = LIBUS_ECONNRESET;
                     }
                 }
+                US_TEMP_DIAL_TRACE("dispatch semi s=%p error=%d eof=%d events=%d connect_error=%d", (void *) p, error, eof, events, connect_error);
                 us_internal_socket_after_open((struct us_socket_t *) p, connect_error);
             } else {
                 struct us_listen_socket_t *listen_socket = (struct us_listen_socket_t *) p;

@@ -69,6 +69,9 @@ static void poll_cb(uv_poll_t *p, int status, int events) {
    * signal). */
   int eof = status == UV_EOF;
   int error = status < 0 && status != UV_EOF;
+  if ((us_internal_poll_type((struct us_poll_t *)p->data) & POLL_TYPE_KIND_MASK) == POLL_TYPE_SEMI_SOCKET) {
+    US_TEMP_DIAL_TRACE("poll_cb p=%p status=%d events=%d registered=%d", p->data, status, events, us_poll_events((struct us_poll_t *)p->data));
+  }
   if (events & (UV_DISCONNECT | UV_PRIORITIZED)) {
     struct us_poll_t *wp = (struct us_poll_t *)p->data;
     uv_poll_start(p, us_poll_events(wp), poll_cb);

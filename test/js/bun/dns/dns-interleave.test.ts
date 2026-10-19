@@ -13,13 +13,13 @@
 import { dns } from "bun";
 import { dnsIsAllLoopbackOfOneFamily, dnsIsLocalhostName } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isLinux, isMusl } from "harness";
+import { bunEnv, bunExe, isLinux, isMusl, isWindows } from "harness";
 
 // The DNS cache is process-global and a failed connect evicts its entry, so
 // each scenario runs in its own process. Every test also does a real fetch()
 // through the seeded entry, which is consumed by usockets via
 // Bun__addrinfo_getRequestResult and us_internal_socket_start_next_attempt().
-async function run(body: string, timeoutMs = 10_000) {
+async function run(body: string, timeoutMs = 10_000, extraEnv: Record<string, string> = {}) {
   const fixture = /* js */ `
     const { dnsCacheSeed } = require("bun:internal-for-testing");
     if (typeof dnsCacheSeed !== "function") {
@@ -37,6 +37,7 @@ async function run(body: string, timeoutMs = 10_000) {
       HTTPS_PROXY: undefined,
       http_proxy: undefined,
       https_proxy: undefined,
+      ...extraEnv,
     },
     stderr: "pipe",
     stdout: "pipe",
@@ -261,7 +262,8 @@ describe.concurrent("connection attempt delay (RFC 8305 §5)", () => {
   // healthy name connects inside the attempt delay, so the client never opens
   // (and then resets) a connection to the others.
   test("a name with three addresses costs the server one connection per dial", async () => {
-    const { out, stderr, exitCode, signal } = await run(/* js */ `
+    const { out, stderr, exitCode, signal } = await run(
+      /* js */ `
       let accepted = 0;
       using server = Bun.listen({
         hostname: "127.0.0.1",
@@ -309,7 +311,13 @@ describe.concurrent("connection attempt delay (RFC 8305 §5)", () => {
 
       console.log(JSON.stringify({ ok: true, dials, viaFetch, viaConnect }));
       process.exit(0);
-    `);
+    `,
+      10_000,
+      // TEMPORARY, removed before merge: Windows dials every address in CI.
+      // The trace on stderr shows why.
+      isWindows ? { BUN_INTERNAL_TEMP_DIAL_TRACE: "1" } : {},
+    );
+    if (isWindows) console.log("DIAL_TRACE " + JSON.stringify({ out, stderr }));
     expect({ out, stderr, exitCode, signal }).toEqual({
       out: { ok: true, dials: 10, viaFetch: 10, viaConnect: 10 },
       stderr: "",

@@ -202,6 +202,11 @@ void us_internal_connect_attempts_if_due(struct us_loop_t *loop);
 /* Open a connect() to the next address of `c`, at most one. Returns 1 when a
  * socket was opened, 0 when every remaining address failed to open. */
 int us_internal_socket_start_next_attempt(struct us_connecting_socket_t *c);
+/* TEMPORARY TRACE, removed before merge: BUN_INTERNAL_TEMP_DIAL_TRACE=1. */
+#include <stdio.h>
+int us_internal_temp_dial_trace(void);
+extern const char *us_internal_temp_dial_reason;
+#define US_TEMP_DIAL_TRACE(...) do { if (us_internal_temp_dial_trace()) { fprintf(stderr, "[dial] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
 void us_internal_free_closed_sockets(us_loop_r loop);
 void us_internal_loop_link_group(struct us_loop_t *loop, struct us_socket_group_t *group);
 void us_internal_loop_unlink_group(struct us_loop_t *loop, struct us_socket_group_t *group);

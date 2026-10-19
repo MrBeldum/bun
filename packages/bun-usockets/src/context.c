@@ -684,6 +684,17 @@ struct us_socket_t *us_socket_group_connect_unix(struct us_socket_group_t *group
  * every address at once instead would park the dial on the kernel's SYN
  * retries (about two minutes) whenever the first few are black holes, and
  * would cost the server one accepted connection per address. */
+/* TEMPORARY TRACE, removed before merge. */
+const char *us_internal_temp_dial_reason = "?";
+int us_internal_temp_dial_trace(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("BUN_INTERNAL_TEMP_DIAL_TRACE");
+        cached = value && value[0] == '1';
+    }
+    return cached;
+}
+
 int us_internal_socket_start_next_attempt(struct us_connecting_socket_t *c) {
     int opened = 0;
     struct us_socket_group_t *group = c->group;
@@ -717,6 +728,7 @@ int us_internal_socket_start_next_attempt(struct us_connecting_socket_t *c) {
         s->connect_next = c->connecting_head;
         c->connecting_head = s;
         s->connect_state = c;
+        US_TEMP_DIAL_TRACE("attempt c=%p s=%p fd=%lld family=%d reason=%s t=%llu", (void *) c, (void *) s, (long long) connect_socket_fd, (int) addr.ss_family, us_internal_temp_dial_reason, (unsigned long long) (us_internal_monotonic_ns() / 1000ULL));
     }
     return opened;
 }
@@ -757,6 +769,8 @@ void us_internal_socket_after_resolve(struct us_connecting_socket_t *c) {
 
     c->addrinfo_head = &result->entries->info;
 
+    US_TEMP_DIAL_TRACE("resolve c=%p", (void *) c);
+    us_internal_temp_dial_reason = "resolve";
     if (!us_internal_socket_start_next_attempt(c)) {
         /* Same as the exhausted path in us_internal_socket_after_open: a
          * real connect failure must not be reported as a caller abort. */
@@ -764,11 +778,25 @@ void us_internal_socket_after_resolve(struct us_connecting_socket_t *c) {
         us_connecting_socket_close(c);
         return;
     }
+    /* TEMPORARY MEASUREMENT AID, removed before merge: dial up to four
+     * addresses at once, the way the code before this change did, so one
+     * binary can compare both dial patterns on one kernel. */
+    static int temp_dial_all_at_once = -1;
+    if (temp_dial_all_at_once < 0) {
+        const char *value = getenv("BUN_INTERNAL_TEMP_DIAL_ALL_AT_ONCE");
+        temp_dial_all_at_once = value && value[0] == '1';
+    }
+    if (temp_dial_all_at_once) {
+        us_internal_temp_dial_reason = "all-at-once";
+        for (int opened = 1; opened < 4 && us_internal_socket_start_next_attempt(c); opened++) {}
+        return;
+    }
     us_internal_connect_attempt_schedule(c);
 }
 
 void us_internal_socket_after_open(struct us_socket_t *s, int error) {
     struct us_connecting_socket_t *c = s->connect_state;
+    US_TEMP_DIAL_TRACE("after_open c=%p s=%p error_in=%d t=%llu", (void *) c, (void *) s, error, (unsigned long long) (us_internal_monotonic_ns() / 1000ULL));
     #if _WIN32
     if (error == 0) {
         if (recv(us_poll_fd((struct us_poll_t*)s), NULL, 0, MSG_PUSH_IMMEDIATE) == SOCKET_ERROR) {
@@ -792,6 +820,7 @@ void us_internal_socket_after_open(struct us_socket_t *s, int error) {
         }
     }
     #endif
+    US_TEMP_DIAL_TRACE("after_open c=%p s=%p error=%d", (void *) c, (void *) s, error);
     if (error) {
         if (c) {
             for (struct us_socket_t **next = &c->connecting_head; *next; next = &(*next)->connect_next) {
@@ -803,6 +832,7 @@ void us_internal_socket_after_open(struct us_socket_t *s, int error) {
             us_socket_close(s, LIBUS_SOCKET_CLOSE_CODE_CONNECTION_RESET, 0);
 
             /* A failure advances to the next address at once. */
+            us_internal_temp_dial_reason = "failure";
             if (!us_internal_socket_start_next_attempt(c) && c->connecting_head == NULL) {
                 /* Every resolved address failed to connect. Without this,
                  * us_connecting_socket_close defaults c->error to
