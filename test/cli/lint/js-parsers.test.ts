@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { bunEnv, bunExe, isASAN, isDebug, normalizeBunSnapshot, tempDir } from "harness";
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
@@ -121,6 +121,10 @@ const pathOf = (it: Result) => it.filePath.replaceAll("\\", "/").replace(/^.*\/b
 
 // Each thread that needs JavaScript starts a VM, which takes seconds in a debug build.
 const timeout = isDebug || isASAN ? 120_000 : 10_000;
+
+// Without a VM a run still starts two processes, one of them for the configuration file. In a debug build that takes
+// seconds, and `bun bd test` gives a test 5. CI has its own limits, so only a debug build gets this one.
+if (isDebug) setDefaultTimeout(timeout);
 
 // Debug builds are 10 to 100 times slower, so the big inputs are smaller there.
 const many = (count: number) => (isDebug || isASAN ? count / 10 : count);
