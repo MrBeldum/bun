@@ -20,6 +20,9 @@ export type Upload = {
   // Body bytes (within the limit) sent with the request head.
   first?: string;
   path?: string;
+  // The client stops reading behind the overflow until this settles, so the
+  // response stays in flight whatever the socket buffers can take.
+  hold?: () => Promise<unknown>;
 };
 
 const connect = (port: number, secure: boolean, onConnect: () => void): net.Socket =>
@@ -33,7 +36,12 @@ const connect = (port: number, secure: boolean, onConnect: () => void): net.Sock
 // client has not read yet. The client sends its FIN behind the overflow, so a
 // server that answers and keeps the connection open still ends the upload.
 // `closed` tells a forced close ("reset") from a graceful one ("fin").
-export function upload(port: number, secure: boolean, { marker, first = "", path = "/" }: Upload, onClose = () => {}) {
+export function upload(
+  port: number,
+  secure: boolean,
+  { marker, first = "", path = "/", hold }: Upload,
+  onClose = () => {},
+) {
   const chunks: Buffer[] = [];
   let overflowed = marker === null;
   let closed = "fin";
@@ -48,6 +56,10 @@ export function upload(port: number, secure: boolean, { marker, first = "", path
       if (overflowed || !Buffer.concat(chunks).includes(marker!)) return;
       overflowed = true;
       sock.end(OVERFLOW);
+      if (hold) {
+        sock.pause();
+        hold().then(() => sock.resume());
+      }
     });
     sock.on("error", () => (closed = "reset"));
     sock.on("close", () => {
@@ -73,8 +85,11 @@ export function get(port: number, secure = false, path = "/ok"): Promise<string>
 const body = (wire: string) => wire.split("\r\n\r\n").slice(1).join("\r\n\r\n");
 
 // A direct stream whose producer writes until `req.signal` tells it to stop.
+// `cancel` is apart from `heard`: a producer that is parked on the sink hears
+// it, and one that has already seen the abort ends its stream first.
 async function producer(run: (c: any, req: Request, heard: string[]) => Promise<void>) {
   const heard: string[] = [];
+  let cancel = "none";
   using server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -90,13 +105,15 @@ async function producer(run: (c: any, req: Request, heard: string[]) => Promise<
               () => void heard.push("producer ended"),
               e => void heard.push(`producer threw:${e}`),
             ),
-          cancel: (reason: unknown) => void heard.push(`cancel:${reason}`),
+          cancel(reason: unknown) {
+            cancel = `${heard.includes("abort") ? "after" : "before"} the abort: ${reason}`;
+          },
         } as any),
       );
     },
   });
   const { closed } = await upload(server.port!, false, { marker: "chunk" });
-  return { closed, heard, pendingRequests: server.pendingRequests, next: await get(server.port!) };
+  return { closed, heard, cancel, pendingRequests: server.pendingRequests, next: await get(server.port!) };
 }
 
 // A handler that reports a failed upload inside its own response, with no

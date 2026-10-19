@@ -8,7 +8,7 @@
 // a pending read of the request body rejects with the limit error, and the
 // producer of the response body is cancelled.
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, tls as tlsCert } from "harness";
+import { bunEnv, bunExe, isWindows, tls as tlsCert } from "harness";
 import { EventEmitter, once } from "node:events";
 import net from "node:net";
 import { join } from "node:path";
@@ -345,7 +345,8 @@ Object.assign(rows, {
   },
 } satisfies Record<string, Row>);
 
-async function run(row: Row, { development = false, secure = false } = {}) {
+// `held`: the client reads the response on only when the server has let the request go.
+async function run(row: Row, { development = false, secure = false, held = false } = {}) {
   const heard: string[] = [];
   const clientClosed = Promise.withResolvers<void>();
   const waitFor: Promise<unknown>[] = [];
@@ -371,7 +372,11 @@ async function run(row: Row, { development = false, secure = false } = {}) {
       });
     },
   });
-  const { wire, closed } = await upload(server.port!, secure, row, clientClosed.resolve);
+  const released = async () => {
+    while (server.pendingRequests > 0) await new Promise(resolve => setImmediate(resolve));
+  };
+  const request = held ? { ...row, hold: released } : row;
+  const { wire, closed } = await upload(server.port!, secure, request, clientClosed.resolve);
   await Promise.all(waitFor);
   const [head, ...rest] = wire.split("\r\n\r\n");
   return {
@@ -407,6 +412,10 @@ async function scenarios(...names: string[]) {
 }
 const announced = (...names: string[]) => names.map(name => `# ${name}\n`).join("");
 
+// The tests run one after the other on purpose. The rows are CPU-bound in a
+// debug build, so together they finish no sooner and each one takes longer.
+// The scenario processes do not all start within the default timeout of a
+// test when a debug build starts five of them at once.
 describe("a chunked request body crosses maxRequestBodySize", () => {
   test.each(Object.entries(rows))("%s", async (_name, row) => {
     await expectRow(row);
@@ -426,9 +435,11 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
     await expectRow(rows[name], { secure: true });
   });
 
+  // Bodies that the socket buffers cannot take whole while the client does not read.
   const large = Buffer.alloc(32 * 1024 * 1024, "y");
   const largeBody = async (respond: Row["respond"]) => {
-    const { head, body, stopped, ...result } = await run({ marker: END_OF_STATUS_LINE, respond, expected: {} });
+    const row = { marker: END_OF_STATUS_LINE, respond, expected: {} };
+    const { head, body, stopped, ...result } = await run(row, { held: true });
     await stopped;
     return { ...result, body: body.length, terminated: body.endsWith("0\r\n\r\n"), head };
   };
@@ -464,16 +475,18 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
   });
 
   // The producer has closed its stream, but the pump into the response still
-  // waits for the client to read the chunk before it ends the response. The
-  // server cannot tell this stream from one that still has chunks: it used to
-  // put a terminating chunk behind the bytes it held, which completed this
-  // body and silently cut the other.
+  // waits for the client to read the last chunk before it ends the response.
+  // The server cannot tell this stream from one that still has chunks: it used
+  // to put a terminating chunk behind the bytes it held, which completed this
+  // body and silently cut the other. The first chunk fills the socket buffer,
+  // so that the last one waits on every platform.
   test("a closed stream whose last chunk is still being sent", async () => {
     const { head, ...result } = await largeBody(
       (req, { heard }) =>
         new Response(
           new ReadableStream({
             start(c) {
+              c.enqueue(large.subarray(0, 1024 * 1024));
               c.enqueue(large);
               c.close();
             },
@@ -496,7 +509,9 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
   });
 
   // A body with a Content-Length used to be cut with a FIN, short of its length.
-  test("a Buffer that is still being sent", async () => {
+  // Windows takes a write of any size into an empty socket buffer, so this body
+  // is never in flight there. The HTTP/2 row holds it back on every platform.
+  test.skipIf(isWindows)("a Buffer that is still being sent", async () => {
     const { head, ...result } = await largeBody(() => new Response(large));
     expect({ ...result, contentLength: /\r\ncontent-length: (\d+)/i.exec(head)?.[1] }).toEqual({
       statusLine: "HTTP/1.1 200 OK",
@@ -516,9 +531,12 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
   // A producer that watches `req.signal` stops. `write()` and `flush()` return 0
   // once the response is gone: without the abort, these loops never yield.
   test("a direct stream whose producer watches req.signal stops", async () => {
+    const cancelled = `after the abort: ${aborted}`;
+    // A loop that waits on the sink hears the cancel. One that has seen the abort by then ends its stream first.
     const stopped = {
       closed: "reset",
-      heard: ["abort", `cancel:${aborted}`, "producer ended"],
+      heard: ["abort", "producer ended"],
+      cancel: expect.stringMatching(/^(none|after the abort: AbortError: The connection was closed\.)$/),
       pendingRequests: 0,
       next: "HTTP/1.1 200 OK",
     };
@@ -529,12 +547,13 @@ describe("a chunked request body crosses maxRequestBodySize", () => {
       "producer:flush": stopped,
       // An abort listener stops the loop.
       "producer:listener": stopped,
-      // A timer writes until req.signal.aborted.
-      "producer:timer": stopped,
-      // write(), flush() and end() after the abort. The producer ends its stream, so nothing is left to cancel.
+      // A timer writes until req.signal.aborted: it is not in the stream when the cancel comes.
+      "producer:timer": { ...stopped, cancel: cancelled },
+      // write(), flush() and end() after the abort: the producer ends its stream, so nothing is left to cancel.
       "producer:late": {
         ...stopped,
         heard: ["abort", "write:0", "flush:0", "flush(true):0", "end:0", "producer ended"],
+        cancel: "none",
       },
     };
     expect(await scenarios(...Object.keys(expected))).toEqual({
