@@ -934,12 +934,12 @@ impl<'h> Graph<'h> {
         };
         with_file(path, &text, &language, None, |file| {
             // As eslint-plugin-import: nothing is known of a file that cannot be parsed.
-            let mut requests = if self.is_refused(file) {
+            let mut requests = if Self::is_refused(file, self.flavor()) {
                 Vec::new()
             } else {
                 requests_of(file, self.flavor())
             };
-            let record = self.keep_record(path.to_vec(), file);
+            let record = self.keep_record(path.to_vec(), file, self.flavor());
             // Of a package only what it exports is of interest.
             if is_in_package(path) && !self.follows_packages.load(Ordering::Relaxed) {
                 let is_exported = |specifier: &[u8]| {
@@ -956,20 +956,25 @@ impl<'h> Graph<'h> {
     }
 
     /// Whether nothing is known of `file`. oxlint also refuses a file that can be parsed, for an early error.
-    fn is_refused<'a>(&self, file: &'a File<'a>) -> bool {
-        match self.flavor() {
+    fn is_refused<'a>(file: &'a File<'a>, flavor: Flavor) -> bool {
+        match flavor {
             Flavor::Oxlint => bun_lint::linter::parse_error(file).is_some(),
             Flavor::EslintPluginImport => file.has_parse_errors(),
         }
     }
 
     /// Makes the [`Record`] of `file`, which is at `path`, if a rule wants them and it is not known.
-    fn keep_record<'a>(&self, path: Vec<u8>, file: &'a File<'a>) -> Option<&Record> {
+    fn keep_record<'a>(
+        &self,
+        path: Vec<u8>,
+        file: &'a File<'a>,
+        flavor: Flavor,
+    ) -> Option<&Record> {
         let make = self.record_maker.get()?;
         let known = match self.known().records.get_ref(&path[..]) {
             Some(known) => known,
             None => {
-                let record = (!self.is_refused(file)).then(|| make(file));
+                let record = (!Self::is_refused(file, flavor)).then(|| make(file));
                 self.known().records.insert_ref(path, record)
             }
         };
@@ -1189,14 +1194,13 @@ impl Modules for Graph<'_> {
     }
 
     fn record_exports<'a>(&self, file: &'a File<'a>, make: MakeRecord) {
-        // Only the rules of oxlint keep records, and the first of them comes here before it comes to `record`.
-        self.follows_oxlint.store(true, Ordering::Relaxed);
         let _ = self.record_maker.set(make);
         let mut real = self.store.disk().realpath(&from_native(file.path()));
         if file.is_later_script() {
             real.push(0);
         }
-        self.keep_record(real, file);
+        // Only the rules of oxlint keep records. The first file comes here before any comes to `record`.
+        self.keep_record(real, file, Flavor::Oxlint);
     }
 
     fn follow_packages(&self) {

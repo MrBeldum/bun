@@ -588,11 +588,12 @@ fn check_and_lint_in(
             };
             // oxlint prints what oxc's parser has first, in its order, and then what tsgolint has.
             let is_oxlint = files[indices[at]].config.language.is_oxlint;
-            let place = |it: &LintMessage| {
-                (!(is_oxlint && is_parse_error(it))).then_some((it.line as i32, it.column as i32))
+            let of_parser = match is_oxlint {
+                true => (result.messages.iter().rposition(is_parse_error)).map_or(0, |it| it + 1),
+                false => 0,
             };
-            if !result.messages.is_sorted_by_key(place) {
-                bun_lint::utils::sort::sort_by_key(&mut result.messages, place);
+            if let Some(rest) = result.messages.get_mut(of_parser..) {
+                LintMessage::sort(rest);
             }
         }
     }
