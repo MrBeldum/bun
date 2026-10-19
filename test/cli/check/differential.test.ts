@@ -2,10 +2,9 @@ import { afterAll, expect, test } from "bun:test";
 import { bunExe, isASAN, isDebug, isWindows, tempDir } from "harness";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { endChildren } from "../children";
-import { inTurns, linesOf, modulesInRings, outputOf, tsc } from "./differential";
+import { endChecks, inTurns, linesOf, modulesInRings, outputOf, tsc } from "./differential";
 
-afterAll(endChildren);
+afterAll(endChecks);
 
 // Small programs generated as cross products, checked by `bun check` and by TypeScript 7, which have to agree. No
 // expectation is stored: TypeScript is the oracle. Each program is one function on one line, so a line names a
@@ -619,7 +618,7 @@ test.concurrent.skipIf(!tsc)("TS2354 is at the first syntax that is checked, on 
 async function errorsOf(cmd: string[], cwd: string) {
   const { stdout } = await outputOf(cmd, cwd);
   const byLine = new Map<number, string[]>();
-  for (const text of stdout.split("\n")) {
+  for (const text of stdout.split(/\r?\n/)) {
     const line = /^a\.ts\((\d+),\d+\): error TS\d+: /.exec(text)?.[1];
     if (line) byLine.set(+line, [...(byLine.get(+line) ?? []), text].sort());
   }

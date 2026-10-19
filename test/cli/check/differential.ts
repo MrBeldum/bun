@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { bunEnv, bunExe, isASAN, isDebug, isWindows, tempDir } from "harness";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { dirname, join } from "node:path";
-import { longLimit, spawn } from "../children";
+import { endChildren, longLimit, spawn } from "../children";
 
 // `bun check` follows TypeScript 7, which is a native program next to its `lib.*.d.ts`: `typescript7` in
 // test/package.json, beside the `typescript` that has the API in JavaScript. `TSC` is the path of another to compare with.
@@ -37,9 +37,12 @@ const oracle = { ...env, GOMAXPROCS: "1", GOGC: "off", GOMEMLIMIT: "1GiB" };
 const width = availableParallelism();
 let running = 0;
 const waiting: (() => void)[] = [];
+// How often `endChecks` has ended the tests that the checks were for.
+let ended = 0;
 
 /** What `cmd` prints, and how it ended. It starts when fewer than `width` others run, whichever tests they are of. */
 export async function outputOf(cmd: string[], cwd: string) {
+  const before = ended;
   if (running < width) running++;
   // The one that ends gives its place to the one that has waited the longest.
   else await new Promise<void>(resolve => waiting.push(resolve));
@@ -53,12 +56,24 @@ export async function outputOf(cmd: string[], cwd: string) {
       stderr: "ignore",
     });
     const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    // `endChecks` killed it. The test that it was for is over, and goes no further than here.
+    if (before !== ended) return new Promise<never>(() => {});
     return { stdout, exitCode, signalCode: proc.signalCode };
   } finally {
     const next = waiting.shift();
     if (next) next();
     else running--;
   }
+}
+
+/**
+ * `endChildren`, for tests that are over. One that ran out of time is still at work: what it has waiting for a turn
+ * would start when the children end, and what follows in it would start more.
+ */
+export function endChecks() {
+  ended++;
+  waiting.length = 0;
+  endChildren();
 }
 
 /** The lines of `output`, without the path of `root`. And how `cmd` ended, if it crashed: that prints nothing. */
@@ -155,6 +170,9 @@ function write(directory: string, files: Record<string, string>) {
  */
 export function programsThatOnceDiffered(part: number, parts: number) {
   const tests = 4;
+  // `bun test` ends the children of a test that ran out of time. The rest of its programs must not start beside the
+  // next test.
+  afterEach(endChecks);
   for (let nth = 0; nth < tests; nth++) {
     // In turn, not `test.concurrent`: each keeps every processor busy by itself. Beside the other three, each would
     // take as long as the whole file, of the 90 seconds that a test has.
