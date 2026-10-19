@@ -1849,6 +1849,9 @@ struct Reach {
     waiting: Vec<u32>,
     walks: Vec<Walk>,
     targets: Vec<u32>,
+    /// The peers that were bound by version, each with its entry. A peer is looked up from its
+    /// entry as well, but most files have no entry that only such a lookup arrives at.
+    peers: Vec<(u32, DependencyID)>,
 }
 
 impl Reach {
@@ -1865,6 +1868,7 @@ impl Reach {
             waiting: Vec::new(),
             walks: Vec::with_capacity(entries + 1),
             targets: Vec::new(),
+            peers: Vec::new(),
         })
     }
 
@@ -2023,7 +2027,54 @@ impl Lookups<'_> {
                 open_bits[(hash >> 6 & 63) as usize] |= 1 << (hash & 63);
             }
         }
-        // Every entry that has one of those names.
+        // A stripped `catalog:` dependency stays unresolved, and so does one that the install
+        // that wrote the file did not resolve. Neither has an entry.
+        let has_no_entry = |dep_id: DependencyID| {
+            self.dependencies[dep_id as usize].version.tag == DependencyVersionTag::Uninitialized
+                || (!self.unresolved.is_empty() && self.unresolved.binary_search(&dep_id).is_ok())
+        };
+        // Looks up the peers of the live entries that have the name of an entry that is not
+        // live. Returns true if that makes an entry live.
+        let peer_lookups = |reach: &mut Reach, path_buf: &mut [u8]| {
+            let mut arrived: Vec<Slot> = Vec::new();
+            let Reach {
+                live, walks, peers, ..
+            } = reach;
+            peers.retain(|&(entry, dep_id)| {
+                let list_of = walks[entry as usize].list_of;
+                if !live.is_set(entry as usize)
+                    || (list_of != Slot::NO_ENTRY && !live.is_set(list_of as usize))
+                {
+                    return true;
+                }
+                let dep = &self.dependencies[dep_id as usize];
+                if open_bits[(dep.name_hash >> 6 & 63) as usize] & (1 << (dep.name_hash & 63)) != 0
+                    && let Ok((&slot, _)) = self.map.find_resolution(
+                        key_of(entry),
+                        dep,
+                        self.string_buf,
+                        path_buf,
+                        None,
+                    )
+                {
+                    arrived.push(slot);
+                }
+                false
+            });
+            let mut found = false;
+            for slot in arrived {
+                found |= reach.mark_slot(slot);
+            }
+            found
+        };
+        while peer_lookups(reach, path_buf) {
+            if reach.close() {
+                return Ok(None);
+            }
+        }
+
+        // Every entry that has the name of an entry that is not live. Within one name, an entry
+        // comes right before the entries below its folder.
         let mut named: Vec<(u64, u32)> = Vec::new();
         for entry in 0..self.rows.len() as u32 {
             if has_key(entry) {
@@ -2033,7 +2084,6 @@ impl Lookups<'_> {
                 }
             }
         }
-        // Within one name, an entry comes right before the entries below its folder.
         named.sort_unstable_by(|a, b| (a.0.cmp(&b.0)).then_with(|| key_of(a.1).cmp(key_of(b.1))));
 
         // The entries that repeat each package, together.
@@ -2049,17 +2099,11 @@ impl Lookups<'_> {
                 .find(|repeat| has_key(repeat.entry) && live.is_set(repeat.entry as usize))
                 .copied()
         };
-        // A stripped `catalog:` dependency stays unresolved, and so does one that the install
-        // that wrote the file did not resolve. Neither has an entry.
-        let has_no_entry = |dep_id: DependencyID| {
-            self.dependencies[dep_id as usize].version.tag == DependencyVersionTag::Uninitialized
-                || (!self.unresolved.is_empty() && self.unresolved.binary_search(&dep_id).is_ok())
-        };
 
         // Each waiting entry, and the entry whose dependency list it walked here.
         let mut walked: Vec<(u32, u32)> = Vec::new();
         loop {
-            let mut found = false;
+            let mut found = peer_lookups(reach, path_buf);
             for &(hash, entry) in &open {
                 if reach.live.is_set(entry as usize) {
                     continue;
@@ -2173,7 +2217,9 @@ impl Lookups<'_> {
             if !found {
                 break;
             }
-            reach.close();
+            if reach.close() {
+                return Ok(None);
+            }
         }
 
         let mut dead = reach.live.clone()?;
@@ -3516,16 +3562,8 @@ fn load_entries(
                     };
                     let res_id = match by_version {
                         Some(id) => {
-                            // Bound by version, but the install looked it up from here as well.
-                            if let Ok((&slot, _)) = pkg_map.find_resolution(
-                                pkg_path,
-                                dep,
-                                string_buf,
-                                &mut path_buf[..],
-                                None,
-                            ) && !listed_unresolved(dep_id)
-                            {
-                                reach.arrive(slot);
+                            if !listed_unresolved(dep_id) {
+                                reach.peers.push((entry, dep_id));
                             }
                             id
                         }
