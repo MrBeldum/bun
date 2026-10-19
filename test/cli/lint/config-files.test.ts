@@ -946,7 +946,9 @@ const ofResolvers = once(() => {
 test.concurrent.each(resolvers.map(([name, , expected], at) => [name, at, expected] as const))(
   "import/resolver: the package answers for a resolver that is not known here: %s",
   async (_, at, expected) => {
-    const { problems } = await ofResolvers();
+    const { problems, stderr, exitCode } = await ofResolvers();
+    // A run that is refused reports nothing, and nothing is what the rows for a known resolver expect.
+    expect({ stderr, exitCode }).toEqual({ stderr: `Linted ${resolvers.length} files`, exitCode: 1 });
     expect(problems.filter(it => it.startsWith(`${at}/`))).toEqual(expected.map(it => `${at}/${it}`));
   },
 );
