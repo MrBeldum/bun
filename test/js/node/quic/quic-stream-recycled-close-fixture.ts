@@ -5,9 +5,9 @@
 // streams and opens FRESH one-way streams of its own, which take the freed
 // blocks.
 //
-// Prints one JSON line: how many fresh streams the server opened, how many of
-// their bodies reached the client whole, and each fresh stream whose `closed`
-// settled before its body was written. A fresh stream that was falsely
+// Prints one JSON line: how many fresh streams the server opened, the ids of
+// the bodies that reached the client whole, and each fresh stream whose
+// `closed` settled before its body was written. A fresh stream that was falsely
 // reported closed loses its root, so the collection after each flight frees
 // it while lsquic still has its body to write.
 import { createPrivateKey } from "node:crypto";
@@ -28,7 +28,7 @@ const BODY = 65536;
 const transportParams = { maxIdleTimeout: 10, initialMaxStreamsUni: 1024 };
 
 let opened = 0;
-let delivered = 0;
+const delivered = new Set<number>();
 const closedBeforeSent: { id: number; sent: number; error?: string }[] = [];
 const failed = Promise.withResolvers<void>();
 let flightDelivered = Promise.withResolvers<void>();
@@ -83,8 +83,8 @@ const client = await connect(server.address!, {
     stream.closed.catch(() => {});
     read(stream).then(
       body => {
-        if (body.length === BODY) delivered++;
-        if (delivered === opened) flightDelivered.resolve();
+        if (body.length === BODY) delivered.add(body.readUInt32LE(0));
+        if (delivered.size === opened) flightDelivered.resolve();
       },
       () => {},
     );
@@ -109,7 +109,7 @@ for (let flight = 0; flight < FLIGHTS; flight++) {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-console.log(JSON.stringify({ opened, delivered, closedBeforeSent }));
+console.log(JSON.stringify({ opened, delivered: [...delivered].sort((a, b) => a - b), closedBeforeSent }));
 // After a false close the sessions cannot close in an orderly way.
 if (!ok) process.exit(1);
 await client.close();

@@ -376,6 +376,59 @@ describe("headers queued before the handshake", () => {
   });
 });
 
+// A stream opened above the peer's stream limit waits for the peer's next
+// grant. When it is destroyed while it waits, the grant goes to the stream
+// that waits behind it.
+describe("a stream destroyed before it opens", () => {
+  test("leaves the next grant to the stream queued behind it", async () => {
+    const received: string[] = [];
+    const gotThird = Promise.withResolvers<void>();
+    await using server = await listen(
+      serverSession => {
+        serverSession.closed.catch(() => {});
+        serverSession.onstream = stream => {
+          stream.closed.catch(() => {});
+          (async () => {
+            const chunks: Uint8Array[] = [];
+            for await (const batch of stream) chunks.push(...batch);
+            const body = Buffer.concat(chunks).toString();
+            received.push(body);
+            stream.writer.endSync();
+            if (body === "third") gotThird.resolve();
+          })().catch(() => {});
+        };
+      },
+      {
+        alpn: ["echo"],
+        sni: { "*": { keys: [key], certs: [cert] } },
+        transportParams: { maxIdleTimeout: 5, initialMaxStreamsBidi: 1 },
+      },
+    );
+
+    const client = await connect(server.address!, {
+      alpn: "echo",
+      servername: "localhost",
+      verifyPeer: "manual",
+      transportParams: { maxIdleTimeout: 5 },
+    } as SessionOptions);
+    client.closed.catch(() => {});
+    await client.opened;
+
+    const [first, second, third] = await Promise.all(
+      ["first", "second", "third"].map(body => client.createBidirectionalStream({ body: Buffer.from(body) })),
+    );
+    for (const stream of [first, second, third]) stream.closed.catch(() => {});
+    expect([second.pending, third.pending]).toEqual([true, true]);
+
+    second.destroy();
+    // The server answers the first stream with a FIN, then grants one more stream.
+    for await (const _ of first);
+    await gotThird.promise;
+    expect(received).toEqual(["first", "third"]);
+    client.close();
+  });
+});
+
 // A session keeps the events of its streams in a queue, and user code can
 // destroy a stream while its events still wait there. When the destroyed
 // stream is collected, the next stream of the session can get the same
@@ -396,10 +449,12 @@ describe.concurrent("a stream that takes the allocation of a destroyed stream", 
 
   // `stderr` holds the ExperimentalWarning of a clean run, or the report of a
   // crash. It is in the compared object so that a failure shows it. The
-  // timeout is for a debug build, where one child needs about 4 seconds.
+  // timeout is for a debug build, where a child needs 3 to 5.5 seconds.
   test("is not reported closed by the destroyed stream's close", async () => {
     expect(await runFixture("quic-stream-recycled-close-fixture.ts")).toEqual({
-      stdout: JSON.stringify({ opened: 16, delivered: 16, closedBeforeSent: [] }) + "\n",
+      stdout:
+        JSON.stringify({ opened: 16, delivered: Array.from({ length: 16 }, (_, id) => id), closedBeforeSent: [] }) +
+        "\n",
       stderr: expect.any(String),
       exitCode: 0,
     });
