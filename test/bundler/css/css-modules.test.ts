@@ -3,6 +3,17 @@ import { bunEnv, bunExe, tempDir } from "harness";
 import { join } from "node:path";
 import { itBundled } from "../expectBundled";
 
+// Each run of white space becomes one space, so `.a .b` and `.a.b` stay different.
+const oneLine = (text: string) => text.trim().replace(/\s+/g, " ");
+
+// A stylesheet on one line, with the module hash written as `HASH`. `local` is
+// a class that the stylesheet scopes.
+function scopedOnOneLine(css: string, local: string) {
+  const hash = css.match(new RegExp(`\\.${local}_([A-Za-z0-9_-]+)`))?.[1];
+  expect(hash, `.${local} should be scoped`).toBeString();
+  return oneLine(css.replaceAll(`_${hash}`, "_HASH"));
+}
+
 describe("css", () => {
   itBundled("css-module/GlobalPseudoFunction", {
     files: {
@@ -181,6 +192,96 @@ describe("css", () => {
       expect([...heroHashes]).toEqual([`#${hero![1]}`]);
       expect(css).not.toMatch(/\.btn\b[^_]/);
       expect(css).not.toMatch(/#hero\b[^_]/);
+    },
+  });
+
+  // `:global(...)` and `:local(...)` print as their argument. So a `&` that
+  // stands for a parent written with one, and a `:is()` around one, need `:is()`
+  // exactly when the argument needs it: when it has a combinator or starts with
+  // a type selector. An argument with a pseudo-element prints as written,
+  // because `:is()` cannot match a pseudo-element.
+  for (const backend of ["api", "cli"] as const) {
+    itBundled(`css-module/ParentWrittenWithGlobalOrLocal/${backend}`, {
+      backend,
+      files: {
+        "/entry.js": `
+          import styles from './styles.module.css';
+          console.log(JSON.stringify(styles));
+        `,
+        "/styles.module.css": `
+          :global(.a .b) { .q& { color: red } }
+          :global(.a .b) { .y & { color: orange } }
+          :global(div) { .x& { color: yellow } }
+          .w:is(:global(.a .b)) { color: green }
+          :local(.c .d) { .q2& { color: blue } }
+          :global(:global(.e .f)) { .q3& { color: pink } }
+          .p:global(.a .b) { .q4& { color: purple } }
+          :global(.g) { .n& { color: tan } .n2 & { color: teal } }
+          .w2:is(:global(.g)) { color: navy }
+          :global(.btn::before) { .dark & { color: gray } }
+          :global(.a .b) { @media print { .q5& { color: olive } } }
+          @scope (:global(.a .b)) to (.q6&) { .z { color: silver } }
+        `,
+      },
+      entryPoints: ["/entry.js"],
+      outdir: "/out",
+      onAfterBundle(api) {
+        expect(scopedOnOneLine(api.readFile("/out/entry.css"), "q")).toBe(
+          oneLine(`
+            /* styles.module.css */
+            .q_HASH:is(.a .b) { color: red; }
+            .y_HASH :is(.a .b) { color: orange; }
+            .x_HASH:is(div) { color: #ff0; }
+            .w_HASH:is(.a .b) { color: green; }
+            .q2_HASH:is(.c_HASH .d_HASH) { color: #00f; }
+            .q3_HASH:is(.e .f) { color: pink; }
+            .q4_HASH:is(.p_HASH.a .b) { color: purple; }
+            .n_HASH.g { color: tan; }
+            .n2_HASH .g { color: teal; }
+            .w2_HASH.g { color: navy; }
+            .dark_HASH .btn:before { color: gray; }
+            @media print {
+              .q5_HASH:is(.a .b) { color: olive; }
+            }
+            @scope (.a .b) to (.q6_HASH:is(.a .b)) {
+              .z_HASH { color: silver; }
+            }
+          `),
+        );
+      },
+    });
+  }
+
+  // The same with nesting kept. `:is()` stays around an argument that has a
+  // combinator or starts with a type selector, and goes when it is simple.
+  itBundled("css-module/ParentWrittenWithGlobalNestingKept", {
+    target: "bun",
+    files: {
+      "/entry.js": `
+        import styles from './styles.module.css';
+        console.log(JSON.stringify(styles));
+      `,
+      "/styles.module.css": `
+        :global(.a .b) { .q& { color: red } }
+        .w:is(:global(.a .b)) { color: green }
+        .foo:is(:global(input:checked)) { color: blue }
+        .w2:is(:global(.g)) { color: navy }
+      `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    onAfterBundle(api) {
+      expect(scopedOnOneLine(api.readFile("/out/entry.css"), "q")).toBe(
+        oneLine(`
+          /* styles.module.css */
+          .a .b {
+            .q_HASH& { color: red; }
+          }
+          .w_HASH:is(.a .b) { color: green; }
+          .foo_HASH:is(input:checked) { color: #00f; }
+          .w2_HASH.g { color: navy; }
+        `),
+      );
     },
   });
 
@@ -626,6 +727,35 @@ test("css-module/NoBundleHashesClassSymbols", async () => {
       opacity: 0;
     }
   `);
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+// With no link step a parent written with `:global(...)` still gets `:is()`
+// when its argument has a combinator.
+test("css-module/NoBundleParentWrittenWithGlobal", async () => {
+  using dir = tempDir("css-module-no-bundle-global-parent", {
+    "styles.module.css": `
+      :global(.a .b) { .q& { color: green } }
+      .w:is(:global(.a .b)) { color: blue }
+      :global(div) { .x& { color: pink } }
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "build", "--no-bundle", "styles.module.css"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(scopedOnOneLine(stdout, "q")).toBe(
+    oneLine(`
+      .q_HASH:is(.a .b) { color: green; }
+      .w_HASH:is(.a .b) { color: #00f; }
+      .x_HASH:is(div) { color: pink; }
+    `),
+  );
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });

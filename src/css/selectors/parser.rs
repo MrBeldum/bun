@@ -1834,17 +1834,6 @@ impl<Impl: BunSelectorImpl> GenericSelector<Impl> {
                 .all(|(a, b)| a.eql(b))
     }
 
-    pub(crate) fn has_combinator(&self) -> bool {
-        for c in &self.components {
-            if let GenericComponent::Combinator(comb) = c {
-                if comb.is_tree_combinator() {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     pub(crate) fn has_pseudo_element(&self) -> bool {
         self.specificity_and_flags.has_pseudo_element()
     }

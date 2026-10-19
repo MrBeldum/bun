@@ -133,7 +133,7 @@ fn downlevel_component<'bump>(
                 && !should_unwrap_is(selectors)
                 && 'brk: {
                     for selector in selectors.iter() {
-                        if selector.has_combinator() {
+                        if has_combinator(selector) {
                             break 'brk false;
                         }
                     }
@@ -1675,6 +1675,17 @@ pub(crate) fn should_unwrap_is(selectors: &[parser::Selector]) -> bool {
     false
 }
 
+/// The argument of `:local()` or `:global()`. The wrapper prints as its argument and nothing
+/// else, so the selector that holds the wrapper has what the argument has.
+fn scope_argument(component: &parser::Component) -> Option<&parser::Selector> {
+    match component {
+        Component::NonTsPseudoClass(
+            PseudoClass::Local { selector } | PseudoClass::Global { selector },
+        ) => Some(selector),
+        _ => None,
+    }
+}
+
 fn has_type_selector(selector: &parser::Selector) -> bool {
     let mut iter = selector.iter_raw_match_order();
     let first = iter.next();
@@ -1684,6 +1695,9 @@ fn has_type_selector(selector: &parser::Selector) -> bool {
     }
 
     is_type_selector(first)
+        || first
+            .and_then(scope_argument)
+            .is_some_and(has_type_selector)
 }
 
 fn is_namespace(component: Option<&parser::Component>) -> bool {
@@ -1710,16 +1724,21 @@ fn is_type_selector(component: Option<&parser::Component>) -> bool {
 }
 
 fn is_simple(selector: &parser::Selector) -> bool {
-    let mut iter = selector.iter_raw_parse_order_from(0);
-    let any_is_combinator = 'any_is_combinator: {
-        while let Some(component) = iter.next() {
-            if component.is_combinator() {
-                break 'any_is_combinator true;
-            }
-        }
-        break 'any_is_combinator false;
-    };
-    !any_is_combinator
+    selector
+        .iter_raw_parse_order_from(0)
+        .all(|component| match scope_argument(component) {
+            // `:is()` cannot match a pseudo-element, so an argument with one prints as written.
+            Some(argument) => is_simple(argument) || argument.has_pseudo_element(),
+            None => !component.is_combinator(),
+        })
+}
+
+/// Whether `selector` has a descendant, child or sibling combinator.
+fn has_combinator(selector: &parser::Selector) -> bool {
+    selector.components.iter().any(|component| match component {
+        Component::Combinator(combinator) => combinator.is_tree_combinator(),
+        _ => scope_argument(component).is_some_and(has_combinator),
+    })
 }
 
 struct CombinatorIter<'a> {
