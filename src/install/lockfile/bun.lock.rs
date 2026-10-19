@@ -1918,6 +1918,8 @@ impl<'a> Reach<'a> {
 
     /// `entry` has its key and has its turn. Returns true if its lookups count right away.
     fn has_turn(&mut self, entry: u32) -> bool {
+        // An entry that is live by its turn does not have to record its lookups.
+        self.follow();
         if !self.live[entry as usize] {
             return false;
         }
@@ -1937,19 +1939,24 @@ impl<'a> Reach<'a> {
         }
     }
 
-    /// Follows the lookups of each live entry that had its turn. Returns true if every entry is
-    /// live then.
+    /// Follows the lookups of each live entry that had its turn.
+    fn follow(&mut self) {
+        while let Some(entry) = self.pending.pop() {
+            if !self.is_trusted(entry) {
+                self.waiting.push(entry);
+                continue;
+            }
+            for index in self.starts[entry as usize]..self.starts[entry as usize + 1] {
+                self.mark(self.targets[index as usize]);
+            }
+        }
+    }
+
+    /// Follows the lookups of each live entry, after the turns of all of them. Returns true if
+    /// every entry is live then.
     fn close(&mut self) -> bool {
         loop {
-            while let Some(entry) = self.pending.pop() {
-                if !self.is_trusted(entry) {
-                    self.waiting.push(entry);
-                    continue;
-                }
-                for index in self.starts[entry as usize]..self.starts[entry as usize + 1] {
-                    self.mark(self.targets[index as usize]);
-                }
-            }
+            self.follow();
             let mut index = 0;
             while index < self.waiting.len() {
                 let entry = self.waiting[index];
