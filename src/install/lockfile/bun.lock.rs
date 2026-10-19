@@ -2033,7 +2033,8 @@ impl Lookups<'_> {
                 }
             }
         }
-        named.sort_unstable();
+        // Within one name, an entry comes right before the entries below its folder.
+        named.sort_unstable_by(|a, b| (a.0.cmp(&b.0)).then_with(|| key_of(a.1).cmp(key_of(b.1))));
 
         // The entries that repeat each package, together.
         let mut by_package: Vec<Repeat> = self.repeats.to_vec();
@@ -2065,16 +2066,29 @@ impl Lookups<'_> {
                 }
                 let (folder, name) = split_key(key_of(entry));
                 let from = named.partition_point(|&(other, _)| other < hash);
-                let is_above_live = (named[from..].iter())
-                    .take_while(|&&(other, _)| other == hash)
-                    .any(|&(_, other)| {
-                        let (below, other_name) = split_key(key_of(other));
-                        reach.live.is_set(other as usize)
-                            && other_name == name
-                            && below.len() > folder.len()
-                            && below.starts_with(folder)
-                            && (folder.is_empty() || below[folder.len()] == b'/')
+                let same_name = &named[from..];
+                let same_name =
+                    &same_name[..same_name.partition_point(|&(other, _)| other == hash)];
+                // With the same name, the keys that start with `<folder>/` are those below it.
+                let below = if folder.is_empty() {
+                    same_name
+                } else {
+                    let from = same_name.partition_point(|&(_, other)| {
+                        let key = key_of(other);
+                        if key.len() > folder.len() && key.starts_with(folder) {
+                            key[folder.len()] < b'/'
+                        } else {
+                            key <= folder
+                        }
                     });
+                    let below = &same_name[from..];
+                    &below[..below.partition_point(|&(_, other)| is_below(key_of(other), folder))]
+                };
+                let is_above_live = below.iter().any(|&(_, other)| {
+                    other != entry
+                        && reach.live.is_set(other as usize)
+                        && split_key(key_of(other)).1 == name
+                });
                 if is_above_live {
                     reach.mark(entry);
                     found = true;
