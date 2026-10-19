@@ -651,6 +651,75 @@ describe("receive backpressure", () => {
     expect(await delivered(pair.receiver, payload)).toEqual({ length: payload.length, same: true });
   });
 
+  // A client that resumes a session opens streams before the handshake ends.
+  // At its end lsquic gave every one of them the peer's limit for
+  // bidirectional streams, so a unidirectional one could send past its window.
+  test("a unidirectional stream that a client opens in 0-RTT stops at the window", async () => {
+    const payload = pattern(3 * WINDOW);
+    const unread = Promise.withResolvers<any>();
+    let sessions = 0;
+    const server = await listen(
+      (session: any) => {
+        session.onerror = () => {};
+        session.closed.catch(() => {});
+        const resumed = ++sessions === 2;
+        session.onstream = (stream: any) => {
+          keep(stream);
+          if (stream.direction === "bidi") stream.writer.endSync();
+          else if (resumed) unread.resolve(stream);
+        };
+      },
+      {
+        alpn: ["quic-test"],
+        sni: { "*": { keys: [key], certs: [cert] } },
+        transportParams: { maxIdleTimeout: 10, initialMaxStreamDataUni: WINDOW },
+      },
+    );
+    await using endpoints = new AsyncDisposableStack();
+    endpoints.defer(() => server.destroy());
+    const options = {
+      alpn: "quic-test",
+      reuseEndpoint: false,
+      servername: "localhost",
+      verifyPeer: "manual",
+      transportParams: { maxIdleTimeout: 10 },
+      onerror() {},
+    };
+    const roundTrip = async (session: any) => {
+      await keep(await session.createBidirectionalStream({ body: new Uint8Array(1) })).closed;
+    };
+
+    let ticket: Buffer | undefined;
+    const gotTicket = Promise.withResolvers<void>();
+    const gotToken = Promise.withResolvers<Buffer>();
+    const first = await connect(server.address!, {
+      ...options,
+      onsessionticket(value: Buffer) {
+        ticket = value;
+        gotTicket.resolve();
+      },
+      onnewtoken: gotToken.resolve,
+    } as SessionOptions);
+    endpoints.use(first.endpoint!);
+    await first.opened;
+    const [token] = await Promise.all([gotToken.promise, gotTicket.promise]);
+    first.destroy();
+
+    const second = await connect(server.address!, { ...options, sessionTicket: ticket, token } as SessionOptions);
+    const secondEndpoint = second.endpoint!;
+    endpoints.defer(() => secondEndpoint.destroy());
+    second.closed.catch(() => {});
+    const sender = keep(await second.createUnidirectionalStream({ body: payload }));
+    const { earlyDataAccepted } = await second.opened;
+    expect(earlyDataAccepted).toBe(true);
+
+    while (Number(sender.stats.bytesSent) < WINDOW) await roundTrip(second);
+    await roundTrip(second);
+    await roundTrip(second);
+    expect(Number(sender.stats.bytesSent)).toBe(WINDOW);
+    expect(await delivered(await unread.promise, payload)).toEqual({ length: payload.length, same: true });
+  });
+
   // The header block is larger than the stream window. lsquic takes HTTP/3
   // framing and header blocks out of the stream by itself, so they never wait
   // for a reader.
