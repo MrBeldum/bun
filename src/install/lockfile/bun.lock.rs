@@ -1911,6 +1911,14 @@ impl<'a> Reach<'a> {
         maker == entry || maker == Slot::NO_ENTRY || self.live[maker as usize]
     }
 
+    /// Returns true if the lookups of `entry` count: it is live, it is at a key of its own, and
+    /// the entry whose dependency list it walks is live.
+    fn looks_up(&self, entry: u32) -> bool {
+        self.live[entry as usize]
+            && self.keyed[entry as usize] != invalid_package_id
+            && self.is_trusted(entry)
+    }
+
     /// The lookups that follow are those of the next entry.
     fn next_entry(&mut self) {
         self.starts.push(self.targets.len() as u32);
@@ -2211,14 +2219,12 @@ impl Lookups<'_> {
     ) -> bool {
         let mut found = false;
         for entry in 0..self.rows.len() {
-            let package = reach.keyed[entry];
-            if package == invalid_package_id
-                || !reach.live[entry]
-                || scanned.as_deref().is_some_and(|scanned| scanned[entry])
-                || !reach.is_trusted(entry as u32)
+            if scanned.as_deref().is_some_and(|scanned| scanned[entry])
+                || !reach.looks_up(entry as u32)
             {
                 continue;
             }
+            let package = reach.keyed[entry];
             if let Some(scanned) = scanned.as_deref_mut() {
                 scanned[entry] = true;
             }
@@ -2279,10 +2285,8 @@ impl Lookups<'_> {
         // Most files have no entry that is not live after these.
         for index in 0..reach.peers.len() {
             let (entry, dep_id) = reach.peers[index];
-            if open.has_name(self.dependencies[dep_id as usize].name_hash)
-                && reach.live[entry as usize]
-                && reach.is_trusted(entry)
-            {
+            let name_hash = self.dependencies[dep_id as usize].name_hash;
+            if open.has_name(name_hash) && reach.looks_up(entry) {
                 let (key, peer) = (self.key_of(entry), DependencySlice::new(dep_id, 1));
                 found |= self.look_up(reach, &mut open, key, false, peer, Stops::Each);
             }
