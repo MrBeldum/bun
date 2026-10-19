@@ -650,14 +650,15 @@ describe("receive backpressure", () => {
   // Inside a QUIC callback the endpoint sends the new limit when the callback
   // ends. A read outside of one has to start the send itself.
   test.each([
-    { reader: "takes more than half of the window", window: 20, packet: true },
-    { reader: "takes less than half of the window", window: 40, packet: false },
+    { reader: "takes more than half of the window", queued: 20, window: 20, packet: true },
+    // bun has read more than half of the window from lsquic. That does not count.
+    { reader: "takes less than half of the window", queued: 24, window: 40, packet: false },
     // One piece of room: a stream at its limit sends its FIN with the next limit.
-    { reader: "starts after the end of the body", window: 21, end: true, packet: false },
-    { reader: "starts after stopSending()", window: 20, stop: true, packet: false },
+    { reader: "starts after the end of the body", queued: 20, window: 21, end: true, packet: false },
+    { reader: "starts after stopSending()", queued: 20, window: 20, stop: true, packet: false },
   ])("a read outside a QUIC callback sends a packet at once ($packet) when the reader $reader", async row => {
-    // 20 pieces wait in a window of `row.window` pieces.
-    await using pair = await pieces(20, row.window * piece.length);
+    // `row.queued` pieces wait in a window of `row.window` pieces.
+    await using pair = await pieces(row.queued, row.window * piece.length);
     if (row.end) {
       pair.sender.writer.endSync();
       await pair.roundTrip();
