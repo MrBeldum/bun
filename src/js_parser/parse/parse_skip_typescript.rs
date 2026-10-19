@@ -233,6 +233,22 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         Ok(())
     }
 
+    /// `parseFunctionOrConstructorType`, after "new" and the type parameters.
+    /// esbuild also takes a parenthesized type here, which makes
+    /// "a << T > (b.c) > (c)" the call "a(c)".
+    fn skip_type_script_fn_or_constructor_type_tail<const GET_METADATA: bool>(
+        &mut self,
+        result: Option<&mut Metadata>,
+    ) -> Result<(), Error> {
+        self.skip_typescript_fn_args()?;
+        self.lexer.expect(T::TEqualsGreaterThan)?;
+        self.skip_typescript_return_type()?;
+        if GET_METADATA {
+            *result.expect("infallible: GET_METADATA implies Some") = Metadata::MFunction;
+        }
+        Ok(())
+    }
+
     // Rust cannot express a const-generic-dependent param type on stable; we use
     // `Option<&mut Metadata>` and require callers to pass `Some` iff `GET_METADATA == true`.
     // The const generic is kept so `if GET_METADATA { ... }` branches monomorphize away.
@@ -250,6 +266,11 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         if !self.stack_check.is_safe_to_recurse() {
             return Err(crate::Error::StackOverflow);
         }
+
+        // `parseEntityName`: a "." continues a name, "import(...)" or "const", and
+        // no other type. esbuild takes it after every type, which makes
+        // "a < this.b > (c)" the call "a(c)".
+        let mut is_entity_name = false;
 
         loop {
             match self.lexer.token {
@@ -312,6 +333,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                         self.log()
                             .add_range_error(Some(self.source), r, b"Unexpected \"const\"");
                     }
+                    is_entity_name = true;
                 }
 
                 T::TThis => {
@@ -387,6 +409,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     }
 
                     self.lexer.expect(T::TCloseParen)?;
+                    is_entity_name = true;
                 }
                 T::TNew => {
                     // "new () => Foo"
@@ -404,14 +427,18 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     let _ = self.skip_type_script_type_parameters(
                         TypeParameterFlag::ALLOW_CONST_MODIFIER,
                     )?;
-                    self.skip_type_script_paren_or_fn_type::<GET_METADATA>(result.as_deref_mut())?;
+                    self.skip_type_script_fn_or_constructor_type_tail::<GET_METADATA>(
+                        result.as_deref_mut(),
+                    )?;
                 }
                 T::TLessThan => {
                     // "<T>() => Foo<T>"
                     let _ = self.skip_type_script_type_parameters(
                         TypeParameterFlag::ALLOW_CONST_MODIFIER,
                     )?;
-                    self.skip_type_script_paren_or_fn_type::<GET_METADATA>(result.as_deref_mut())?;
+                    self.skip_type_script_fn_or_constructor_type_tail::<GET_METADATA>(
+                        result.as_deref_mut(),
+                    )?;
                 }
                 T::TOpenParen => {
                     // "(number | string)"
@@ -644,6 +671,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                             self.lexer.next()?;
                         }
                     }
+                    is_entity_name = true;
 
                     // "function assert(x: any): x is boolean"
                     if self.lexer.is_contextual_keyword(b"is") && !self.lexer.has_newline_before {
@@ -715,14 +743,40 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     }
 
                     while self.lexer.token != T::TCloseBracket {
+                        // `isTupleElementName`: after "..." a keyword is a label. Without
+                        // this, the default arm reports it, as esbuild does.
+                        let mut is_keyword_label = false;
                         if self.lexer.token == T::TDotDotDot {
                             self.lexer.next()?;
+                            is_keyword_label = self.lexer.is_identifier_or_keyword()
+                                && !matches!(
+                                    self.lexer.token,
+                                    T::TIdentifier
+                                        | T::TConst
+                                        | T::TFalse
+                                        | T::TFunction
+                                        | T::TImport
+                                        | T::TNew
+                                        | T::TNull
+                                        | T::TThis
+                                        | T::TTrue
+                                        | T::TTypeof
+                                        | T::TVoid
+                                );
                         }
-                        self.skip_type_script_type_with_opts::<false>(
-                            Level::Lowest,
-                            SkipTypeOptionsBitset::only(SkipTypeOptions::AllowTupleLabels),
-                            None,
-                        )?;
+                        if is_keyword_label {
+                            // "[...default: number[]]"
+                            self.lexer.next()?;
+                            if self.lexer.token != T::TColon && self.lexer.token != T::TQuestion {
+                                self.lexer.expect(T::TColon)?;
+                            }
+                        } else {
+                            self.skip_type_script_type_with_opts::<false>(
+                                Level::Lowest,
+                                SkipTypeOptionsBitset::only(SkipTypeOptions::AllowTupleLabels),
+                                None,
+                            )?;
+                        }
                         if self.lexer.token == T::TQuestion {
                             self.lexer.next()?;
                         }
@@ -892,6 +946,9 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     self.lexer.next()?;
                 }
                 T::TDot => {
+                    if !is_entity_name {
+                        return Ok(());
+                    }
                     self.lexer.next()?;
                     if !self.lexer.is_identifier_or_keyword() {
                         self.lexer.expect(T::TIdentifier)?;
@@ -930,6 +987,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     if !self.lexer.has_newline_before {
                         let _ = self.skip_type_script_type_arguments::<false, false>()?;
                     }
+                    continue;
                 }
                 T::TOpenBracket => {
                     // "{ ['x']: string \n ['y']: string }" must not become a single type
@@ -1018,6 +1076,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     return Ok(());
                 }
             }
+            is_entity_name = false;
         }
     }
 

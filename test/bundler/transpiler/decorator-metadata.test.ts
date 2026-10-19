@@ -543,4 +543,30 @@ describe("decorator metadata", () => {
     expect(Reflect.getMetadata("design:type", A.prototype, "method4")).toBe(Function);
     expect(Reflect.getMetadata("design:returntype", A.prototype, "method4")).toBeUndefined();
   });
+
+  test("constructor types and generic function types", () => {
+    function d1(target: any, key: string) {}
+
+    class A {
+      @d1
+      // @ts-ignore
+      prop0: new () => String;
+
+      @d1
+      // @ts-ignore
+      prop1: abstract new (a0: number) => String;
+
+      @d1
+      // @ts-ignore
+      prop2: <T>(a0: T) => T;
+
+      @d1
+      // @ts-ignore
+      prop3: new <T>(a0: T) => T;
+    }
+
+    expect(
+      ["prop0", "prop1", "prop2", "prop3"].map(key => Reflect.getMetadata("design:type", A.prototype, key)),
+    ).toEqual([Function, Function, Function, Function]);
+  });
 });
