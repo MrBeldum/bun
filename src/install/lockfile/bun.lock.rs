@@ -2018,29 +2018,30 @@ struct Dead {
 
 /// An entry that is not live.
 #[derive(Clone, Copy)]
-struct Open {
-    /// The hash of its name.
+struct Open<'a> {
+    /// The hash of `name`.
     hash: u64,
     entry: u32,
-    /// The length of the folder that it is in. 0 if it is in none.
-    folder: u32,
+    /// The two parts of its key. `folder` is empty if it is in no folder.
+    folder: &'a [u8],
+    name: &'a [u8],
 }
 
 /// The entries that are not live, by the hash of their name.
-struct OpenEntries {
-    by_name: Vec<Open>,
+struct OpenEntries<'a> {
+    by_name: Vec<Open<'a>>,
     /// One bit for the hash of each name.
     names: [u64; 64],
 }
 
-impl OpenEntries {
-    fn named(&self, hash: u64) -> &[Open] {
+impl<'a> OpenEntries<'a> {
+    /// The entries from the first one that has this hash.
+    fn named(&self, hash: u64) -> &[Open<'a>] {
         if self.names[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) == 0 {
             return &[];
         }
         let from = self.by_name.partition_point(|open| open.hash < hash);
-        let len = self.by_name[from..].partition_point(|open| open.hash == hash);
-        &self.by_name[from..from + len]
+        &self.by_name[from..]
     }
 }
 
@@ -2144,7 +2145,7 @@ impl Lookups<'_> {
     fn look_up(
         &self,
         reach: &mut Reach<'_>,
-        open: &OpenEntries,
+        open: &OpenEntries<'_>,
         key: &[u8],
         // A workspace looks in its own folder and at the root only.
         is_member: bool,
@@ -2155,27 +2156,23 @@ impl Lookups<'_> {
         for dep_id in list.begin()..list.end() {
             let dep = &self.dependencies[dep_id as usize];
             let named = open.named(dep.name_hash);
-            if named.is_empty() || self.has_no_entry(dep_id) {
+            if named.first().is_none_or(|open| open.hash != dep.name_hash)
+                || self.has_no_entry(dep_id)
+            {
                 continue;
             }
             let name = dep.name.slice(self.string_buf);
             let is_stopped = dep.behavior.is_optional_peer() && !is_member;
-            for other in named {
-                if reach.live[other.entry as usize] {
-                    continue;
-                }
-                let other_key = self.key_of(other.entry);
-                let (folder, other_name) = match other.folder as usize {
-                    0 => (&other_key[..0], other_key),
-                    folder => (&other_key[..folder], &other_key[folder + 1..]),
-                };
+            for open in named.iter().take_while(|open| open.hash == dep.name_hash) {
+                let folder = open.folder;
                 let is_above =
                     folder.is_empty() || key == folder || (!is_member && is_below(key, folder));
                 if is_above
-                    && other_name == name
+                    && !reach.live[open.entry as usize]
+                    && open.name == name
                     && !(is_stopped && self.stops_below(key, folder, stops, reach))
                 {
-                    found |= reach.mark(other.entry);
+                    found |= reach.mark(open.entry);
                 }
             }
         }
@@ -2187,7 +2184,7 @@ impl Lookups<'_> {
     fn look_up_each(
         &self,
         reach: &mut Reach<'_>,
-        open: &OpenEntries,
+        open: &OpenEntries<'_>,
         mut scanned: Option<&mut [bool]>,
         stops: Stops,
     ) -> bool {
@@ -2238,7 +2235,8 @@ impl Lookups<'_> {
                 open.by_name.push(Open {
                     hash,
                     entry: entry as u32,
-                    folder: folder.len() as u32,
+                    folder,
+                    name,
                 });
                 open.names[(hash >> 6 & 63) as usize] |= 1 << (hash & 63);
             }
