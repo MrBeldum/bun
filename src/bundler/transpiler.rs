@@ -1920,7 +1920,7 @@ fn parse_data_loader<'a>(
                         ..Default::default()
                     };
 
-                    let ref_ = bun_ast::Ref::init(count as u32, 0, false);
+                    let ref_ = bun_ast::Ref::init(count as u32, 0);
                     decls[count] = bun_ast::G::Decl {
                         binding: bun_ast::Binding::alloc(
                             arena,
