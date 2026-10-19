@@ -2017,6 +2017,7 @@ struct Dead {
 }
 
 /// An entry that is not live.
+#[derive(Clone, Copy)]
 struct Open<'a> {
     /// The hash of `name`.
     hash: u64,
@@ -2026,45 +2027,21 @@ struct Open<'a> {
     name: &'a [u8],
 }
 
-/// The entries that are not live.
+/// The entries that are not live, by the hash of their name.
 struct OpenEntries<'a> {
-    /// Those of one name together, with the shortest folder first.
     by_name: Vec<Open<'a>>,
-    /// The hash of each name, and where its entries are in `by_name`.
-    names: Vec<(u64, core::ops::Range<usize>)>,
     /// One bit for the hash of each name.
-    name_bits: [u64; 64],
+    names: [u64; 64],
 }
 
 impl<'a> OpenEntries<'a> {
-    fn init(mut by_name: Vec<Open<'a>>) -> OpenEntries<'a> {
-        by_name.sort_unstable_by_key(|open| (open.hash, open.folder.len(), open.entry));
-        let mut names: Vec<(u64, core::ops::Range<usize>)> = Vec::new();
-        let mut name_bits = [0u64; 64];
-        let mut start = 0;
-        for of_name in by_name.chunk_by(|a, b| a.hash == b.hash) {
-            let hash = of_name[0].hash;
-            names.push((hash, start..start + of_name.len()));
-            name_bits[(hash >> 6 & 63) as usize] |= 1 << (hash & 63);
-            start += of_name.len();
-        }
-        OpenEntries {
-            by_name,
-            names,
-            name_bits,
-        }
-    }
-
-    /// The entries whose name has this hash.
+    /// The entries from the first one that has this hash.
     fn named(&self, hash: u64) -> &[Open<'a>] {
-        if self.name_bits[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) == 0 {
+        if self.names[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) == 0 {
             return &[];
         }
-        let at = self.names.partition_point(|(other, _)| *other < hash);
-        match self.names.get(at) {
-            Some((found, range)) if *found == hash => &self.by_name[range.clone()],
-            _ => &[],
-        }
+        let from = self.by_name.partition_point(|open| open.hash < hash);
+        &self.by_name[from..]
     }
 }
 
@@ -2179,22 +2156,19 @@ impl Lookups<'_> {
         for dep_id in list.begin()..list.end() {
             let dep = &self.dependencies[dep_id as usize];
             let named = open.named(dep.name_hash);
-            if named.is_empty() || self.has_no_entry(dep_id) {
+            if named.first().is_none_or(|open| open.hash != dep.name_hash)
+                || self.has_no_entry(dep_id)
+            {
                 continue;
             }
             let name = dep.name.slice(self.string_buf);
             let is_stopped = dep.behavior.is_optional_peer() && !is_member;
-            for open in named {
+            for open in named.iter().take_while(|open| open.hash == dep.name_hash) {
                 let folder = open.folder;
-                if folder.len() > key.len() {
-                    break;
-                }
-                if reach.live[open.entry as usize] {
-                    continue;
-                }
                 let is_above =
                     folder.is_empty() || key == folder || (!is_member && is_below(key, folder));
                 if is_above
+                    && !reach.live[open.entry as usize]
                     && open.name == name
                     && !(is_stopped && self.stops_below(key, folder, stops, reach))
                 {
@@ -2250,19 +2224,24 @@ impl Lookups<'_> {
     ) -> Result<Option<Dead>, bun_alloc::AllocError> {
         let count = self.rows.len();
 
-        let mut open: Vec<Open<'_>> = Vec::with_capacity(reach.open);
+        let mut open = OpenEntries {
+            by_name: Vec::with_capacity(reach.open),
+            names: [0; 64],
+        };
         for entry in 0..count {
             if !reach.live[entry] {
                 let (folder, name) = split_key(self.key_of(entry as u32));
-                open.push(Open {
-                    hash: StringBuilder::string_hash(name),
+                let hash = StringBuilder::string_hash(name);
+                open.by_name.push(Open {
+                    hash,
                     entry: entry as u32,
                     folder,
                     name,
                 });
+                open.names[(hash >> 6 & 63) as usize] |= 1 << (hash & 63);
             }
         }
-        let open = OpenEntries::init(open);
+        (open.by_name).sort_unstable_by_key(|open| (open.hash, open.entry));
 
         // A workspace looks up its dependencies from `<name>`, or from `./<name>` if a
         // dependency of the root has the key with its name.
