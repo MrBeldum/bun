@@ -4471,7 +4471,11 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         // i.e. import {graphql} "react-relay"
 
         // arena-owned `StoreSlice<ClauseItem>` valid for parser 'a.
-        if remap_count > 0 && stmt.items.is_empty() && stmt.default_name.is_none() {
+        if remap_count > 0
+            && stmt.items.is_empty()
+            && stmt.default_name.is_none()
+            && stmt.star_name_loc.is_empty()
+        {
             self.import_records.items_mut()[stmt.import_record_index as usize]
                 .path
                 .namespace = crate::Macro::NAMESPACE;
@@ -4502,6 +4506,144 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         self.import_items_for_namespace
             .insert(stmt.namespace_ref, item_refs);
         Ok(self.s(stmt, loc))
+    }
+
+    /// A macro import is removed, and only a call of it is replaced: the call un-counts its target. A use that the
+    /// visit pass still counts is a name that the output would not declare.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn reject_macro_value_uses(&mut self, parts: [&[js_ast::Part]; 3]) {
+        let has_use = |this: &Self, r#ref: Ref| {
+            this.symbols[r#ref.inner_index() as usize].use_count_estimate != 0
+        };
+        if !self
+            .macro_
+            .refs
+            .keys()
+            .iter()
+            .any(|r#ref| has_use(self, *r#ref))
+        {
+            return;
+        }
+        if self.options.features.is_macro_runtime {
+            // No call is replaced inside a macro, so this output must not answer a load outside of one.
+            #[cfg(not(target_arch = "wasm32"))]
+            if bun_core::feature_flags::RUNTIME_TRANSPILER_CACHE {
+                if let Some(cache) = self.options.features.runtime_transpiler_cache_mut() {
+                    cache.input_hash = None;
+                }
+            }
+            return;
+        }
+        let located = crate::scan::scan_macro_refs::locate_macro_refs(parts, &self.macro_.refs);
+        for &(r#ref, loc) in &located {
+            if has_use(self, r#ref) {
+                self.report_macro_value_use(r#ref, Some(loc));
+            }
+        }
+        // The visit pass can count a use and then fold its node away.
+        for i in 0..self.macro_.refs.count() {
+            let r#ref = self.macro_.refs.keys()[i];
+            if has_use(self, r#ref) && !located.iter().any(|(found, _)| found.eql(r#ref)) {
+                self.report_macro_value_use(r#ref, None);
+            }
+        }
+    }
+
+    #[cold]
+    fn report_macro_value_use(&mut self, r#ref: Ref, use_loc: Option<bun_ast::Loc>) {
+        let data = *self.macro_.refs.get(&r#ref).expect("a key of macro_.refs");
+        let symbol = &self.symbols[r#ref.inner_index() as usize];
+        let name: &'a [u8] = symbol.original_name.slice();
+        // Only a binding that a macro remap replaces is declared as an import.
+        let is_remapped = symbol.kind == js_ast::symbol::Kind::Import;
+        let import_range = match self.module_scope().members.get(name) {
+            Some(member) if member.ref_.eql(r#ref) => {
+                js_lexer::range_of_identifier(self.source, member.loc)
+            }
+            _ => bun_ast::Range::NONE,
+        };
+        let path = self.import_records.items()[data.import_record_id as usize]
+            .path
+            .text;
+        let (name, path) = (bstr::BStr::new(name), bstr::BStr::new(path));
+
+        let mut notes = Vec::<bun_ast::Data>::with_capacity(2);
+        if use_loc.is_some() {
+            let mut removed = Vec::<u8>::new();
+            let _ = if is_remapped {
+                write!(
+                    &mut removed,
+                    "Bun removes this import of \"{name}\" because a macro remap replaces it with \"{path}\""
+                )
+            } else {
+                write!(
+                    &mut removed,
+                    "Bun removes this macro import of \"{name}\" from \"{path}\""
+                )
+            };
+            notes.push(bun_ast::range_data(
+                Some(self.source),
+                import_range,
+                removed,
+            ));
+        }
+        let mut remedy = Vec::<u8>::new();
+        let _ = write!(
+            &mut remedy,
+            "Bun replaces each call of a macro with its result. To inline a value, call a macro that returns it. To use \"{name}\" at runtime, {}.",
+            if is_remapped {
+                "remove its macro remap"
+            } else {
+                "add a regular import of it"
+            }
+        );
+        notes.push(bun_ast::range_data(None, bun_ast::Range::NONE, remedy));
+
+        match use_loc {
+            Some(loc) => self.log().add_range_error_fmt_with_notes(
+                Some(self.source),
+                js_lexer::range_of_identifier(self.source, loc),
+                notes.into_boxed_slice(),
+                format_args!("\"{name}\" is a macro import and is not defined at runtime"),
+            ),
+            None => self.log().add_range_error_fmt_with_notes(
+                Some(self.source),
+                import_range,
+                notes.into_boxed_slice(),
+                format_args!(
+                    "\"{name}\" is a macro import and is not defined at runtime, but this file uses it outside of a call"
+                ),
+            ),
+        }
+    }
+
+    /// The parse pass counts the name of a decorator-metadata type as a use. `reject_macro_value_uses` reads what the
+    /// visit pass counts.
+    #[cold]
+    pub(crate) fn reset_macro_use_counts(&mut self) {
+        for i in 0..self.macro_.refs.count() {
+            let r#ref = self.macro_.refs.keys()[i];
+            self.symbols[r#ref.inner_index() as usize].use_count_estimate = 0;
+        }
+    }
+
+    /// A type that is named before the import statement is an unbound symbol linked to the binding.
+    fn is_macro_ref(&self, r#ref: Ref) -> bool {
+        if self.macro_.refs.is_empty() {
+            return false;
+        }
+        let mut r#ref = r#ref;
+        loop {
+            if self.macro_.refs.contains_key(&r#ref) {
+                return true;
+            }
+            let symbol = &self.symbols[r#ref.inner_index() as usize];
+            if !symbol.has_link() {
+                return false;
+            }
+            r#ref = symbol.link.get();
+        }
     }
 
     #[cold]
@@ -7854,6 +7996,9 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 self.maybe_defined_helper(e)?
             }
             M::MPromise => ident!(b"Promise"),
+            // A macro import is not defined at runtime.
+            M::MIdentifier(ref_) if self.is_macro_ref(ref_) => ident!(b"Object"),
+            M::MDot(ref refs) if self.is_macro_ref(refs[0]) => ident!(b"Object"),
             M::MIdentifier(ref_) => {
                 self.record_usage(ref_);
                 let e = if self.is_import_item.contains_key(&ref_) {

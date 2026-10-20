@@ -965,6 +965,10 @@ impl<'a> Parser<'a> {
         let mut visit_tracer = bun_core::perf::trace("JSParser::visit");
         p.prepare_for_visit_pass()?;
 
+        if TS && P::<TS, false>::ALLOW_MACROS && !p.macro_.refs.is_empty() {
+            p.reset_macro_use_counts();
+        }
+
         if p.options.features.react_compiler.is_enabled() {
             let rc_options = bun_react_compiler::ReactCompilerOptions {
                 enabled: true,
@@ -1213,6 +1217,10 @@ impl<'a> Parser<'a> {
         }
 
         visit_tracer.end();
+
+        if P::<TS, false>::ALLOW_MACROS && !p.macro_.refs.is_empty() {
+            p.reject_macro_value_uses([&before, &parts, &after]);
+        }
 
         // If there were errors while visiting, also halt here
         if p.log().errors > orig_error_count {
