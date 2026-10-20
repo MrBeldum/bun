@@ -670,17 +670,34 @@ describe.each(implementations)("ws client events ($name)", ({ ws: implementation
     );
 
     test.each([
-      { name: "onerror", listen: (ws, listener) => (ws.onerror = listener) },
-      { name: "addEventListener()", listen: (ws, listener) => ws.addEventListener("error", listener) },
-    ] as { name: string; listen(ws: WsSocket, listener: (event: any) => void): unknown }[])(
+      {
+        name: "onerror",
+        listen: (ws, listener) => (ws.onerror = listener),
+        expected: [`ErrorEvent ${connectionRefused}`],
+      },
+      {
+        name: "addEventListener()",
+        listen: (ws, listener) => ws.addEventListener("error", listener),
+        expected: [`ErrorEvent ${connectionRefused}`],
+      },
+      // oven-sh/bun#46222: once("error") must fire exactly once on a failed connection. A second 'error' emit would
+      // find no listener left, so EventEmitter would throw it as an unhandled 'error'.
+      {
+        name: "once()",
+        listen: (ws, listener) => ws.once("error", listener),
+        expected: [connectionRefused],
+      },
+    ] as { name: string; listen(ws: WsSocket, listener: (event: any) => void): unknown; expected: string[] }[])(
       "$name alone is enough to handle a refused connection",
-      async ({ listen }) => {
+      async ({ listen, expected }) => {
         await using target = await refusingUrl();
         const ws = new WebSocket(target.url);
         const seen: string[] = [];
-        listen(ws, event => seen.push(`${event.constructor.name} ${showError(event.error)}`));
+        listen(ws, event =>
+          seen.push(event instanceof Error ? showError(event) : `${event.constructor.name} ${showError(event.error)}`),
+        );
         await nextEvent(ws, "close");
-        expect(seen).toEqual([`ErrorEvent ${connectionRefused}`]);
+        expect(seen).toEqual(expected);
       },
     );
 

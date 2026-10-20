@@ -20,6 +20,7 @@ import {
   type Payload,
   reasonTooLong,
   recordEvents,
+  showError,
   showFrame,
   tryCall,
   validCloseCalls,
@@ -500,6 +501,24 @@ describe.each(implementations)("ws client close ($name)", ({ ws: implementation,
         expect((await client.peer.connection()).headLines[0]).toBe("GET /second HTTP/1.1");
       } finally {
         second.on("error", () => {}).terminate();
+      }
+    });
+
+    // oven-sh/bun#46222: with only a once("error") listener, a second 'error' emit would find no listener left and
+    // throw as an unhandled 'error', crashing the process.
+    test("once('error') fires exactly once when close() runs before the connection is established", async () => {
+      const peer = await createPeer({ respond: () => null });
+      try {
+        const ws = new WebSocket(peer.url);
+        const seen: string[] = [];
+        ws.once("error", err => seen.push(`error ${showError(err)}`));
+        const closed = nextEvent(ws, "close");
+        ws.close();
+        const [code] = await closed;
+        expect(seen).toEqual(['error Error "WebSocket was closed before the connection was established"']);
+        expect(code).toBe(1006);
+      } finally {
+        await peer[Symbol.asyncDispose]();
       }
     });
 
