@@ -2875,6 +2875,17 @@ where
                 // If we immediately have the value available, we can skip the extra event loop tick
                 match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
                     jsc::PromiseResult::Pending => {
+                        // A promise with its own `then()` can start its work there (`Bun.$`, a `Bun.SQL` query).
+                        if promise.has_custom_then(this.global_this()) {
+                            match ctx.follow_then(this, response_value) {
+                                Followed::No => {}
+                                Followed::By(follower) => {
+                                    response_value = follower;
+                                    continue;
+                                }
+                                Followed::Gone => return,
+                            }
+                        }
                         let cell = ctx.create_promise_cell(this.global_this());
                         response_value.then_with_value(
                             this.global_this(),
