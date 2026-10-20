@@ -1177,16 +1177,18 @@ describe("yarn berry migration", () => {
       [`no-deps@${registry}no-deps/-/no-deps-2.0.0.tgz`]: "patches/no-deps.patch",
     });
     const bunLock = await bunLockOf(dir);
-    expect(bunLock).toContain(`"no-deps": ["no-deps@http://localhost:1234/no-deps/-/no-deps-2.0.0.tgz", {}]`);
+    expect(bunLock).toContain(
+      `"no-deps": ["no-deps@http://localhost:1234/no-deps/-/no-deps-2.0.0.tgz", { "version": "2.0.0" }]`,
+    );
     expect(bunLock).toContain(`"no-deps@http://localhost:1234/no-deps/-/no-deps-2.0.0.tgz": "patches/no-deps.patch",`);
     expect(bunLock).toContain(
-      `"pkg-a": ["pkg-a@git+ssh://git@example.com/org/pkg-a.git#0123456789abcdef0123456789abcdef01234567", { "dependencies": { "no-deps": "http://localhost:1234/no-deps/-/no-deps-2.0.0.tgz", "pkg-b": "^2.0.0" } }, "0123456789abcdef0123456789abcdef01234567"]`,
+      `"pkg-a": ["pkg-a@git+ssh://git@example.com/org/pkg-a.git#0123456789abcdef0123456789abcdef01234567", { "version": "1.0.0", "dependencies": { "no-deps": "http://localhost:1234/no-deps/-/no-deps-2.0.0.tgz", "pkg-b": "^2.0.0" } }, "0123456789abcdef0123456789abcdef01234567"]`,
     );
     expect(bunLock).toContain(
-      `"pkg-b": ["pkg-b@git+ssh://git@example.com/org/pkg-b.git#89abcdef0123456789abcdef0123456789abcdef", {}, "89abcdef0123456789abcdef0123456789abcdef"]`,
+      `"pkg-b": ["pkg-b@git+ssh://git@example.com/org/pkg-b.git#89abcdef0123456789abcdef0123456789abcdef", { "version": "2.0.0" }, "89abcdef0123456789abcdef0123456789abcdef"]`,
     );
     expect(bunLock).toContain(
-      `"hue": ["hue@git+https://github.com/org/hue.git#ec3d1d18f73ab023b1fa3e31e1f4316f476566a5", {}, "ec3d1d18f73ab023b1fa3e31e1f4316f476566a5"]`,
+      `"hue": ["hue@git+https://github.com/org/hue.git#ec3d1d18f73ab023b1fa3e31e1f4316f476566a5", { "version": "0.2.3" }, "ec3d1d18f73ab023b1fa3e31e1f4316f476566a5"]`,
     );
   });
 

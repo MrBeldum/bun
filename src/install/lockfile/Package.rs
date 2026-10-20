@@ -104,6 +104,31 @@ pub(crate) fn value_loc_of(source: &bun_ast::Source, key_loc: bun_ast::Loc) -> b
     crate::bun_json::property_value_loc(&source.contents, key_loc).unwrap_or(key_loc)
 }
 
+/// Longer than node-semver's `MAX_LENGTH` is a version to no package manager: recorded as none.
+pub(crate) fn recordable_version(version: &[u8]) -> &[u8] {
+    if version.len() > 256 { b"" } else { version }
+}
+
+/// The `version` string of a package.json, empty when it has none.
+pub(crate) fn package_json_version<'b>(json: &Expr, bump: &'b bun_alloc::Arena) -> &'b [u8] {
+    (json.as_property(b"version"))
+        .and_then(|version| version.expr.as_utf8(bump))
+        .map(recordable_version)
+        .unwrap_or_default()
+}
+
+/// `package_json_version` of the text of a package.json. `None` when the text does not parse.
+pub(crate) fn version_in_package_json(path: &[u8], contents: &[u8]) -> Option<Box<[u8]>> {
+    initialize_store();
+    let source = bun_ast::Source::init_path_string(path, contents);
+    let mut log = bun_ast::Log::init();
+    let parsed = crate::bun_json::ParsedJson::parse_package_json(&source, &mut log).ok()?;
+    Some(Box::from(package_json_version(
+        &parsed.root,
+        &bun_alloc::Arena::new(),
+    )))
+}
+
 /// Returns the path in the form that `Version.value.folder` has in local packages, or `None` if it
 /// doesn't fit in `buf`.
 pub(crate) fn folder_relative_to_top_level_dir<'a>(
@@ -2372,13 +2397,12 @@ impl Package<u64> {
             }
         }
 
-        if !FEATURES.is_main {
-            if let Some(version_q) = json.as_property(b"version") {
-                if let Some(version_str) = version_q.expr.as_utf8(&bump) {
-                    string_builder.count(version_str);
-                }
-            }
-        }
+        let version: &[u8] = if FEATURES.is_main || resolver.is_void() {
+            b""
+        } else {
+            package_json_version(&json, &bump)
+        };
+        string_builder.count(version);
         'bin: {
             if let Some(bin) = json.as_property(b"bin") {
                 if let Some(rows) = JsonObjectStringRows::new(&bin.expr, &bump) {
@@ -2727,6 +2751,10 @@ impl Package<u64> {
         if !FEATURES.is_main {
             if !resolver.is_void() {
                 self.resolution = resolver.resolve(&mut string_builder, &json)?;
+                if self.resolution.tag.records_package_json_version() {
+                    self.meta
+                        .record_version(string_builder.append::<String>(version));
+                }
             }
         } else {
             self.resolution = Resolution::<u64>::init(TaggedValue::Root);

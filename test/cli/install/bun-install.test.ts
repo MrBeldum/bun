@@ -12063,7 +12063,11 @@ describe.concurrent("bun-install", () => {
           },
         },
         "packages": {
-          "jquery": [`jquery@git+ssh://git@github.com/dylan-conway/install-test-8.git#${repo.sha}`, {}, repo.sha],
+          "jquery": [
+            `jquery@git+ssh://git@github.com/dylan-conway/install-test-8.git#${repo.sha}`,
+            { "version": "2.2.2" },
+            repo.sha,
+          ],
         },
       });
       await Promise.all([
@@ -15802,7 +15806,7 @@ describe.concurrent("file: tarball declared by a file: folder dependency", () =>
       // The lockfile records the path as declared; the name in front of it is
       // read from the tarball that was extracted.
       expect(lockfile).toContain('"lib": ["lib@file:vendor/lib", { "dependencies": { "tool": "file:./tool.tgz" } }]');
-      expect(lockfile).toContain('"tool": ["bar@./tool.tgz", {}, "sha512-');
+      expect(lockfile).toContain('"tool": ["bar@./tool.tgz", { "version": "0.0.2" }, "sha512-');
     });
   }
 
@@ -15822,7 +15826,7 @@ describe.concurrent("file: tarball declared by a file: folder dependency", () =>
     const { installed, lockfile } = await installAndRequireLib(String(dir), "hoisted");
     expect(installed).toEqual(["bar@0.0.2", "bar@0.0.2"]);
     expect(lockfile).toContain('"lib": ["lib@file:vendor/lib", { "dependencies": { "tool": "^1.0.0" } }]');
-    expect(lockfile).toContain('"tool": ["bar@./tool.tgz", {}, "sha512-');
+    expect(lockfile).toContain('"tool": ["bar@./tool.tgz", { "version": "0.0.2" }, "sha512-');
   });
 });
 
