@@ -58,6 +58,12 @@ impl AnyPromise {
         any_promise_dispatch!(self, |p| p.set_handled())
     }
 
+    /// See [`JSPromise::has_custom_then`].
+    #[inline]
+    pub fn has_custom_then(self, global: &JSGlobalObject) -> bool {
+        JSPromise::opaque_ref(self.as_js_promise()).has_custom_then(global)
+    }
+
     #[inline]
     pub fn resolve(self, global_this: &JSGlobalObject, value: JSValue) -> JsResult<()> {
         any_promise_dispatch!(self, |p| p.resolve(global_this, value))
