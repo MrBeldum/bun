@@ -5,8 +5,8 @@ import net from "node:net";
 import vm from "node:vm";
 
 // A promise has its own then() when `then` is a function or an accessor on the promise or on a
-// class of it. The state of such a promise is not its answer. Bun.serve reads `then` once and
-// calls it once, with a resolve and a reject function.
+// class of it. When such a promise is pending or holds no Response, Bun.serve reads `then` once
+// and calls it once, with a resolve and a reject function.
 
 /** Fulfilled at once with a placeholder, and then() delivers: an SDK's `APIPromise` (null), p-lazy (undefined). */
 class PlaceholderPromise<T> extends Promise<T> {
@@ -93,7 +93,7 @@ describe("a promise that holds a placeholder", () => {
   });
 });
 
-// What error() returns is read by its state, as in Bun 1.4.3.
+// What error() returns is read by its state. Its then() is not called.
 describe("error() returns a promise with its own then()", () => {
   test.concurrent("that holds a placeholder: the default page for the error", async () => {
     const { stdout, stderr, exitCode } = await run(`
@@ -142,7 +142,7 @@ describe("error() returns a promise with its own then()", () => {
   });
 });
 
-// The state of these promises is the answer, as in Bun 1.4.3: no then() is called.
+// The state of these promises is the answer: no then() is called.
 describe("a promise is read by its state", () => {
   // `made` counts the promises of a class. A call of the then() it inherits makes one more.
   const rows: Record<string, () => { value: unknown; thenCalls: () => number }> = {

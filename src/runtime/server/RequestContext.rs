@@ -2863,10 +2863,8 @@ where
             // If we immediately have the value available, we can skip the extra event loop tick
             match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
                 jsc::PromiseResult::Pending => {
-                    // A promise with its own `then()` can start its work there (`Bun.$`, a `Bun.SQL` query).
-                    if promise.has_custom_then(this.global_this())
-                        && ctx.follow_then(this, response_value)
-                    {
+                    if promise.structure_id() != this.promise_structure_id() {
+                        ctx.on_pending_promise_not_plain(promise);
                         return;
                     }
                     let cell = ctx.create_promise_cell(this.global_this());
@@ -2888,23 +2886,13 @@ where
                     }
 
                     if fulfilled_value.is_empty_or_undefined_or_null() {
-                        ctx.on_promise_without_response(
-                            this,
-                            response_value,
-                            promise,
-                            fulfilled_value,
-                        );
+                        ctx.on_promise_without_response(promise, fulfilled_value);
                         return;
                     }
                     // `fulfilled_value` is rooted via ensure_still_alive() /
                     // protect() below for as long as `response` is used.
                     let Some(response) = as_response(fulfilled_value) else {
-                        ctx.on_promise_without_response(
-                            this,
-                            response_value,
-                            promise,
-                            fulfilled_value,
-                        );
+                        ctx.on_promise_without_response(promise, fulfilled_value);
                         return;
                     };
 
@@ -2945,24 +2933,34 @@ where
     /// A handler's promise holds no Response. One with its own `then()` can hold a placeholder (an SDK's `APIPromise`).
     #[cold]
     #[inline(never)]
-    fn on_promise_without_response(
-        &self,
-        this: &ThisServer,
-        promise_value: JSValue,
-        promise: jsc::AnyPromise,
-        fulfilled_value: JSValue,
-    ) {
-        if promise.has_custom_then(this.global_this()) && self.follow_then(this, promise_value) {
+    fn on_promise_without_response(&self, promise: jsc::AnyPromise, fulfilled_value: JSValue) {
+        if promise.has_custom_then(self.server().global_this()) && self.follow_then(promise) {
             return;
         }
         self.render_missing_invalid_response(fulfilled_value);
     }
 
+    /// A handler's pending promise is not a plain one. One with its own `then()` can start its work there (`Bun.$`, a `Bun.SQL` query).
+    #[cold]
+    #[inline(never)]
+    fn on_pending_promise_not_plain(&self, promise: jsc::AnyPromise) {
+        let global = self.server().global_this();
+        if promise.has_custom_then(global) && self.follow_then(promise) {
+            return;
+        }
+        let cell = self.create_promise_cell(global);
+        promise
+            .as_value()
+            .then_with_value(global, cell, Self::ON_RESOLVE, Self::ON_REJECT);
+    }
+
     /// Answers with what the `then()` of a handler's promise reports. `false`: `then` gave nothing to call.
     #[cold]
     #[inline(never)]
-    fn follow_then(&self, this: &ThisServer, promise_value: JSValue) -> bool {
+    fn follow_then(&self, promise: jsc::AnyPromise) -> bool {
+        let this = self.server();
         let global = this.global_this();
+        let promise_value = promise.as_value();
         let follower = jsc::JSPromise::create(global);
         if follower.resolve(global, promise_value).is_err() {
             return true;
