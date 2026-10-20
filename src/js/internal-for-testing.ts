@@ -184,6 +184,15 @@ export const memfd_create: (size: number) => number = $newRustFunction(
   1,
 );
 
+// Opens the file `path` (a directory with `directory`) in the directory `dir` with the open that
+// fails with ELOOP when a component of `path` is a symlink, and closes it. Returns null when this
+// system has no such open.
+export const openatNoSymlinks: (dir: string, path: string, directory?: boolean) => true | null = $newRustFunction(
+  "node_fs_binding.rs",
+  "openatNoSymlinksForTesting",
+  3,
+);
+
 export const createStatsForIno: (ino: bigint, big: boolean) => any = $newRustFunction(
   "Stat.rs",
   "createStatsForIno",

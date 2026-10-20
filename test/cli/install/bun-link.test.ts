@@ -1,4 +1,5 @@
 import { file, spawn } from "bun";
+import * as internals from "bun:internal-for-testing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import {
   access,
@@ -17,6 +18,7 @@ import {
   bunExe,
   bunEnv as env,
   isASAN,
+  isLinux,
   isMacOS,
   isWindows,
   readdirSorted,
@@ -1253,5 +1255,89 @@ describe.each(["hoisted", "isolated"] as const)("when a package fails to install
         exitCode: 0,
       });
     });
+  });
+});
+
+async function linkTo(target: string, path: string) {
+  await rm(path, { recursive: true, force: true });
+  await symlink(target, path, "junction");
+}
+
+// `bun_sys::openat_no_symlinks`.
+describe("the open that refuses a link in a path", () => {
+  // FreeBSD has no such open, and neither has a Linux that refuses `openat2`.
+  const hasOpen = (() => {
+    try {
+      return internals.openatNoSymlinks(import.meta.dir, basename(import.meta.path)) !== null;
+    } catch {
+      return true;
+    }
+  })();
+  const script = `
+    import { openatNoSymlinks } from "bun:internal-for-testing";
+    import { join } from "path";
+    const open = (path, directory) => {
+      try {
+        return openatNoSymlinks(process.cwd(), join(...path), directory);
+      } catch (error) {
+        return error.code;
+      }
+    };
+    console.log(
+      JSON.stringify({
+        file: open(["real", "pkg", "package.json"]),
+        missing: open(["real", "pkg", "missing.json"]),
+        "file in a link": open(["real", "link", "package.json"]),
+        "file below a link": open(["link", "pkg", "package.json"]),
+        folder: open(["real", "pkg"], true),
+        "folder that is a link": open(["real", "link"], true),
+      }),
+    );
+  `;
+  const refusesLinks = {
+    file: true,
+    missing: "ENOENT",
+    "file in a link": "ELOOP",
+    "file below a link": "ELOOP",
+    folder: true,
+    "folder that is a link": "ELOOP",
+  };
+  const noSuchOpen = Object.fromEntries(Object.keys(refusesLinks).map(name => [name, null]));
+
+  // Opens each path in a bun that has `more` in its environment.
+  async function open(more: (root: string) => Record<string, string>) {
+    using dir = tempDir("bun-link-open-", {
+      real: { pkg: { "package.json": "{}" } },
+      system: { bin: { linker64: "" } },
+    });
+    const root = String(dir);
+    await linkTo(join(root, "real"), join(root, "link"));
+    await linkTo(join(root, "real", "pkg"), join(root, "real", "link"));
+
+    await using proc = spawn({
+      cmd: [bunExe(), "-e", script],
+      cwd: root,
+      env: { ...env, ...more(root) },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stderr, opened: stdout && JSON.parse(stdout), exitCode };
+  }
+
+  it.concurrent.skipIf(!hasOpen)("refuses a link in any folder, and a link in the place of the file", async () => {
+    expect(await open(() => ({}))).toEqual({ stderr: "", opened: refusesLinks, exitCode: 0 });
+  });
+
+  it.concurrent.skipIf(!isLinux)("is off with BUN_FEATURE_FLAG_DISABLE_OPENAT2", async () => {
+    const result = await open(() => ({ BUN_FEATURE_FLAG_DISABLE_OPENAT2: "1" }));
+    expect(result).toEqual({ stderr: "", opened: noSuchOpen, exitCode: 0 });
+  });
+
+  // Android answers `openat2` with a signal, not with an error, so bun does not call it there.
+  // The test host's kernel release isn't Android's, and this makes bun detect Android.
+  it.concurrent.skipIf(!isLinux)("is off on Android", async () => {
+    const result = await open(root => ({ ANDROID_ROOT: join(root, "system"), ANDROID_DATA: "/data" }));
+    expect(result).toEqual({ stderr: "", opened: noSuchOpen, exitCode: 0 });
   });
 });
