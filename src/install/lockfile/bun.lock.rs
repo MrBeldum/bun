@@ -1957,8 +1957,14 @@ impl<'a> Reach<'a> {
                     self.waiting.push(entry);
                     continue;
                 }
-                for index in self.starts[entry as usize]..self.starts[entry as usize + 1] {
-                    self.mark(self.targets[index as usize]);
+                let lookups = self.starts[entry as usize]..self.starts[entry as usize + 1];
+                for &target in &self.targets[lookups.start as usize..lookups.end as usize] {
+                    let is_live = &mut self.live[target as usize];
+                    if !*is_live {
+                        *is_live = true;
+                        self.open -= 1;
+                        self.pending.push(target);
+                    }
                 }
             }
             let mut index = 0;
@@ -2028,44 +2034,73 @@ struct Dead {
 }
 
 /// An entry that is not live.
+#[derive(Clone, Copy)]
 struct Open<'a> {
-    /// The hash of `name`.
-    hash: u64,
+    /// From the hash of `name`: see `OpenEntries::order`.
+    order: u64,
     entry: u32,
     /// The two parts of its key. `folder` is empty if it is in no folder.
     folder: &'a [u8],
     name: &'a [u8],
 }
 
-/// The entries that were not live after the turns of the entries, by the hash of their name.
+/// The entries that were not live after the turns of the entries.
 struct OpenEntries<'a> {
+    /// In the order of `Open::order`, so those of one name are together.
     by_name: Vec<Open<'a>>,
-    /// One bit for the hash of each name that an entry has that is not live.
+    /// One bit for each name that an entry has that is not live. A lookup of another name stops
+    /// here.
     names: [u64; 64],
 }
 
 impl<'a> OpenEntries<'a> {
-    fn has_name(&self, hash: u64) -> bool {
-        self.names[(hash >> 6 & 63) as usize] & (1 << (hash & 63)) != 0
+    /// The hash of a name, with the 12 bits that choose its bit in `names` first. So the names
+    /// of one bit are together as well.
+    fn order(name_hash: u64) -> u64 {
+        name_hash.rotate_right(12)
+    }
+
+    /// The bit in `names` for the names of this order.
+    fn bit(order: u64) -> usize {
+        (order >> 52) as usize
+    }
+
+    fn has_name(&self, name_hash: u64) -> bool {
+        let bit = Self::bit(Self::order(name_hash));
+        self.names[bit / 64] & (1 << (bit % 64)) != 0
     }
 
     /// The entries whose name has this hash.
-    fn named(&self, hash: u64) -> &[Open<'a>] {
-        if !self.has_name(hash) {
+    fn named(&self, name_hash: u64) -> &[Open<'a>] {
+        if !self.has_name(name_hash) {
             return &[];
         }
-        let from = self.by_name.partition_point(|open| open.hash < hash);
-        let len = self.by_name[from..].partition_point(|open| open.hash == hash);
-        &self.by_name[from..from + len]
+        let order = Self::order(name_hash);
+        let from = self.by_name.partition_point(|open| open.order < order);
+        let named = &self.by_name[from..];
+        &named[..named.iter().take_while(|open| open.order == order).count()]
     }
 
-    /// Drops the names whose entries are all live by now, so that a lookup of such a name
-    /// stops at `has_name`.
+    /// Drops the bit of this name if each entry that has the bit is live by now.
+    fn forget(&mut self, name_hash: u64, live: &[bool]) {
+        let bit = Self::bit(Self::order(name_hash));
+        let from = (self.by_name).partition_point(|open| Self::bit(open.order) < bit);
+        let of_bit = &self.by_name[from..];
+        let mut of_bit = of_bit
+            .iter()
+            .take_while(|open| Self::bit(open.order) == bit);
+        if of_bit.all(|open| live[open.entry as usize]) {
+            self.names[bit / 64] &= !(1 << (bit % 64));
+        }
+    }
+
+    /// Sets the bits again, for the entries that are not live by now.
     fn forget_live(&mut self, live: &[bool]) {
         self.names = [0; 64];
         for open in &self.by_name {
             if !live[open.entry as usize] {
-                self.names[(open.hash >> 6 & 63) as usize] |= 1 << (open.hash & 63);
+                let bit = Self::bit(open.order);
+                self.names[bit / 64] |= 1 << (bit % 64);
             }
         }
     }
@@ -2178,7 +2213,6 @@ impl Lookups<'_> {
         stops: Stops,
     ) -> bool {
         let mut found = false;
-        let mut is_name_done = false;
         for dep_id in list.begin()..list.end() {
             let dep = &self.dependencies[dep_id as usize];
             let named = open.named(dep.name_hash);
@@ -2202,11 +2236,10 @@ impl Lookups<'_> {
             }
             if is_marked {
                 found = true;
-                is_name_done |= named.iter().all(|open| reach.live[open.entry as usize]);
+                if named.iter().all(|open| reach.live[open.entry as usize]) {
+                    open.forget(dep.name_hash, &reach.live);
+                }
             }
-        }
-        if is_name_done {
-            open.forget_live(&reach.live);
         }
         found
     }
@@ -2252,22 +2285,30 @@ impl Lookups<'_> {
     ) -> Result<Option<Dead>, bun_alloc::AllocError> {
         let count = self.rows.len();
 
-        let mut open = OpenEntries {
-            by_name: Vec::with_capacity(reach.open),
-            names: [0; 64],
-        };
+        let mut open: Vec<Open<'_>> = Vec::with_capacity(reach.open);
         for entry in 0..count {
             if !reach.live[entry] {
                 let (folder, name) = split_key(self.key_of(entry as u32));
-                open.by_name.push(Open {
-                    hash: StringBuilder::string_hash(name),
+                open.push(Open {
+                    order: OpenEntries::order(StringBuilder::string_hash(name)),
                     entry: entry as u32,
                     folder,
                     name,
                 });
             }
         }
-        (open.by_name).sort_unstable_by_key(|open| (open.hash, open.entry));
+        // A pair is a third of an `Open` to move.
+        let mut order: Vec<(u64, u32)> = (open.iter().enumerate())
+            .map(|(index, open)| (open.order, index as u32))
+            .collect();
+        order.sort_unstable();
+        let mut open = OpenEntries {
+            by_name: order
+                .iter()
+                .map(|&(_, index)| open[index as usize])
+                .collect(),
+            names: [0; 64],
+        };
         open.forget_live(&reach.live);
 
         // A workspace looks up its dependencies from `<name>`, or from `./<name>` if a
