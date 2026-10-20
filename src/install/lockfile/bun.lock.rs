@@ -1830,6 +1830,9 @@ struct Repeat {
 /// not in the tree that the file saves, but a peer could bind to it by version, and its walks
 /// could bind the dependencies of a package that it repeats. So such an entry does not count:
 /// see `Dead`.
+///
+/// The entries have their turn in the order of the file. In its turn an entry looks up the
+/// dependencies of its package from its key.
 struct Reach<'a> {
     /// By index into `packages`. An entry that is left out is live from the start, and one that
     /// does not have its key is live from its turn.
@@ -2282,20 +2285,25 @@ impl Lookups<'_> {
             let list = self.lists[member as usize];
             found |= self.look_up(reach, &mut open, &path_buf[..end], true, list, Stops::Each);
         }
-        // Most files have no entry that is not live after these.
-        for index in 0..reach.peers.len() {
-            let (entry, dep_id) = reach.peers[index];
-            let name_hash = self.dependencies[dep_id as usize].name_hash;
-            if open.has_name(name_hash) && reach.looks_up(entry) {
-                let (key, peer) = (self.key_of(entry), DependencySlice::new(dep_id, 1));
-                found |= self.look_up(reach, &mut open, key, false, peer, Stops::Each);
+        // Most files have no entry that is not live after these. A peer can lead to a package
+        // that has a peer itself, so they are looked up until that finds no more.
+        loop {
+            for index in 0..reach.peers.len() {
+                let (entry, dep_id) = reach.peers[index];
+                let name_hash = self.dependencies[dep_id as usize].name_hash;
+                if open.has_name(name_hash) && reach.looks_up(entry) {
+                    let (key, peer) = (self.key_of(entry), DependencySlice::new(dep_id, 1));
+                    found |= self.look_up(reach, &mut open, key, false, peer, Stops::Each);
+                }
             }
-        }
-        if found {
+            if !found {
+                break;
+            }
             if reach.close() {
                 return Ok(None);
             }
             open.forget_live(&reach.live);
+            found = false;
         }
 
         let mut scanned = vec![false; count];
