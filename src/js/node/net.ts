@@ -354,29 +354,34 @@ const kOnreadPendingEnd = Symbol("kOnreadPendingEnd");
 const kOnreadReadRequested = Symbol("kOnreadReadRequested");
 const kOnreadEmptyTail = Buffer.alloc(0);
 const kwriteCallback = Symbol("writeCallback");
+// { frame }: the async context this socket's events ran in when a write that waited completed in its own.
+const kEventFrame = Symbol("kEventFrame");
+// An AsyncLocalStorage that holds a socket's [kEventFrame] while the completion of its write runs.
+let completingSocket;
 // A write that waits completes in the async context `_write` was called in, as the write request of Node's handle does.
-function completeWaitedWrite(frame, callback, err?) {
+function completeWaitedWrite(this: SocketInstance, frame, callback, err?) {
   const eventFrame = $getInternalField($asyncContext, 0);
   // A program with no AsyncLocalStorage is in `frame` already.
   if (frame === eventFrame) return callback(err);
   const AsyncContextFrame = require("internal/async_context_frame");
   // A context inside another Bun.ModuleGraph than the socket's is not entered: see runInSameGraph.
   if (AsyncContextFrame.isInAnotherGraph(frame)) return callback(err);
-  return AsyncContextFrame.run(frame, completeWithEventFrame, undefined, eventFrame, callback, err);
+  let events = this[kEventFrame];
+  if (events === undefined || events.frame !== eventFrame) events = this[kEventFrame] = { frame: eventFrame };
+  return AsyncContextFrame.run(frame, completeAsSocket, undefined, events, callback, err);
 }
-function waitedWrite(callback) {
-  return completeWaitedWrite.bind(undefined, $getInternalField($asyncContext, 0), callback);
+function completeAsSocket(events, callback, err) {
+  completingSocket ??= new (require("node:async_hooks").AsyncLocalStorage)();
+  return completingSocket.run(events, callback, err);
 }
-// The context of the event that completes a write, kept while the write completes in its own: 'close' goes back to it.
-let completingEventFrame;
-function completeWithEventFrame(eventFrame, callback, err) {
-  completingEventFrame ??= new (require("node:async_hooks").AsyncLocalStorage)();
-  return completingEventFrame.run({ frame: eventFrame }, callback, err);
+function waitedWrite(self, callback) {
+  return completeWaitedWrite.bind(self, $getInternalField($asyncContext, 0), callback);
 }
-function setCloseImmediate(emitClose) {
-  const event = completingEventFrame?.getStore();
-  if (event === undefined) return setImmediate(emitClose);
-  return require("internal/async_context_frame").runInSameGraph(event.frame, setImmediate, undefined, emitClose);
+// 'close' goes back to the context of the socket's events when the completion of its own write destroys the socket.
+function scheduleClose(self, schedule, thisArg, emitClose, a?, b?) {
+  const events = completingSocket?.getStore();
+  if (events === undefined || events !== self[kEventFrame]) return schedule.$call(thisArg, emitClose, a, b);
+  return require("internal/async_context_frame").runInSameGraph(events.frame, schedule, thisArg, emitClose, a, b);
 }
 const kRejectedWrite = Symbol("kRejectedWrite");
 const kSocketClass = Symbol("kSocketClass");
@@ -2546,7 +2551,7 @@ Socket.prototype._destroy = function _destroy(err, callback) {
       const transport = unadoptedTransport(this);
       if (transport !== undefined) abortTransport(transport);
       const err = this._handle.terminate();
-      setCloseImmediate(() => {
+      scheduleClose(this, setImmediate, undefined, () => {
         $debug("emit close");
         this.emit("close", isException);
       });
@@ -2579,7 +2584,7 @@ Socket.prototype._destroy = function _destroy(err, callback) {
     const transport = transportToDestroy(this);
     if (transport !== undefined) abortTransport(transport);
     if (transport instanceof Socket) transport.once("close", emitCloseNT.bind(null, this, err ? true : false));
-    else process.nextTick(emitCloseNT, this, err ? true : false);
+    else scheduleClose(this, process.nextTick, process, emitCloseNT, this, err ? true : false);
   }
 
   const server = this._server;
@@ -3069,7 +3074,7 @@ Socket.prototype._write = function _write(chunk, encoding, callback) {
     // adopts the fd a tick later, so hold the write until it lands rather
     // than failing it as a closed socket.
     // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L590-L608
-    const waiting = (this[kwriteCallback] = waitedWrite(callback));
+    const waiting = (this[kwriteCallback] = waitedWrite(this, callback));
     this._pendingData = chunk;
     this._pendingEncoding = encoding;
     const onClose = onUpgradeWriteClose.bind(this, waiting);
@@ -3106,7 +3111,7 @@ Socket.prototype._write = function _write(chunk, encoding, callback) {
   if (res < 0) {
     // The kernel rejected the send outright (peer reset): $write returned the
     // negative errno; deliver it like the EBADF/EPIPE branch above.
-    if (holdRejectedWrite(this, socket, res, callback)) this[kwriteCallback] = waitedWrite(callback);
+    if (holdRejectedWrite(this, socket, res, callback)) this[kwriteCallback] = waitedWrite(this, callback);
     else callback(writeErrnoException(res));
     return false;
   }
@@ -3129,7 +3134,7 @@ Socket.prototype._write = function _write(chunk, encoding, callback) {
   } else if (this[kwriteCallback]) {
     callback(new Error("overlapping _write()"));
   } else {
-    this[kwriteCallback] = waitedWrite(callback);
+    this[kwriteCallback] = waitedWrite(this, callback);
     // A pending write holds the loop even on a handle whose FIN/pause dropped
     // its hold (libuv: the uv_write_t is active); unrefAfterDrain lets go again.
     if ((this[kended] || this[kPausedUnref]) && !this[kUserUnrefed]) socket.ref?.();
@@ -4543,7 +4548,7 @@ function closeSocketHandle(self, handle, isException, isCleanupPending = false) 
   // The owner of a wrapped socket destroyed it: the TLS socket goes first, so the close of their fd is nothing to report.
   handle[kAdoptedTLSRaw]?.destroy();
   handle.close(onSocketHandleClosed);
-  setCloseImmediate(() => {
+  scheduleClose(self, setImmediate, undefined, () => {
     $debug("emit close", isCleanupPending);
     self.emit("close", isException);
     if (isCleanupPending) {

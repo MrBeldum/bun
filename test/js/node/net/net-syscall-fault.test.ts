@@ -471,12 +471,55 @@ describe.skipIf(skip)("a write that waited for the socket completes in the async
       expect(failed).toEqual({ events: ["write EPIPE in write", "error EPIPE in write"], close: "opened" });
     });
 
+    // This one needs no fault: the peer does not read, so the kernel takes only part of the write.
+    test("the write callback and 'close', when the peer's reset fails the write", async () => {
+      const { p, writer, reader } = await pair();
+      using _ = p;
+      const { promise, resolve } = Promise.withResolvers<{ callback: string | undefined; close: string | undefined }>();
+      let callback: string | undefined;
+      writer.once("close", () => resolve({ callback, close: storage.getStore() }));
+      storage.run("write", () =>
+        writer.write(Buffer.alloc(8 * 1024 * 1024), err => {
+          callback = `${err ? "failed" : "done"} in ${storage.getStore()}`;
+          // The callback handles the failure, so the socket has no 'error' to report.
+          writer.destroy();
+        }),
+      );
+      expect(writer.writableLength).toBeGreaterThan(0);
+      reader.resetAndDestroy();
+      expect(await promise).toEqual({ callback: "failed in write", close: "opened" });
+    });
+
     test("the write callback, when destroy() closes the socket first", async () => {
       const { p, writer } = await pair();
       using _ = p;
       const { events } = await failedWrite(writer, () => storage.run("destroy", () => writer.destroy()));
       expect(events).toEqual(["write ERR_SOCKET_CLOSED in write"]);
     });
+  });
+
+  // 'close' runs where destroy() was called. Only the socket whose own write is what destroys it goes back to the
+  // context of its events: another socket, and a destroy() after the write, do not.
+  test("'close' of another socket that the callback of a write that waited destroys", async () => {
+    using a = await storage.run("opened", connectedPair);
+    using b = await storage.run("opened elsewhere", connectedPair);
+    const { promise, resolve } = Promise.withResolvers<string | undefined>();
+    b.client.once("close", () => resolve(storage.getStore()));
+    takeOneByte(a.client);
+    storage.run("write", () => a.client.write(Buffer.alloc(200, "w"), () => b.client.destroy()));
+    expect(await promise).toBe("write");
+  });
+
+  test("'close' after a destroy() that comes later than the write that waited", async () => {
+    using p = await storage.run("opened", connectedPair);
+    const written = Promise.withResolvers<void>();
+    takeOneByte(p.client);
+    storage.run("write", () => p.client.write(Buffer.alloc(200, "w"), () => written.resolve()));
+    await written.promise;
+    const { promise, resolve } = Promise.withResolvers<string | undefined>();
+    p.client.once("close", () => resolve(storage.getStore()));
+    storage.run("later", () => p.client.destroy());
+    expect(await promise).toBe("later");
   });
 
   // The extra pipe of a child process is a socket over an fd it adopts, which has a handler table of its own.
