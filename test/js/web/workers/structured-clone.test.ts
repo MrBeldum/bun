@@ -1,12 +1,20 @@
 import { deserialize, serialize } from "bun:jsc";
 import { openSync } from "fs";
 import { bunEnv, bunExe, tls } from "harness";
-import { createPrivateKey, createPublicKey, createSecretKey, KeyObject, X509Certificate } from "node:crypto";
+import {
+  createPrivateKey,
+  createPublicKey,
+  createSecretKey,
+  KeyObject,
+  X509Certificate,
+  type webcrypto,
+} from "node:crypto";
 import { BlockList } from "node:net";
 import type { ReadableStreamDefaultReader } from "node:stream/web";
 import { deserialize as v8Deserialize } from "node:v8";
 import { deflate } from "node:zlib";
 import { join } from "path";
+import { algorithmsInNoKey, cryptoKeyCloneTable } from "./crypto-key-clone-table";
 
 // Terminal object types that were never entered into the structured clone object
 // reference pool, so duplicated references to them came back as distinct copies.
@@ -855,6 +863,107 @@ describe("deserializing a version 13 payload", () => {
     expect(cloned[0]).not.toBe(cloned[1]);
   });
 });
+
+type CryptoKeyCloneRow = (typeof cryptoKeyCloneTable)[number];
+
+// An HKDF or PBKDF2 key is never extractable. The bits that it derives stand for its key material.
+const deriveBitsParameters: Record<string, webcrypto.HkdfParams | webcrypto.Pbkdf2Params> = {
+  HKDF: { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(16), info: new Uint8Array(0) },
+  PBKDF2: { name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array(16), iterations: 1 },
+};
+const isNeverExtractable = ([algorithm]: CryptoKeyCloneRow) => algorithm.name in deriveBitsParameters;
+
+// The clone reader refuses every X25519 key until #45624. That change turns the X25519 rows into clone rows.
+const isRefused = ([algorithm]: CryptoKeyCloneRow) => algorithm.name === "X25519";
+
+const slots = ({ type, algorithm, usages, extractable }: CryptoKey) => ({ type, algorithm, usages, extractable });
+
+async function describeKey(key: CryptoKey) {
+  const derive = deriveBitsParameters[key.algorithm.name];
+  const material = derive
+    ? Buffer.from(await crypto.subtle.deriveBits(derive, key, 256)).toString("hex")
+    : await crypto.subtle.exportKey("jwk", key);
+  return { ...slots(key), material };
+}
+
+// generateKey takes about 0.1 s for an RSA key in a debug build, so the RSA rows import the key of `tls`.
+const rsaPublicJwk = createPublicKey(tls.key).export({ format: "jwk" });
+const rsaPrivateJwk = createPrivateKey(tls.key).export({ format: "jwk" });
+const publicKeyUsages: webcrypto.KeyUsage[] = ["encrypt", "verify", "wrapKey"];
+
+async function makeKeys(...[algorithm, usages]: CryptoKeyCloneRow): Promise<CryptoKey[]> {
+  const { subtle } = crypto;
+  if (algorithm.name in deriveBitsParameters) {
+    // These algorithms have no generateKey. A key is imported key material.
+    return [await subtle.importKey("raw", crypto.getRandomValues(new Uint8Array(32)), algorithm, false, usages)];
+  }
+  if (algorithm.name.startsWith("RSA")) {
+    const forPublicKey = usages.filter(usage => publicKeyUsages.includes(usage));
+    const forPrivateKey = usages.filter(usage => !publicKeyUsages.includes(usage));
+    return Promise.all([
+      subtle.importKey("jwk", rsaPublicJwk, algorithm, true, forPublicKey),
+      subtle.importKey("jwk", rsaPrivateJwk, algorithm, true, forPrivateKey),
+    ]);
+  }
+  const made = (await subtle.generateKey(algorithm, true, usages)) as CryptoKey | CryptoKeyPair;
+  return made instanceof CryptoKey ? [made] : [made.publicKey, made.privateKey];
+}
+
+for (const structuredCloneFn of [structuredClone, jscSerializeRoundtrip, jscSerializeRoundtripCrossProcess]) {
+  describe(`${structuredCloneFn.name}: CryptoKey of each algorithm`, () => {
+    // bun:jsc serialize() refuses a key that is not extractable, so only structuredClone takes an HKDF or PBKDF2 key.
+    const rows = cryptoKeyCloneTable.filter(row => structuredCloneFn === structuredClone || !isNeverExtractable(row));
+
+    test.each(rows.filter(row => !isRefused(row)))("%j %j keys clone to the same keys", async (algorithm, usages) => {
+      for (const key of await makeKeys(algorithm, usages)) {
+        expect(await describeKey(await structuredCloneFn(key))).toEqual(await describeKey(key));
+      }
+    });
+
+    // A refusal ends the child process that the cross-process route shares, so that route has no test of it.
+    if (structuredCloneFn !== jscSerializeRoundtripCrossProcess) {
+      test.each(rows.filter(isRefused))("%j %j keys do not clone yet", async (algorithm, usages) => {
+        const keys = await makeKeys(algorithm, usages);
+        expect(keys.map(key => key.type)).toEqual(["public", "private"]);
+        for (const key of keys) {
+          expect(() => structuredCloneFn(key)).toThrow(new TypeError("Unable to deserialize data."));
+        }
+      });
+    }
+  });
+}
+
+// The rows above clone extractable keys, except for HKDF and PBKDF2. bun:jsc serialize() refuses a key that is not
+// extractable, so only structuredClone has this test.
+test.each(cryptoKeyCloneTable.filter(row => !isNeverExtractable(row) && !isRefused(row)))(
+  "structuredClone: %j %j keys that are not extractable clone to keys that are not extractable",
+  async (algorithm, usages) => {
+    for (const original of await makeKeys(algorithm, usages)) {
+      const jwk = await crypto.subtle.exportKey("jwk", original);
+      const key = await crypto.subtle.importKey("jwk", jwk, original.algorithm, false, original.usages);
+      expect(slots(structuredClone(key))).toEqual({ ...slots(original), extractable: false });
+    }
+  },
+);
+
+// The source lint accepts a registered algorithm that is in no row of cryptoKeyCloneTable only if algorithmsInNoKey
+// lists it. For such an algorithm, every attempt to make a key with it ends in NotSupportedError. An algorithm that
+// a key can have, as its algorithm or as its hash, passes one of these attempts or fails it with another error.
+test.each(algorithmsInNoKey)(
+  "%s is in no row of the CryptoKey clone table: crypto.subtle makes no key with it",
+  async name => {
+    const { subtle } = crypto;
+    const formats = ["raw", "raw-secret", "raw-public", "raw-seed", "spki", "pkcs8"] as const;
+    const attempts = [
+      subtle.generateKey(name, true, ["sign"]),
+      subtle.generateKey({ name: "HMAC", hash: name }, true, ["sign"]),
+      subtle.importKey("jwk", {}, name, true, ["sign"]),
+      ...formats.map(format => subtle.importKey(format, new Uint8Array(32), name, true, ["sign"])),
+    ];
+    const outcomes = attempts.map(attempt => attempt.then(() => "made a key").catch(error => error.name));
+    expect(await Promise.all(outcomes)).toEqual(attempts.map(() => "NotSupportedError"));
+  },
+);
 
 // https://github.com/oven-sh/bun/issues/32981
 // %Object.prototype% is an immutable prototype exotic object that the structured
