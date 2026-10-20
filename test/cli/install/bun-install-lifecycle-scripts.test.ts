@@ -3154,6 +3154,49 @@ describe.concurrent.each(["hoisted", "isolated"] as const)("the install after a 
     expect(second.exitCode).toBe(0);
   });
 
+  // `inner` is in the `node_modules` of the workspace `z`, which bun reaches through the link to
+  // `z`. One script at a time: `z` still waits for its own script when the script of `inner` fails.
+  test("a package behind the link to a workspace", async () => {
+    using ctx = await setupScriptPackages(linker, {
+      plain: {},
+      inner: { scripts: { postinstall: `echo inner >> "$RUNS" && exit 1` } },
+    });
+    await Promise.all([
+      writeFile(
+        ctx.packageJson,
+        JSON.stringify({
+          name: "foo",
+          workspaces: ["packages/*"],
+          dependencies: { "its-inner": "npm:plain@1.0.0" },
+          trustedDependencies: ["inner"],
+        }),
+      ),
+      write(
+        join(ctx.packageDir, "packages", "z", "package.json"),
+        JSON.stringify({
+          name: "z",
+          version: "1.0.0",
+          dependencies: { "its-inner": "npm:inner@1.0.0" },
+          scripts: { postinstall: `echo z >> "$RUNS"` },
+        }),
+      ),
+    ]);
+    ctx.env.RUNS = join(ctx.packageDir, "runs.txt");
+
+    for (const install of [1, 2]) {
+      const { err, exitCode } = await ctx.bun("install", "--concurrent-scripts=1");
+      expect({
+        errors: splitErrLines(err).filter(line => line.startsWith("error:")),
+        ran: readFileSync(ctx.env.RUNS, "utf8").split("\n").filter(Boolean),
+        exitCode,
+      }).toEqual({
+        errors: ['error: postinstall script from "its-inner" exited with 1'],
+        ran: Array(install).fill("inner"),
+        exitCode: 1,
+      });
+    }
+  });
+
   // The scripts of a registry package are read from the package.json that was linked.
   test("a package whose scripts cannot be read fails every install", async () => {
     using ctx = await setupScriptPackages(linker, {
@@ -3297,14 +3340,10 @@ test.concurrent.skipIf(!isLinux).each(["hoisted", "isolated"] as const)(
 );
 
 // To run a package's scripts, bun reads its package.json and puts its `node_modules/.bin` in $PATH,
-// both by their absolute paths. PATH_MAX is 4096 on Linux.
-test.concurrent.skipIf(!isLinux).each([
-  ["hoisted", "node_modules/scripted/package.json"],
-  ["hoisted", "node_modules/scripted/node_modules/.bin"],
-  ["isolated", "node_modules/.bun/scripted@1.0.0/node_modules/scripted/package.json"],
-  ["isolated", "node_modules/.bun/scripted@1.0.0/node_modules/scripted/node_modules/.bin"],
-] as const)("%s: a project so deep that %s exceeds PATH_MAX fails with ENAMETOOLONG", async (linker, subpath) => {
-  using ctx = await setupScriptPackages(linker, { scripted: { scripts: { postinstall: "echo ran > ran.txt" } } });
+// both by their absolute paths. PATH_MAX is 4096 on Linux. The project here depends on `scripted`,
+// and `subpath` in it is one byte too long.
+async function projectBeyondPathMax(linker: "hoisted" | "isolated", subpath: string) {
+  const ctx = await setupScriptPackages(linker, { scripted: { scripts: { postinstall: "echo ran > ran.txt" } } });
   const projectBytes = 4096 + 1 - `/${subpath}`.length;
   let project = ctx.packageDir;
   // The last name has to stay under NAME_MAX (255).
@@ -3315,18 +3354,47 @@ test.concurrent.skipIf(!isLinux).each([
     join(project, "package.json"),
     JSON.stringify({ name: "foo", dependencies: { scripted: "1.0.0" }, trustedDependencies: ["scripted"] }),
   );
+  return {
+    [Symbol.dispose]: () => ctx[Symbol.dispose](),
+    async install() {
+      await using proc = spawn({
+        cmd: [bunExe(), "install", `--linker=${linker}`],
+        cwd: project,
+        env: { ...ctx.env, BUN_CONFIG_REGISTRY: ctx.registry },
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [err, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      return { err, exitCode };
+    },
+  };
+}
 
-  await using proc = spawn({
-    cmd: [bunExe(), "install", `--linker=${linker}`],
-    cwd: project,
-    env: { ...ctx.env, BUN_CONFIG_REGISTRY: ctx.registry },
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "pipe",
-  });
-  const [err, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+test.concurrent.skipIf(!isLinux).each([
+  ["hoisted", "node_modules/scripted/package.json"],
+  ["hoisted", "node_modules/scripted/node_modules/.bin"],
+  ["isolated", "node_modules/.bun/scripted@1.0.0/node_modules/scripted/package.json"],
+  ["isolated", "node_modules/.bun/scripted@1.0.0/node_modules/scripted/node_modules/.bin"],
+] as const)("%s: a project so deep that %s exceeds PATH_MAX fails with ENAMETOOLONG", async (linker, subpath) => {
+  using project = await projectBeyondPathMax(linker, subpath);
+  const { err, exitCode } = await project.install();
   expect(err).toContain("ENAMETOOLONG");
   expect(exitCode).toBe(1);
+});
+
+// bun cannot start the script of `scripted`. A package that stays in place counts as installed, so
+// `scripted` does not stay: the next install fails the same way.
+test.concurrent.skipIf(!isLinux).each([
+  ["hoisted", "node_modules/scripted/node_modules/.bin"],
+  ["isolated", "node_modules/.bun/scripted@1.0.0/node_modules/scripted/node_modules/.bin"],
+] as const)("%s: a project so deep that %s exceeds PATH_MAX fails every install", async (linker, subpath) => {
+  using project = await projectBeyondPathMax(linker, subpath);
+  for (const _ of [1, 2]) {
+    const { err, exitCode } = await project.install();
+    expect(err).toContain("ENAMETOOLONG");
+    expect(exitCode).toBe(1);
+  }
 });
 
 // `baz` is an optional dependency of the project, and its postinstall fails. Whether the install continues without it
@@ -3456,6 +3524,359 @@ describe.concurrent.each(["hoisted", "isolated"] as const)("failed script of an 
       required
         ? { errors: ['error: postinstall script from "baz" exited with 1'], exitCode: 1 }
         : { errors: [], exitCode: 0 },
+    );
+  });
+
+  // A dependency `its-<name>` is the package `<name>` for `fails` and the package `plain` for the
+  // root. So the hoisted linker places `<name>` in the folder of `fails`, and that folder has to stay
+  // while the scripts of `<name>` are not done.
+  describe("packages inside its folder have scripts left to run", () => {
+    type Ctx = Awaited<ReturnType<typeof setupScriptPackages>>;
+    const its = (names: string[], target: (name: string) => string) =>
+      Object.fromEntries(names.map(name => [`its-${name}`, `npm:${target(name)}@1.0.0`]));
+    const records = (name: string) => `echo ${name} >> "$SCRIPT_RUNS"`;
+    const failing = (name: string, inside: object) => ({
+      dependencies: inside,
+      scripts: { postinstall: `${records(name)} && exit 1` },
+    });
+    const ran = (ctx: TestCtx) =>
+      existsSync(ctx.env.SCRIPT_RUNS) ? readFileSync(ctx.env.SCRIPT_RUNS, "utf8").split(/\s+/).filter(Boolean) : [];
+    const errorsOf = (err: string) => splitErrLines(err).filter(line => line.startsWith("error:"));
+    // The order is the hoisted linker's. The isolated linker runs the scripts of a package after
+    // those of its dependencies, so for it only the set is compared.
+    const inOrder = (names: string[]) => (linker === "hoisted" ? names : names.toSorted());
+
+    // One script at a time, and nothing to download: the hoisted linker runs the scripts of the
+    // package it linked last, then those of the other packages in the order it linked them.
+    async function linkFromTheCache(ctx: Ctx, ...folders: string[]) {
+      ctx.env.SCRIPT_RUNS = join(ctx.packageDir, "runs.txt");
+      expect((await ctx.bun("install", "--ignore-scripts")).exitCode).toBe(0);
+      for (const folder of ["node_modules", ...folders]) {
+        await rm(join(ctx.packageDir, folder), { recursive: true, force: true });
+      }
+    }
+
+    // `fails` and `later` have the same bin, whose file their scripts write. `fails` is first by
+    // name, so the link is its own unless it is gone before the bins of scripted packages are linked.
+    test("one of them has not started", async () => {
+      const bin = { tool: "made.js" };
+      const writesItsBin = (name: string) => `echo made > made.js && ${records(name)}`;
+      using ctx = await setupScriptPackages(linker, {
+        plain: {},
+        first: { scripts: { postinstall: records("first") } },
+        second: { scripts: { postinstall: records("second") } },
+        fails: {
+          bin,
+          dependencies: its(["first", "second"], name => name),
+          scripts: { postinstall: `${writesItsBin("fails")} && exit 1` },
+        },
+        later: { bin, scripts: { postinstall: writesItsBin("later") } },
+      });
+      await writeFile(
+        ctx.packageJson,
+        JSON.stringify({
+          name: "foo",
+          dependencies: { ...its(["first", "second"], () => "plain"), later: "1.0.0" },
+          optionalDependencies: { fails: "1.0.0" },
+          trustedDependencies: ["fails", "first", "second", "later"],
+        }),
+      );
+      await linkFromTheCache(ctx);
+
+      const { err, exitCode } = await ctx.bun("install", "--concurrent-scripts=1");
+      const bins = (await readdirSorted(ctx.installed(".bin"))).map(name => name.replace(/\.(exe|bunx)$/, ""));
+      expect({
+        errors: errorsOf(err),
+        ran: inOrder(ran(ctx)),
+        failsIsInstalled: existsSync(ctx.installed("fails")),
+        bins: [...new Set(bins)],
+        exitCode,
+      }).toEqual({
+        errors: [],
+        ran: inOrder(["second", "fails", "later", "first"]),
+        failsIsInstalled: false,
+        bins: ["tool"],
+        exitCode: 0,
+      });
+    });
+
+    // `first` is a dependency of `fails`, not an optional one: its failure ends the install, as it
+    // does when the script of `fails` has not failed. Neither stays, so the next install ends the same.
+    test("one of them has not started, and then its own script fails", async () => {
+      const nested = its(["first", "second"], name => name);
+      using ctx = await setupScriptPackages(linker, {
+        plain: {},
+        first: { scripts: { postinstall: `${records("first")} && exit 7` } },
+        second: { scripts: { postinstall: records("second") } },
+        fails: failing("fails", nested),
+      });
+      await writeFile(
+        ctx.packageJson,
+        JSON.stringify({
+          name: "foo",
+          dependencies: its(["first", "second"], () => "plain"),
+          optionalDependencies: { fails: "1.0.0" },
+          trustedDependencies: ["fails", "first", "second"],
+        }),
+      );
+      await linkFromTheCache(ctx);
+
+      for (const install of [1, 2]) {
+        const { err, exitCode } = await ctx.bun("install", "--concurrent-scripts=1");
+        expect({
+          errors: errorsOf(err),
+          // The isolated linker runs `first` before or after `second`.
+          ran: linker === "hoisted" ? ran(ctx) : [],
+          failsIsInstalled: existsSync(ctx.installed("fails")),
+          exitCode,
+        }).toEqual({
+          errors: ['error: postinstall script from "its-first" exited with 7'],
+          ran: linker === "hoisted" ? Array(install).fill(["second", "fails", "first"]).flat() : [],
+          failsIsInstalled: false,
+          exitCode: 7,
+        });
+      }
+    });
+
+    // `bun install --filter a` reaches the workspace `z` only through an optional dependency of `a`.
+    // What goes when the script of `z` fails is the link to `z`, and `first` and `second` are behind it.
+    test("it is a workspace, and one of them has not started", async () => {
+      const nested = its(["first", "second"], name => name);
+      using ctx = await setupScriptPackages(linker, {
+        plain: {},
+        first: { scripts: { postinstall: records("first") } },
+        second: { scripts: { postinstall: records("second") } },
+      });
+      const workspace = (name: string, fields: object) =>
+        write(
+          join(ctx.packageDir, "packages", name, "package.json"),
+          JSON.stringify({ name, version: "1.0.0", ...fields }),
+        );
+      await Promise.all([
+        writeFile(
+          ctx.packageJson,
+          JSON.stringify({ name: "foo", workspaces: ["packages/*"], trustedDependencies: ["first", "second"] }),
+        ),
+        workspace("a", {
+          dependencies: its(["first", "second"], () => "plain"),
+          optionalDependencies: { z: "workspace:*" },
+        }),
+        workspace("z", failing("z", nested)),
+      ]);
+      await linkFromTheCache(ctx, join("packages", "z", "node_modules"));
+
+      const { err, exitCode } = await ctx.bun("install", "--filter", "a", "--concurrent-scripts=1");
+      expect({
+        errors: errorsOf(err),
+        ran: inOrder(ran(ctx)),
+        zIsLinked: lstatSync(ctx.installed("z"), { throwIfNoEntry: false }) !== undefined,
+        zIsThere: existsSync(join(ctx.packageDir, "packages", "z", "package.json")),
+        exitCode,
+      }).toEqual({
+        errors: [],
+        ran: inOrder(["second", "z", "first"]),
+        zIsLinked: false,
+        zIsThere: true,
+        exitCode: 0,
+      });
+    });
+
+    // Two scripts at a time. `inner` waits at the gate while the script of the optional package runs
+    // beside it and fails. `after` starts once bun has dealt with that failure: it records what is
+    // left of the optional package, and only then does the test go on.
+    async function installUntilAfterRan(packages: Record<string, ScriptPackage>, manifest: object, optional: string) {
+      const afterIsLinked = Promise.withResolvers<void>();
+      const sees = (what: string, path: string) =>
+        `{ test ! -e "$INIT_CWD/node_modules/${optional}${path}" || ${records(what)}; }`;
+      const ctx = await setupScriptPackages(linker, {
+        plain: {},
+        other: {},
+        ...packages,
+        // Linked last of the root's packages, so it is the one that starts beside `inner`.
+        fails: { hold: afterIsLinked.promise, ...failing("fails", packages.fails.dependencies as object) },
+        after: {
+          scripts: {
+            postinstall: `${sees("folder", "")} && ${sees("manifest", "/package.json")} && ${records("after")}`,
+          },
+        },
+      });
+      await writeFile(
+        ctx.packageJson,
+        JSON.stringify({ name: "foo", trustedDependencies: ["fails", "after", "inner"], ...manifest }),
+      );
+      // With a lockfile the linker downloads what it links.
+      expect((await ctx.bun("install", "--lockfile-only")).exitCode).toBe(0);
+
+      const gate = join(ctx.packageDir, "gate");
+      expect(Bun.spawnSync({ cmd: ["mkfifo", gate] }).exitCode).toBe(0);
+      // Open for reading too, so that a line written before the script opens its end stays in the pipe.
+      const pipe = openSync(gate, fsConstants.O_RDWR | fsConstants.O_NONBLOCK);
+      Object.assign(ctx.env, { SCRIPT_RUNS: join(ctx.packageDir, "runs.txt"), GATE: gate });
+      const proc = spawn({
+        cmd: [bunExe(), "install", "--concurrent-scripts=2"],
+        cwd: ctx.packageDir,
+        env: ctx.env,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const until = async (condition: () => boolean) => {
+        while (!condition()) {
+          if (proc.exitCode !== null) throw new Error(`bun install exited with ${proc.exitCode}`);
+          await Bun.sleep(1);
+        }
+      };
+      const started = {
+        ctx,
+        proc,
+        // In the order of the record, without the line of `inner`, whose place in it is not fixed.
+        seen: () => ran(ctx).filter(name => name !== "inner-started"),
+        openTheGate: () => void writeSync(pipe, "\n"),
+        async [Symbol.asyncDispose]() {
+          afterIsLinked.resolve();
+          // A script that is still there ends: it finds no pipe to open, or a line in the one it has open.
+          rmSync(gate, { force: true });
+          writeSync(pipe, "\n");
+          closeSync(pipe);
+          proc.kill();
+          await proc.exited;
+          ctx[Symbol.dispose]();
+        },
+      };
+      try {
+        await until(() => existsSync(ctx.installed("after", "package.json")));
+        afterIsLinked.resolve();
+        await until(() => ["inner-started", "after"].every(name => ran(ctx).includes(name)));
+      } catch (error) {
+        await started[Symbol.asyncDispose]();
+        throw error;
+      }
+      return started;
+    }
+    const between = { preinstall: `${records("inner-started")} && read line < "$GATE"`, postinstall: records("inner") };
+    const inside = {
+      inner: { scripts: between },
+      fails: { dependencies: its(["inner"], name => name) },
+    };
+    const root = {
+      dependencies: { ...its(["inner"], () => "plain"), after: "1.0.0" },
+      optionalDependencies: { fails: "1.0.0" },
+    };
+    // In the hoisted layout `after` finds the folder of `fails`, without its package.json.
+    const whileItWaits = ["fails", "folder", "after"];
+
+    test.skipIf(isWindows).each([
+      { title: "one of them is between two scripts", packages: inside, manifest: root, inner: ["its-inner"] },
+      {
+        title: "one of them runs a script that reads its own files",
+        packages: {
+          ...inside,
+          inner: {
+            scripts: {
+              postinstall: `${records("inner-started")} && read line < "$GATE" && cat package.json > /dev/null && ${records("inner")}`,
+            },
+          },
+        },
+        manifest: root,
+        inner: ["its-inner"],
+      },
+      // `fails` has another `its-inner`, so `inner` is placed in the folder of `mid`, which is in the folder of `fails`.
+      {
+        title: "one of them is two folders down",
+        packages: {
+          inner: { scripts: between },
+          mid: { dependencies: its(["inner"], name => name) },
+          fails: { dependencies: { ...its(["mid"], name => name), ...its(["inner"], () => "other") } },
+        },
+        manifest: { ...root, dependencies: { ...its(["mid", "inner"], () => "plain"), after: "1.0.0" } },
+        inner: ["its-mid", "node_modules", "its-inner"],
+      },
+    ])(
+      "$title",
+      async ({ packages, manifest, inner }) => {
+        await using started = await installUntilAfterRan(packages, manifest, "fails");
+        const { ctx, proc } = started;
+        if (linker === "hoisted") {
+          expect({
+            seen: started.seen(),
+            innerIsThere: existsSync(ctx.installed("fails", "node_modules", ...inner, "package.json")),
+          }).toEqual({ seen: whileItWaits, innerIsThere: true });
+        }
+
+        started.openTheGate();
+        const [err, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+        expect({
+          errors: errorsOf(err),
+          last: ran(ctx).at(-1),
+          failsIsInstalled: existsSync(ctx.installed("fails")),
+          exitCode,
+        }).toEqual({
+          errors: [],
+          last: linker === "hoisted" ? "inner" : "fails",
+          failsIsInstalled: false,
+          exitCode: 0,
+        });
+      },
+      30_000,
+    );
+
+    // The root's `opt` is the package `fails`. `inner` is inside another `opt`, the one of `host`, so
+    // nothing has scripts left inside the root's `opt`: it goes when its script fails.
+    test.skipIf(isWindows)(
+      "none of them: the one with scripts left is inside another package of the same name",
+      async () => {
+        await using started = await installUntilAfterRan(
+          {
+            inner: { scripts: between },
+            holder: { dependencies: its(["inner"], name => name) },
+            host: { dependencies: { opt: "npm:holder@1.0.0", ...its(["inner"], () => "other") } },
+            fails: { dependencies: {} },
+          },
+          {
+            dependencies: { ...its(["inner"], () => "plain"), host: "1.0.0", after: "1.0.0" },
+            optionalDependencies: { opt: "npm:fails@1.0.0" },
+          },
+          "opt",
+        );
+        const { ctx, proc } = started;
+        if (linker === "hoisted") expect(started.seen()).toEqual(["fails", "after"]);
+
+        started.openTheGate();
+        const [err, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+        expect({ errors: errorsOf(err), ran: ran(ctx).includes("inner"), exitCode }).toEqual({
+          errors: [],
+          ran: true,
+          exitCode: 0,
+        });
+      },
+      30_000,
+    );
+
+    // bun is killed while `fails` waits for `inner`. The folder of `fails` is still there, but it does
+    // not count as installed: the next install places it again and runs the scripts again. The
+    // isolated linker has not run the script of `fails` at that time, so it has nothing to keep.
+    test.skipIf(!isLinux || linker === "isolated")(
+      "one of them is between two scripts, and bun is killed",
+      async () => {
+        await using started = await installUntilAfterRan(inside, root, "fails");
+        const { ctx, proc } = started;
+        expect(started.seen()).toEqual(whileItWaits);
+        proc.kill("SIGKILL");
+        await proc.exited;
+
+        await rm(ctx.env.SCRIPT_RUNS);
+        const openGate = join(ctx.packageDir, "open-gate");
+        await writeFile(openGate, "\n");
+        ctx.env.GATE = openGate;
+        const { err, exitCode } = await ctx.bun("install", "--concurrent-scripts=2");
+        expect({
+          errors: errorsOf(err),
+          failsRan: ran(ctx).includes("fails"),
+          failsIsInstalled: existsSync(ctx.installed("fails")),
+          exitCode,
+        }).toEqual({ errors: [], failsRan: true, failsIsInstalled: false, exitCode: 0 });
+      },
+      30_000,
     );
   });
 });

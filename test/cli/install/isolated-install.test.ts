@@ -6157,9 +6157,12 @@ describe.concurrent("bin links of a failed optional dependency (hoisted)", () =>
     expect(exitCode).toBe(0);
   });
 
-  // The links are removed when the script fails, not when the install ends, because a later failure ends the install
-  // immediately. Here, the required script waits for the optional package and its link to be removed. When it fails,
-  // its own package is removed too, so that the next install runs it again.
+  // When no scripted package is inside the folder of the optional package, the links are removed when the script
+  // fails, not when the install ends, because a later failure ends the install immediately. Here, the required
+  // script waits for the optional package and its link to be removed. When it fails, its own package is removed
+  // too, so that the next install runs it again. When a scripted package is inside, the folder and the links stay
+  // until the scripts have ended: see "packages inside its folder have scripts left to run" in
+  // bun-install-lifecycle-scripts.test.ts.
   test.concurrent("an install that a required script ends afterwards", async () => {
     const { packageDir } = await registry.createTestDir({
       bunfigOpts: { linker: "hoisted" },

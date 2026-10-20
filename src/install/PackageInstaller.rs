@@ -449,6 +449,21 @@ pub struct TreeContext {
 
 type TreeContextId = lockfile::tree::Id;
 
+/// Returns whether `tree` is the `node_modules` of the folder `alias` in the tree `parent`.
+fn is_node_modules_of_package(
+    tree: &Tree,
+    parent: lockfile::tree::Id,
+    alias: &[u8],
+    trees: &[Tree],
+    hoisted_deps: &[DependencyID],
+    deps: &[crate::Dependency],
+    string_buf: &[u8],
+) -> bool {
+    tree.parent == parent
+        && tree.folder_name(deps, string_buf) == alias
+        && !tree.is_unlinked_member(trees, hoisted_deps, deps)
+}
+
 /// Finds the tree whose `node_modules` contains `target_pkg_id`, walked in
 /// Node resolution order from `<start_tree>/<alias>/`: the child tree at
 /// `<start_tree>/<alias>/node_modules/`, then `start_tree`, then each ancestor.
@@ -471,10 +486,7 @@ fn find_native_binlink_target_tree(
     };
 
     for t in trees {
-        if t.parent == start_tree
-            && t.folder_name(deps, string_buf) == alias
-            && !t.is_unlinked_member(trees, hoisted_deps, deps)
-        {
+        if is_node_modules_of_package(t, start_tree, alias, trees, hoisted_deps, deps, string_buf) {
             if tree_contains(t.id) {
                 return Some(t.id);
             }
@@ -519,12 +531,68 @@ fn abs_node_modules_path(
     abs
 }
 
-/// For a workspace or a `link:` package, this only removes the link.
-pub(crate) fn remove_placed_package(
+/// Returns whether the `node_modules` of `tree_id` is in the folder `alias` of the tree `owner`.
+fn is_inside_package(
     lockfile: &Lockfile,
+    mut tree_id: lockfile::tree::Id,
+    owner: lockfile::tree::Id,
+    alias: &[u8],
+) -> bool {
+    let buffers = &lockfile.buffers;
+    let (trees, deps) = (buffers.trees.as_slice(), buffers.dependencies.as_slice());
+    let (hoisted_deps, string_buf) = (&buffers.hoisted_dependencies, &buffers.string_bytes);
+    while tree_id != lockfile::tree::INVALID_ID {
+        let tree = &trees[tree_id as usize];
+        if is_node_modules_of_package(tree, owner, alias, trees, hoisted_deps, deps, string_buf) {
+            return true;
+        }
+        tree_id = tree.parent;
+    }
+    false
+}
+
+/// Removes a failed optional package, unless a package inside its folder still has scripts to run.
+pub(crate) fn leave_out_placed_package(
+    lockfile: &Lockfile,
+    unfinished: &UnfinishedScripts,
     tree_id: lockfile::tree::Id,
     alias: &[u8],
 ) {
+    let mut listed = unfinished.borrow_mut();
+    if (listed.iter()).any(|(inner, _)| is_inside_package(lockfile, *inner, tree_id, alias)) {
+        // The folder stays as their working directory, but it no longer counts as installed.
+        let string_buf = lockfile.buffers.string_bytes.as_slice();
+        let path = abs_node_modules_path(lockfile, string_buf, tree_id);
+        if let Ok(node_modules) = Dir::open(path.slice()) {
+            delete_what_verify_reads(&node_modules, alias);
+        }
+        return;
+    }
+    listed.retain(|(tree, folder_name)| *tree != tree_id || **folder_name != *alias);
+    drop(listed);
+    remove_placed_package(lockfile, tree_id, alias);
+}
+
+/// Removes every listed package, so that the next install places it again and runs its scripts.
+pub(crate) fn discard_unfinished_packages(lockfile: &Lockfile, unfinished: &UnfinishedScripts) {
+    let mut listed = core::mem::take(&mut *unfinished.borrow_mut());
+    // A nested tree has the higher id, and a package behind a workspace link goes before the link.
+    while let Some(innermost) = (0..listed.len()).max_by_key(|&index| listed[index].0) {
+        let (tree_id, folder_name) = listed.swap_remove(innermost);
+        remove_placed_package(lockfile, tree_id, &folder_name);
+    }
+}
+
+/// After this, the package no longer counts as installed. A link is not followed.
+fn delete_what_verify_reads(node_modules: &Dir, alias: &[u8]) {
+    if let Some(package) = crate::prune::descend(node_modules, alias) {
+        let _ = package.delete_tree(b"package.json");
+        let _ = package.delete_tree(package_install::BUN_TAG);
+    }
+}
+
+/// For a workspace or a `link:` package, this only removes the link.
+fn remove_placed_package(lockfile: &Lockfile, tree_id: lockfile::tree::Id, alias: &[u8]) {
     let path = abs_node_modules_path(lockfile, lockfile.buffers.string_bytes.as_slice(), tree_id);
     let Ok(node_modules) = Dir::open(path.slice()) else {
         return;
@@ -538,11 +606,7 @@ pub(crate) fn remove_placed_package(
     if let Some(old) = moved {
         let _ = node_modules.delete_tree(old.as_bytes());
     } else {
-        // If the rename fails, delete the files `verify` reads first.
-        if let Some(package) = crate::prune::descend(&node_modules, alias) {
-            let _ = package.delete_tree(b"package.json");
-            let _ = package.delete_tree(package_install::BUN_TAG);
-        }
+        delete_what_verify_reads(&node_modules, alias);
         let _ = node_modules.delete_tree(alias);
     }
     crate::prune::prune_bins(&node_modules);
