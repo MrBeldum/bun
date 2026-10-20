@@ -32,6 +32,7 @@ use crate::package_manager_real::progress_strings::ProgressStrings;
 use crate::package_manager_task as task;
 use crate::patch_install::{self, PatchTask};
 use crate::postinstall_optimizer::{self, PostinstallOptimizer};
+use crate::prune::LinkedNodeModules;
 use crate::resolution::{self, Resolution};
 use crate::{
     DependencyID, DependencyInstallContext, ExtractData, PackageID, PackageNameHash,
@@ -70,6 +71,13 @@ pub struct PackageInstaller<'a> {
     /// The `node_modules` that the last package was linked into. It's kept open for the next
     /// package.
     pub(crate) tree_dir: Option<TreeDir>,
+    /// The base of the last `AnchorFrom::Base` tree. It's kept open for the next tree below it.
+    /// `None`: a no-links open can't start there.
+    pub(crate) base_dir: core::cell::RefCell<Option<(lockfile::tree::Id, Option<Dir>)>>,
+    /// Whether a no-links open from the project folder and from the root `node_modules` sees a
+    /// junction. It doesn't on a network volume, where the server resolves them.
+    #[cfg(windows)]
+    pub(crate) sees_junctions: [core::cell::Cell<Option<bool>>; 2],
     /// `None`: every package is linked in its turn.
     pub(crate) deferred: Option<DeferredLinks>,
     pub(crate) summary: &'a mut package_install::Summary,
@@ -206,23 +214,103 @@ impl DeferredLinks {
     }
 }
 
-/// A cheaper `join_z_buf` for two paths that are already normalized. A warm install calls this for
-/// every package.
-fn join_normalized_z<'b>(buf: &'b mut [u8], folder: &[u8], file_path: &[u8]) -> &'b ZStr {
+/// A cheaper `join_z_buf` for paths that are already normalized. Empty parts are skipped. A warm
+/// install calls this for every package.
+fn join_normalized_z<'b>(buf: &'b mut [u8], parts: &[&[u8]]) -> &'b ZStr {
     // A scoped alias contains a `/`, which Windows needs converted to `\`.
     if cfg!(windows) {
-        return join_z_buf::<platform::Auto>(buf, &[folder, file_path]);
+        return join_z_buf::<platform::Auto>(buf, parts);
     }
     let mut len = 0;
-    if !folder.is_empty() {
-        buf[..folder.len()].copy_from_slice(folder);
-        buf[folder.len()] = SEP;
-        len = folder.len() + 1;
+    for part in parts.iter().filter(|part| !part.is_empty()) {
+        if len != 0 {
+            buf[len] = SEP;
+            len += 1;
+        }
+        buf[len..len + part.len()].copy_from_slice(part);
+        len += part.len();
     }
-    buf[len..len + file_path.len()].copy_from_slice(file_path);
-    len += file_path.len();
     buf[len] = 0;
     ZStr::from_buf(buf, len)
+}
+
+/// Returns true if the installer makes the folder that owns `tree` as a directory of its own: a
+/// copy of a cache entry, or of a `file:` folder that `PackageInstall::verify_folder` checks.
+fn owner_is_copy(lockfile: &Lockfile, tree: &Tree) -> bool {
+    match lockfile.tree_owner_tag(tree.id) {
+        Some(resolution::Tag::Folder) => {
+            lockfile.is_workspace_tree_id(tree.parent) || lockfile.is_folder_tree_id(tree.parent)
+        }
+        Some(tag) => tag.can_enqueue_install_task(),
+        None => false,
+    }
+}
+
+/// Where the no-links opens for a tree start. Between that directory and the tree's
+/// `node_modules`, the installer makes every folder, so none of them is a link.
+#[derive(Clone, Copy)]
+pub(crate) struct TreeAnchor {
+    from: AnchorFrom,
+    /// The closest tree, at or above this one, whose owner isn't a copy (see `owner_is_copy`):
+    /// the root's or a workspace's.
+    base: lockfile::tree::Id,
+    /// The length of the base's `node_modules` in `NodeModulesFolder::path`.
+    base_len: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnchorFrom {
+    /// The base is the root `node_modules`, which the installer keeps open.
+    Root,
+    /// The base is a workspace's `node_modules`, named from the project folder by the workspace's
+    /// own folder. With `Some`, the tree's path goes through the workspace's symlink in the root
+    /// `node_modules`, and the folder of that package takes the symlink's place.
+    Project(Option<PackageID>),
+    /// The base is a workspace's `node_modules` that no path from the project folder names
+    /// without a link. It's opened the way an install opens it. See
+    /// `PackageInstaller::open_base`.
+    Base,
+}
+
+/// What `PackageInstaller::anchor_at` found for a `TreeAnchor`.
+enum AnchorAt<'a> {
+    Open(Anchor<'a>),
+    /// The base doesn't exist, so nothing is installed in the tree.
+    Missing,
+    /// No no-links open can start there.
+    Unusable,
+}
+
+/// A symlink in a tree's path, in the place of a folder that the installer makes.
+#[derive(Clone, Copy)]
+pub(crate) struct LinkAbove {
+    /// The tree of the dependency whose folder, `@scope` or `node_modules` it is.
+    tree: lockfile::tree::Id,
+    /// The length of the symlink's path in `NodeModulesFolder::path`.
+    len: u32,
+}
+
+/// A `TreeAnchor` whose directory is open. The joined `parts` are the path of the tree's
+/// `node_modules` from `dir`.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor<'a> {
+    dir: Fd,
+    parts: [&'a [u8]; 3],
+}
+
+impl Anchor<'_> {
+    /// Opens `file_path` in the tree's `node_modules` with `bun_sys::openat_no_symlinks`. Returns
+    /// `None` if this system has no such open.
+    pub(crate) fn open(&self, file_path: &[u8], flags: i32) -> Option<bun_sys::Result<Fd>> {
+        let parts = [self.parts[0], self.parts[1], self.parts[2], file_path];
+        // Three separators and the NUL.
+        if parts.iter().map(|part| part.len()).sum::<usize>() + 4 > MAX_PATH_BYTES {
+            return None;
+        }
+        let mut path_buf = bun_paths::path_buffer_pool::get();
+        let path = join_normalized_z(path_buf.as_mut_slice(), &parts);
+        bun_sys::openat_no_symlinks(self.dir, path, flags, 0)
+    }
 }
 
 impl NodeModulesFolder {
@@ -238,7 +326,7 @@ impl NodeModulesFolder {
                     .or_else(|| rest.is_empty().then_some(rest))
             })
             .unwrap_or(self.path.as_slice());
-        join_normalized_z(buf, folder, file_path.as_bytes())
+        join_normalized_z(buf, &[folder, file_path.as_bytes()])
     }
 
     /// Since the stack size of these functions are rather large, let's not let them be inlined.
@@ -292,6 +380,89 @@ impl NodeModulesFolder {
         bun_sys::fstatat(&dir, file_path).ok()
     }
 
+    /// Returns true if the entry itself is a symlink, and `None` if nothing is there.
+    pub(crate) fn is_link(&self, root_node_modules_dir: &Dir, file_path: &ZStr) -> Option<bool> {
+        let fits = file_path.len() + self.path.len() * 2 < MAX_PATH_BYTES;
+        // `lstatat` reports a junction as a directory. libuv's `lstat` reports a junction and a
+        // symlink as a link, and no other reparse point.
+        #[cfg(windows)]
+        let stat = {
+            let _ = root_node_modules_dir;
+            let mut path_buf = bun_paths::path_buffer_pool::get();
+            let parts = [self.path.as_slice(), file_path.as_bytes()];
+            let path = fits.then(|| join_z_buf::<platform::Auto>(path_buf.as_mut_slice(), &parts));
+            bun_sys::lstat(path?)
+        };
+        #[cfg(not(windows))]
+        let stat = if fits {
+            let mut path_buf = bun_paths::path_buffer_pool::get();
+            bun_sys::lstatat(
+                root_node_modules_dir.fd(),
+                self.path_from_root(path_buf.as_mut_slice(), file_path),
+            )
+        } else {
+            bun_sys::lstatat(&self.open_dir(root_node_modules_dir).ok()?, file_path)
+        };
+        Some(bun_sys::S::ISLNK(stat.ok()?.st_mode as bun_sys::Mode))
+    }
+
+    /// Returns where the no-links opens for this tree start. Returns `None` if the path to the
+    /// tree's base goes through a copy, or through one of bun's own symlinks that isn't a
+    /// workspace's (a `link:` dependency, or a folder that a package ships).
+    pub(crate) fn anchor(&self, lockfile: &Lockfile) -> Option<TreeAnchor> {
+        let trees = lockfile.buffers.trees.as_slice();
+        let dependencies = lockfile.buffers.dependencies.as_slice();
+        let string_buf = lockfile.buffers.string_bytes.as_slice();
+
+        // The path of a tree is `<parent tree>/<folder name>/node_modules`.
+        let mut tree = trees[self.tree_id as usize];
+        let mut base_len = self.path.len();
+        while tree.parent != lockfile::tree::INVALID_ID && owner_is_copy(lockfile, &tree) {
+            let folder_name = tree.folder_name(dependencies, string_buf);
+            base_len = base_len.checked_sub(folder_name.len() + "//node_modules".len())?;
+            tree = trees[tree.parent as usize];
+        }
+        let from = if tree.parent == lockfile::tree::INVALID_ID {
+            AnchorFrom::Root
+        } else if lockfile.tree_owner_tag(tree.id) != Some(resolution::Tag::Workspace) {
+            return None;
+        } else if tree.parent != 0 {
+            let mut above = trees[tree.parent as usize];
+            while above.parent != lockfile::tree::INVALID_ID {
+                if owner_is_copy(lockfile, &above) {
+                    return None;
+                }
+                above = trees[above.parent as usize];
+            }
+            AnchorFrom::Base
+        } else {
+            let package_id = lockfile.buffers.resolutions.as_slice()[tree.dependency_id as usize];
+            let folder = lockfile.packages.items_resolution()[package_id as usize]
+                .workspace()
+                .slice(string_buf);
+            if lockfile.linked_members.get(folder).is_some() || crate::bin::path_climbs_out(folder)
+            {
+                // A symlink leads to the workspace, or it's outside the project.
+                AnchorFrom::Base
+            } else {
+                // The path of a workspace that has no symlink in the root `node_modules` starts
+                // at the workspace's own folder.
+                let top_level_dir = FileSystem::instance().top_level_dir();
+                let through_root = (self.path)
+                    .strip_prefix(strings::without_trailing_slash(top_level_dir))
+                    .and_then(|rest| rest.strip_prefix(&[SEP]))
+                    .and_then(|rest| rest.strip_prefix(b"node_modules"))
+                    .is_some_and(|rest| rest.first() == Some(&SEP));
+                AnchorFrom::Project(through_root.then_some(package_id))
+            }
+        };
+        Some(TreeAnchor {
+            from,
+            base: tree.id,
+            base_len: u32::try_from(base_len).ok()?,
+        })
+    }
+
     /// Since the stack size of these functions are rather large, let's not let them be inlined.
     #[inline(never)]
     fn open_file_without_opening_directories(
@@ -305,23 +476,6 @@ impl NodeModulesFolder {
             bun_sys::O::RDONLY,
             0,
         )
-    }
-
-    pub(crate) fn read_small_file(
-        &self,
-        root_node_modules_dir: &Dir,
-        file_path: &ZStr,
-    ) -> crate::Result<bun_sys::file::ReadToEndResult> {
-        let file = self.open_file(root_node_modules_dir, file_path)?;
-        let res = file.read_to_end_small();
-        let _ = file.close(); // close error is non-actionable
-        Ok(match res {
-            Ok(bytes) => bun_sys::file::ReadToEndResult { bytes, err: None },
-            Err(e) => bun_sys::file::ReadToEndResult {
-                bytes: Vec::new(),
-                err: Some(e),
-            },
-        })
     }
 
     pub(crate) fn open_file(
@@ -378,6 +532,73 @@ impl NodeModulesFolder {
         }
     }
 
+    /// Below the `node_modules` of the project or of a workspace, the installer makes every
+    /// `@scope`, every folder that is a copy (see `owner_is_copy`) and the `node_modules` inside
+    /// it. Behind one of bun's own symlinks that isn't a workspace's, it makes the `node_modules`.
+    /// A symlink in the place of one of these points at a directory with files of its own.
+    ///
+    /// Returns the first such symlink in this tree's path. With `own`, this tree's own
+    /// `node_modules` is checked too.
+    pub(crate) fn link_above(&self, lockfile: &Lockfile, own: bool) -> Option<LinkAbove> {
+        let trees = lockfile.buffers.trees.as_slice();
+        let dependencies = lockfile.buffers.dependencies.as_slice();
+        let string_buf = lockfile.buffers.string_bytes.as_slice();
+        let mut path_buf = bun_paths::path_buffer_pool::get();
+        let mut is_link = |path: &[u8]| {
+            path.len() < MAX_PATH_BYTES
+                && LinkedNodeModules::is_at(bun_paths::resolve_path::z(path, &mut path_buf))
+                    == Some(true)
+        };
+        let mut path = self.path.as_slice();
+        let mut tree = trees[self.tree_id as usize];
+        let mut look_at_node_modules = own;
+        while tree.parent != lockfile::tree::INVALID_ID {
+            let folder_name = tree.folder_name(dependencies, string_buf);
+            let is_copy = owner_is_copy(lockfile, &tree);
+            let link = if is_copy {
+                let owner = dirname::<platform::Auto>(path);
+                if look_at_node_modules && is_link(path) {
+                    Some(path)
+                } else if is_link(owner) {
+                    Some(owner)
+                } else if strings::contains_char(folder_name, b'/') {
+                    Some(dirname::<platform::Auto>(owner)).filter(|scope| is_link(scope))
+                } else {
+                    None
+                }
+            } else if lockfile.tree_owner_tag(tree.id) == Some(resolution::Tag::Workspace) {
+                // The `node_modules` of a workspace is the user's.
+                None
+            } else {
+                (look_at_node_modules && is_link(path)).then_some(path)
+            };
+            if let Some(link) = link {
+                return Some(LinkAbove {
+                    tree: tree.id,
+                    len: link.len() as u32,
+                });
+            }
+            // The path to a workspace is the user's, and it doesn't have the form below if the
+            // workspace has no symlink in the root `node_modules`.
+            if !is_copy && tree.parent == 0 {
+                break;
+            }
+            look_at_node_modules = true;
+            // `path` is `<parent tree>/<folder name>/node_modules`.
+            let Some(parent_len) =
+                (path.len()).checked_sub(folder_name.len() + "//node_modules".len())
+            else {
+                return Some(LinkAbove {
+                    tree: tree.id,
+                    len: path.len() as u32,
+                });
+            };
+            path = &path[..parent_len];
+            tree = trees[tree.parent as usize];
+        }
+        None
+    }
+
     fn make_and_open_dir(&self, root: &Dir, lockfile: &Lockfile) -> crate::Result<Dir> {
         #[cfg(unix)]
         {
@@ -391,7 +612,13 @@ impl NodeModulesFolder {
 
         #[cfg(not(unix))]
         {
-            let _ = lockfile;
+            // Like `make_open_real_dir`: a junction at a package's `node_modules` is removed, not
+            // followed.
+            if !lockfile.is_importer_tree_id(self.tree_id) {
+                let mut path_buf = bun_paths::path_buffer_pool::get();
+                let path = bun_paths::resolve_path::z(self.path.as_slice(), &mut path_buf);
+                crate::prune::remove_planted_link(root, path)?;
+            }
             Ok(Dir::from_fd(
                 bun_sys::open_dir_at_windows_a(
                     root.fd(),
@@ -445,6 +672,22 @@ pub struct TreeContext {
     pub(crate) inside_replaced_folder: bool,
     /// See `PackageInstaller::set_outlived_root`.
     pub(crate) outlived_root: bool,
+    /// `NodeModulesFolder::anchor`, worked out once.
+    pub(crate) anchor: core::cell::Cell<Option<Option<TreeAnchor>>>,
+    /// For the tree of a workspace: a no-links open from the project folder was refused and no
+    /// folder below this tree's `node_modules` was a link. The link is in the workspace's own
+    /// path and `Lockfile::linked_members` doesn't have it (the workspace's `node_modules` is
+    /// one), so the opens of this tree and of the trees below it start at this `node_modules`.
+    pub(crate) opens_base: core::cell::Cell<bool>,
+    /// The result of `NodeModulesFolder::link_above` at the time the tree's first package is
+    /// linked.
+    pub(crate) behind_link: core::cell::Cell<Option<Option<LinkAbove>>>,
+    /// For `PackageInstaller::folder_above_has_link`: whether the tree's path has a symlink, and
+    /// the last `@scope` in the tree that was checked and isn't one.
+    pub(crate) has_link: core::cell::Cell<Option<bool>>,
+    pub(crate) real_scope: core::cell::RefCell<Vec<u8>>,
+    /// `PackageInstaller::skip_behind_link` has reported a `LinkAbove` of this tree.
+    pub(crate) link_reported: core::cell::Cell<bool>,
 }
 
 type TreeContextId = lockfile::tree::Id;
@@ -1191,6 +1434,250 @@ impl<'a> PackageInstaller<'a> {
             || deps.eql(&self.completed_trees.unmanaged))
             && LifecycleScriptSubprocess::alive_count().load(Ordering::Relaxed)
                 < self.manager().options.max_concurrent_lifecycle_scripts
+    }
+
+    /// Returns where the no-links opens for the current tree start, if they can start anywhere.
+    fn tree_anchor(&self) -> Option<TreeAnchor> {
+        let tree = &self.trees[self.current_tree_id as usize];
+        let mut anchor = tree.anchor.get().unwrap_or_else(|| {
+            let anchor = self.node_modules.anchor(self.lockfile());
+            tree.anchor.set(Some(anchor));
+            anchor
+        })?;
+        if matches!(anchor.from, AnchorFrom::Project(_))
+            && self.trees[anchor.base as usize].opens_base.get()
+        {
+            anchor.from = AnchorFrom::Base;
+        }
+        Some(anchor)
+    }
+
+    /// Returns the directory of `anchor` and the path of the current tree from it.
+    fn anchor_at(&self, anchor: TreeAnchor) -> AnchorAt<'_> {
+        let path = self.node_modules.path.as_slice();
+        let (Some(base), Some(below)) = (
+            path.get(..anchor.base_len as usize),
+            path.get(anchor.base_len as usize..),
+        ) else {
+            return AnchorAt::Unusable;
+        };
+        let below = below.strip_prefix(&[SEP]).unwrap_or(below);
+        let (dir, parts): (Fd, [&[u8]; 3]) = match anchor.from {
+            AnchorFrom::Root => (self.root_node_modules_folder.fd(), [b"", b"", below]),
+            AnchorFrom::Project(Some(workspace)) => {
+                let string_buf = self.lockfile().buffers.string_bytes.as_slice();
+                let folder = self.resolutions[workspace as usize]
+                    .workspace()
+                    .slice(string_buf);
+                let folder = strings::without_trailing_slash(folder);
+                (Fd::cwd(), [folder, b"node_modules", below])
+            }
+            AnchorFrom::Project(None) => {
+                let top_level_dir = FileSystem::instance().top_level_dir();
+                let top_level_len = strings::without_trailing_slash(top_level_dir).len() + 1;
+                let Some(base) = base.get(top_level_len..) else {
+                    return AnchorAt::Unusable;
+                };
+                (Fd::cwd(), [base, b"", below])
+            }
+            AnchorFrom::Base => match self.open_base(anchor.base, base) {
+                Ok(Some(fd)) => (fd, [b"", b"", below]),
+                Err(err) if matches!(err.get_errno(), bun_sys::E::ENOENT | bun_sys::E::ENOTDIR) => {
+                    return AnchorAt::Missing;
+                }
+                // The opens that follow links report what's wrong with the base.
+                Ok(None) | Err(_) => return AnchorAt::Unusable,
+            },
+        };
+        #[cfg(windows)]
+        if anchor.from != AnchorFrom::Base {
+            let seen = &self.sees_junctions[(anchor.from == AnchorFrom::Root) as usize];
+            let sees_junctions = seen.get().unwrap_or_else(|| {
+                let sees_junctions = matches!(bun_sys::is_remote_device(dir), Ok(false));
+                seen.set(Some(sees_junctions));
+                sees_junctions
+            });
+            if !sees_junctions {
+                return AnchorAt::Unusable;
+            }
+        }
+        AnchorAt::Open(Anchor { dir, parts })
+    }
+
+    /// Opens the `node_modules` of the workspace that owns the tree `base` the way an install
+    /// opens it, through any symlink. The directory stays open until another base is asked for.
+    /// Returns `Ok(None)` if no no-links open can start there.
+    fn open_base(&self, base: lockfile::tree::Id, path: &[u8]) -> bun_sys::Result<Option<Fd>> {
+        let mut base_dir = self.base_dir.borrow_mut();
+        if let Some((tree_id, dir)) = base_dir.as_ref()
+            && *tree_id == base
+        {
+            return Ok(dir.as_ref().map(|dir| dir.fd()));
+        }
+        // Closes the other base first.
+        *base_dir = None;
+        let mut path_buf = bun_paths::path_buffer_pool::get();
+        let dir = Dir::from_fd(bun_sys::openat(
+            Fd::cwd(),
+            bun_paths::resolve_path::z(path, &mut path_buf),
+            bun_sys::O::DIRECTORY | bun_sys::O::RDONLY | bun_sys::O::CLOEXEC,
+            0,
+        )?);
+        #[cfg(windows)]
+        let dir = matches!(bun_sys::is_remote_device(dir.fd()), Ok(false)).then_some(dir);
+        #[cfg(not(windows))]
+        let dir = Some(dir);
+        let fd = dir.as_ref().map(|dir| dir.fd());
+        *base_dir = Some((base, dir));
+        Ok(fd)
+    }
+
+    /// Returns true if a folder above `alias` in the current tree is a symlink. The tree's own
+    /// folders are checked once, and an `@scope` once for each run of its packages.
+    fn folder_above_has_link(&self, alias: &ZStr) -> bool {
+        let tree = &self.trees[self.current_tree_id as usize];
+        let has_link = tree.has_link.get().unwrap_or_else(|| {
+            let has_link = (self.node_modules)
+                .link_above(self.lockfile(), true)
+                .is_some();
+            tree.has_link.set(Some(has_link));
+            has_link
+        });
+        if has_link {
+            return true;
+        }
+        if let Some((scope, _)) = strings::split_once_char(alias.as_bytes(), b'/')
+            && *tree.real_scope.borrow() != scope
+        {
+            let mut scope_buf = bun_paths::path_buffer_pool::get();
+            let scope_path = bun_paths::resolve_path::z(scope, &mut scope_buf);
+            if (self.node_modules).is_link(&self.root_node_modules_folder, scope_path)
+                != Some(false)
+            {
+                return true;
+            }
+            *tree.real_scope.borrow_mut() = scope.to_vec();
+        }
+        false
+    }
+
+    /// `NodeModulesFolder::link_above` for the current tree. It's looked up once, when the tree's
+    /// first package is about to be linked, because every package above it is linked by then.
+    fn tree_behind_link(&self) -> Option<LinkAbove> {
+        let tree = &self.trees[self.current_tree_id as usize];
+        tree.behind_link.get().unwrap_or_else(|| {
+            let behind = self.node_modules.link_above(self.lockfile(), false);
+            tree.behind_link.set(Some(behind));
+            behind
+        })
+    }
+
+    /// `PackageInstall::verify` for a package of the current tree.
+    fn is_installed(
+        &self,
+        installer: &mut PackageInstall<'_>,
+        resolution: &Resolution,
+        package_id: PackageID,
+    ) -> bool {
+        use package_install::{Refused, Verified};
+        let integrity = &self.metas[package_id as usize].integrity;
+        let skips_verify = self.manager().skips_verify(resolution.tag);
+        let root = &self.root_node_modules_folder;
+        if !resolution.tag.can_enqueue_install_task() {
+            return installer.verify(resolution, integrity, skips_verify, root, None)
+                == Verified::Yes;
+        }
+
+        // The installer makes the folder of a package from the cache, and every folder between
+        // it and the tree's base. If one of them is a symlink, what's behind it isn't this
+        // package, and the `node_modules` below isn't this package's. The open in `verify`
+        // refuses such a path, so a warm install pays no `lstat` for it.
+        let anchor = self.tree_anchor();
+        let mut refused = Refused::NoOpen;
+        match anchor.map(|anchor| self.anchor_at(anchor)) {
+            Some(AnchorAt::Open(at)) => {
+                match installer.verify(resolution, integrity, skips_verify, root, Some(at)) {
+                    Verified::Yes => return true,
+                    Verified::No => return false,
+                    Verified::Refused(why) => refused = why,
+                }
+            }
+            Some(AnchorAt::Missing) => return false,
+            Some(AnchorAt::Unusable) | None => {}
+        }
+
+        // The open was refused, or there's no such open for this tree. Look at the folders.
+        if self.folder_above_has_link(installer.destination_dir_subpath)
+            || (self.node_modules).is_link(root, installer.destination_dir_subpath) != Some(false)
+        {
+            return false;
+        }
+
+        // No folder below the base is a link. If the open started at the project folder, the link
+        // is in the workspace's own path, which is the user's: open the base from now on.
+        if refused == Refused::Path
+            && let Some(anchor) = anchor
+            && matches!(anchor.from, AnchorFrom::Project(_))
+            && !self.trees[anchor.base as usize].opens_base.replace(true)
+            && let AnchorAt::Open(at) = self.anchor_at(TreeAnchor {
+                from: AnchorFrom::Base,
+                ..anchor
+            })
+        {
+            match installer.verify(resolution, integrity, skips_verify, root, Some(at)) {
+                Verified::Yes => return true,
+                Verified::No => return false,
+                Verified::Refused(_) => {}
+            }
+        }
+        // A file of the package is a link (`--backend=symlink`), or this system has no such open.
+        // No folder of the path is a link, so this open reads the package's own files.
+        installer.verify(resolution, integrity, skips_verify, root, None) == Verified::Yes
+    }
+
+    /// Counts a package of the current tree that isn't installed because `link` is in the tree's
+    /// path, and reports the link once.
+    fn skip_behind_link(&mut self, link: LinkAbove, log_level: Options::LogLevel) {
+        let lockfile = self.lockfile();
+        let owner = lockfile.buffers.trees.as_slice()[link.tree as usize].dependency_id;
+        let owner_package_id = lockfile.buffers.resolutions.as_slice()[owner as usize];
+        // `report_offline_misses` decides whether the owner is an error. The packages below an
+        // owner that isn't installed aren't needed.
+        if self.manager().options.offline
+            == crate::package_manager_real::options::OfflineMode::Offline
+            && (self.summary.offline_misses.missing).contains(&owner_package_id)
+        {
+            return;
+        }
+        let required = (self.manager()).is_package_required(owner, owner_package_id);
+        self.summary.fail += required as u32;
+        if !required
+            || log_level == Options::LogLevel::Silent
+            || self.trees[link.tree as usize].link_reported.replace(true)
+        {
+            return;
+        }
+        let path = self.node_modules.path.as_slice();
+        let path = path.get(..link.len as usize).unwrap_or(path);
+        // The project's folder says nothing about a global install.
+        let top_level_dir = strings::without_trailing_slash(FileSystem::instance().top_level_dir());
+        let path = (!self.manager().options.global)
+            .then(|| path.strip_prefix(top_level_dir)?.strip_prefix(&[SEP]))
+            .flatten()
+            .unwrap_or(path);
+        let string_buf = lockfile.buffers.string_bytes.as_slice();
+        let owner_name = lockfile.buffers.dependencies.as_slice()[owner as usize]
+            .name
+            .slice(string_buf);
+        Output::err(
+            crate::Error::Sys(bun_errno::SystemErrno::ELOOP),
+            "cannot install through symlink {}, the packages below <b>{}<r> are missing",
+            (
+                crate::prune::native_path(path),
+                bun_core::fmt::for_terminal(bstr::BStr::new(owner_name)),
+            ),
+        );
+        bun_core::note!("remove the link and run 'bun install'");
     }
 
     /// A tree can start installing packages when the parent has installed all its packages. If the parent
@@ -1986,12 +2473,7 @@ impl<'a> PackageInstaller<'a> {
         let needs_install = !verifying
             || remove_patch
             || inside_replaced_folder
-            || !installer.verify(
-                resolution,
-                &self.metas[package_id as usize].integrity,
-                self.manager().skips_verify(resolution.tag),
-                &self.root_node_modules_folder,
-            );
+            || !self.is_installed(&mut installer, resolution, package_id);
         self.summary.skipped += (!needs_install) as u32;
         if !needs_install && log_level.show_progress() {
             self.node.complete_one();
@@ -2154,6 +2636,16 @@ impl<'a> PackageInstaller<'a> {
                         path: self.node_modules.path.clone(),
                     });
                 self.pending_install_count += 1;
+                return;
+            }
+
+            // Nothing is installed below a package whose folder is still a symlink. An install
+            // that made the root `node_modules` has made every folder below it.
+            if !(self.skip_delete && !outlived_root)
+                && let Some(link) = self.tree_behind_link()
+            {
+                self.skip_behind_link(link, log_level);
+                self.increment_tree_install_count(is_pending_package_install, log_level);
                 return;
             }
 

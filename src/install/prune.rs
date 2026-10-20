@@ -196,7 +196,7 @@ impl Plan {
 
 /// Formats `path` for a message. On Windows a path can mix separators, because bun.lock stores a
 /// workspace's path with `/` and `join` adds the platform's separator.
-fn native_path(path: &[u8]) -> impl core::fmt::Display + '_ {
+pub(crate) fn native_path(path: &[u8]) -> impl core::fmt::Display + '_ {
     use bun_core::fmt::{EscapeControlChars, PathFormatOptions, PathSep, fmt_path};
     // On other platforms `\` is an ordinary character in a file name, so it is not converted.
     let path_sep = if cfg!(windows) {
@@ -1129,9 +1129,17 @@ impl<'a> HoistedTree<'a> {
                 };
             }
             ResolutionTag::Folder if kind == EntryKind::SymLink => return Installed::Matches,
+            // Like `PackageInstaller::is_installed`: a link isn't the copy of a package from the
+            // cache, unless the isolated linker made it.
+            tag if kind == EntryKind::SymLink
+                && tag.can_enqueue_install_task()
+                && store_link_target(&folder, alias).is_none() =>
+            {
+                return Installed::Mismatch;
+            }
             _ => {}
         }
-        // A link counts as what it points at, as in `PackageInstall::verify`.
+        // Any other link counts as what it points at.
         let package = match kind {
             EntryKind::SymLink if is_dangling(&folder, alias) => return Installed::Missing,
             EntryKind::SymLink => folder.open_at(alias).ok(),
