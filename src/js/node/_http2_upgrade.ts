@@ -92,6 +92,12 @@ function tlsSocketWrite(this: TLSProxySocket, chunk: Buffer, encoding: string, c
     callback(new Error("Socket is closed"));
     return;
   }
+  // As in net.ts's streamEngineWrite: one SSL_write takes at most 2^31 - 1 bytes and nothing sends the rest.
+  if (chunk.length > 0x7fffffff) {
+    const { ErrnoException } = require("internal/shared");
+    callback(new ErrnoException(process.binding("uv").UV_EPROTO, "write"));
+    return;
+  }
   // $write returns true if fully flushed, false if buffered
   if (h.$write(chunk, encoding)) {
     callback();

@@ -216,7 +216,7 @@ pub mod socket_transfer {
 // SAFETY (safe fn): `UpgradedDuplex` is an `opaque_extern!` ZST handle (`!Freeze`
 // via `UnsafeCell`), so `&`/`&mut` carry no `readonly`/`noalias` and are
 // ABI-identical to non-null `*const`/`*mut`. Shims taking only the handle +
-// scalars are `safe fn`; the two `(ptr,len)` slice writers stay `unsafe fn`.
+// scalars are `safe fn`; the `(ptr,len)` slice writers stay `unsafe fn`.
 unsafe extern "C" {
     safe fn UpgradedDuplex__ssl_error(this: &UpgradedDuplex) -> us_bun_verify_error_t;
     safe fn UpgradedDuplex__is_established(this: &UpgradedDuplex) -> bool;
@@ -234,6 +234,7 @@ unsafe extern "C" {
         ptr: *const u8,
         len: usize,
     ) -> i32;
+    fn UpgradedDuplex__seal(this: *mut UpgradedDuplex, ptr: *const u8, len: usize) -> i32;
     fn UpgradedDuplex__raw_write(this: *mut UpgradedDuplex, ptr: *const u8, len: usize) -> i32;
     safe fn UpgradedDuplex__shutdown(this: &mut UpgradedDuplex);
     safe fn UpgradedDuplex__shutdown_read(this: &mut UpgradedDuplex);
@@ -286,6 +287,13 @@ impl UpgradedDuplex {
         // the call, and `(data.as_ptr(), data.len())` is a valid readable region
         // borrowed for the call's duration; the callee only reads from it.
         unsafe { UpgradedDuplex__encode_and_write(self, data.as_ptr(), data.len()) }
+    }
+    #[inline]
+    pub(crate) fn seal(&mut self, data: &[u8]) -> i32 {
+        // SAFETY: `&mut self` coerces to a non-null `*mut UpgradedDuplex` valid for
+        // the call, and `(data.as_ptr(), data.len())` is a valid readable region
+        // borrowed for the call's duration; the callee only reads from it.
+        unsafe { UpgradedDuplex__seal(self, data.as_ptr(), data.len()) }
     }
     #[inline]
     pub(crate) fn raw_write(&mut self, data: &[u8]) -> i32 {

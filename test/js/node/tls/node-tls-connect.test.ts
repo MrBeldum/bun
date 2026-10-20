@@ -1681,6 +1681,168 @@ describe("application data written over a Duplex transport before the handshake 
     });
   });
 
+  // Node's JSStreamSocket has no 'drain' listener on the stream it wraps:
+  // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/js_stream_socket.js#L64-L92
+  describe("what runs inside the transport's write() sends nothing twice", () => {
+    const clientWraps = {
+      "tls.connect({ socket })": (socket: Duplex) => tls.connect({ socket, rejectUnauthorized: false }),
+      "new TLSSocket(socket)": (socket: Duplex) => new TLSSocket(socket, { rejectUnauthorized: false }),
+    };
+    // `client` writes "parked" before its handshake and ends. Resolves once it closed, with what the server got.
+    async function parkedWrite(client: TLSSocket, serverSide: Duplex) {
+      const received: Buffer[] = [];
+      const errors: unknown[] = [];
+      let callbacks = 0;
+      const server = new TLSSocket(serverSide, serverContext());
+      server.on("data", (chunk: Buffer) => received.push(chunk));
+      server.on("end", () => server.end());
+      server.on("error", (err: NodeJS.ErrnoException) => errors.push(err.code));
+      client.on("data", () => {});
+      client.on("error", (err: NodeJS.ErrnoException) => errors.push(err.code));
+      const closed = closeOf(client, []);
+      client.write("parked", () => callbacks++);
+      client.end();
+      await closed;
+      return { received: Buffer.concat(received).toString(), errors, callbacks, bytesWritten: client.bytesWritten };
+    }
+
+    it.each(Object.keys(clientWraps) as (keyof typeof clientWraps)[])(
+      "%s: a 'drain' the transport emits there",
+      async wrap => {
+        const { clientSide, serverSide } = inMemoryPair(synchronously, undefined, {
+          client: () => void clientSide.emit("drain"),
+        });
+        const client = clientWraps[wrap](clientSide);
+        const drainListeners = [clientSide.listenerCount("drain")];
+        const result = await parkedWrite(client, serverSide);
+        drainListeners.push(clientSide.listenerCount("drain"));
+        expect({ ...result, drainListeners }).toEqual({
+          received: "parked",
+          errors: [],
+          callbacks: 1,
+          bytesWritten: 6,
+          drainListeners: [0, 0],
+        });
+      },
+    );
+
+    it("new TLSSocket(socket, { isServer: true }): a 'drain' the transport emits there", async () => {
+      const { clientSide, serverSide } = inMemoryPair(synchronously, undefined, {
+        server: () => void serverSide.emit("drain"),
+      });
+      const received: Buffer[] = [];
+      const server = new TLSSocket(serverSide, serverContext());
+      server.on("data", () => {});
+      server.write("banner");
+      server.end();
+      const client = tls.connect({ socket: clientSide, rejectUnauthorized: false });
+      client.on("data", (chunk: Buffer) => received.push(chunk));
+      client.on("end", () => client.end());
+      await closeOf(client, [client, server]);
+      expect({
+        received: Buffer.concat(received).toString(),
+        bytesWritten: server.bytesWritten,
+        drainListeners: serverSide.listenerCount("drain"),
+      }).toEqual({ received: "banner", bytesWritten: 6, drainListeners: 0 });
+    });
+
+    it("a 'drain' emitted by a write() override does not nest the transport's writes", async () => {
+      const { clientSide, serverSide } = inMemoryPair(synchronously);
+      let depth = 0;
+      let deepest = 0;
+      const write = clientSide.write;
+      clientSide.write = function (this: Duplex, ...args: any[]) {
+        deepest = Math.max(deepest, ++depth);
+        // Bounded, so a nested write shows as a depth and not as a stack overflow.
+        if (depth < 3) this.emit("drain");
+        try {
+          return write.apply(this, args);
+        } finally {
+          depth--;
+        }
+      } as typeof write;
+      const client = tls.connect({ socket: clientSide, rejectUnauthorized: false });
+      const { received, errors } = await parkedWrite(client, serverSide);
+      expect({ received, errors, deepest }).toEqual({ received: "parked", errors: [], deepest: 1 });
+    });
+
+    it("a flush of the socket's handle there", async () => {
+      let client: TLSSocket | undefined;
+      const { clientSide, serverSide } = inMemoryPair(synchronously, undefined, {
+        client: () => void (client as any)?._handle?.flush(),
+      });
+      client = tls.connect({ socket: clientSide, rejectUnauthorized: false });
+      expect(await parkedWrite(client, serverSide)).toEqual({
+        received: "parked",
+        errors: [],
+        callbacks: 1,
+        bytesWritten: 6,
+      });
+    });
+
+    // Stock sockets only: the dialing socket emits its own 'drain' while the TLS socket over it is still connecting.
+    it("a TLSSocket over a net.Socket that has not sent what it was given before the wrap", async () => {
+      const preface = Buffer.alloc(64 * 1024, "p");
+      const { promise: received, resolve, reject } = Promise.withResolvers<string>();
+      const server = net.createServer(accepted => {
+        let seen = 0;
+        accepted.on("error", reject);
+        accepted.on("data", function onPreface(chunk: Buffer) {
+          if ((seen += chunk.length) < preface.length) return;
+          accepted.removeListener("data", onPreface);
+          const secure = tls.connect({ socket: accepted, rejectUnauthorized: false });
+          let text = "";
+          secure.setEncoding("utf8");
+          secure.on("error", reject);
+          secure.on("data", chunk => (text += chunk));
+          secure.on("end", () => resolve(text));
+        });
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const raw = net.connect((server.address() as AddressInfo).port, "127.0.0.1");
+      try {
+        raw.on("error", reject);
+        raw.write(preface);
+        const socket = new TLSSocket(raw, serverContext());
+        socket.on("error", reject);
+        socket.write("hello", () => socket.end());
+        expect({ received: await received, bytesWritten: socket.bytesWritten }).toEqual({
+          received: "hello",
+          bytesWritten: 5,
+        });
+      } finally {
+        raw.destroy();
+        server.close();
+      }
+    });
+  });
+
+  // One SSL_write takes at most 2^31 - 1 bytes. Node fails the write and hands the stream nothing:
+  // https://github.com/nodejs/node/blob/v26.3.0/src/crypto/crypto_tls.cc#L1105-L1126
+  it("one write above 2^31 - 1 bytes fails with EPROTO", async () => {
+    let transportWrites = 0;
+    const { clientSide, serverSide } = inMemoryPair(synchronously, () => transportWrites++);
+    const server = new TLSSocket(serverSide, serverContext());
+    server.on("error", () => {});
+    server.resume();
+    const client = tls.connect({ socket: clientSide, rejectUnauthorized: false });
+    try {
+      await once(client, "secureConnect");
+      const { promise: failed, resolve } = Promise.withResolvers<Record<string, unknown>>();
+      client.on("error", () => {});
+      const before = transportWrites;
+      // Never touched: no page of it is committed.
+      client.write(Buffer.alloc(2 ** 31), (err: any) =>
+        resolve({ code: err?.code, syscall: err?.syscall, transportWrites: transportWrites - before }),
+      );
+      expect(await failed).toEqual({ code: "EPROTO", syscall: "write", transportWrites: 0 });
+    } finally {
+      client.destroy();
+      server.destroy();
+    }
+  });
+
   // A synchronous transport feeds the peer's answer to the engine from inside
   // the engine's own transport write. A TLS write issued there, before that
   // transport write returns, finds the peer's last handshake flight queued but
@@ -6426,6 +6588,102 @@ it("an HTTP/2 request completes over a Duplex that emits 'drain' in its _write()
     session.destroy();
     raw.destroy();
     server.close();
+  }
+});
+
+// This transport hands each chunk to the socket at once, so a record written from inside its write() would pass
+// the one that write() is still carrying.
+it("an HTTP/2 request body arrives intact over a Duplex whose write() override emits 'drain'", async () => {
+  const body = Buffer.alloc(512 * 1024, Buffer.from(Array.from({ length: 251 }, (_, i) => i)));
+  const { promise, resolve, reject } = Promise.withResolvers<{ status: unknown; received: number; intact: boolean }>();
+  const server = http2.createSecureServer(COMMON_CERT_);
+  server.on("sessionError", reject);
+  server.on("stream", (stream: http2.ServerHttp2Stream) => {
+    const chunks: Buffer[] = [];
+    stream.on("error", reject);
+    stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+    stream.on("end", () => {
+      const all = Buffer.concat(chunks);
+      stream.respond({ ":status": 200, "x-received": String(all.length), "x-intact": String(all.equals(body)) });
+      stream.end();
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const raw = net.connect((server.address() as AddressInfo).port, "127.0.0.1");
+  await once(raw, "connect");
+  class Direct extends Duplex {
+    _read() {}
+    write(chunk: any, encoding?: any, callback?: any) {
+      this.emit("drain");
+      raw.write(chunk, typeof encoding === "function" ? encoding : callback);
+      return true;
+    }
+    end() {
+      raw.end();
+      return this;
+    }
+  }
+  const transport = new Direct();
+  raw.on("data", chunk => transport.push(chunk));
+  raw.on("error", reject);
+  raw.on("close", () => reject(new Error("the connection closed before the response ended")));
+  const session = http2.connect("https://localhost", {
+    createConnection: () => tls.connect({ socket: transport, ALPNProtocols: ["h2"], rejectUnauthorized: false }),
+  });
+  try {
+    session.on("error", reject);
+    const request = session.request({ ":path": "/", ":method": "POST" });
+    request.on("error", reject);
+    request.on("close", () => reject(new Error("the request closed before its response ended")));
+    request.on("response", headers => {
+      request.resume();
+      request.on("end", () =>
+        resolve({
+          status: headers[":status"],
+          received: Number(headers["x-received"]),
+          intact: headers["x-intact"] === "true",
+        }),
+      );
+    });
+    request.end(body);
+    expect(await promise).toEqual({ status: 200, received: body.length, intact: true });
+  } finally {
+    session.destroy();
+    raw.destroy();
+    server.close();
+  }
+});
+
+it("http2.createSecureServer().emit('connection', socket) puts no 'drain' listener on that socket", async () => {
+  const h2Server = http2.createSecureServer(COMMON_CERT_);
+  const { promise: drainListeners, resolve, reject } = Promise.withResolvers<number>();
+  let accepted: net.Socket | undefined;
+  h2Server.on("stream", (stream: http2.ServerHttp2Stream) => {
+    resolve(accepted!.listenerCount("drain"));
+    stream.respond({ ":status": 200 });
+    stream.end();
+  });
+  const tcp = net.createServer(raw => {
+    accepted = raw;
+    h2Server.emit("connection", raw);
+  });
+  tcp.listen(0, "127.0.0.1");
+  await once(tcp, "listening");
+  const session = http2.connect(`https://localhost:${(tcp.address() as AddressInfo).port}`, {
+    rejectUnauthorized: false,
+  });
+  try {
+    session.on("error", reject);
+    const request = session.request({ ":path": "/" });
+    request.on("error", reject);
+    request.resume();
+    request.end();
+    expect(await drainListeners).toBe(0);
+  } finally {
+    session.destroy();
+    tcp.close();
+    h2Server.close();
   }
 });
 

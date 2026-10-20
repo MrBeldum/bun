@@ -881,6 +881,17 @@ pub mod ssl_wrapper {
 
         /// Send data to the network (unencrypted data)
         pub fn write_data(&self, data: &[u8]) -> Result<usize, WriteDataError> {
+            self.seal_then::<true>(data)
+        }
+
+        /// [`Self::write_data`] without its pass: the records stay queued until [`Self::flush`].
+        /// For an owner that lends `data` from a buffer it settles before the transport runs.
+        pub fn seal(&self, data: &[u8]) -> Result<usize, WriteDataError> {
+            self.seal_then::<false>(data)
+        }
+
+        #[inline(always)]
+        fn seal_then<const DELIVER: bool>(&self, data: &[u8]) -> Result<usize, WriteDataError> {
             let Some(ssl) = self.ssl.get() else {
                 return Err(WriteDataError::ConnectionClosed);
             };
@@ -897,12 +908,16 @@ pub mod ssl_wrapper {
 
             if data.is_empty() {
                 // just cycle through internal openssl's state
-                self.handle_traffic();
+                if DELIVER {
+                    self.handle_traffic();
+                }
                 return Ok(0);
             }
             // SSL_write would drive the pending handshake itself, bypassing on_handshake.
             if self.flags.handshake_state() == HandshakeState::HandshakePending {
-                self.handle_traffic();
+                if DELIVER {
+                    self.handle_traffic();
+                }
                 return Err(WriteDataError::WantRead);
             }
             let data = &data[..data.len().min(c_int::MAX as usize)];
@@ -928,12 +943,16 @@ pub mod ssl_wrapper {
 
                 if err == boring_sys::SSL_ERROR_WANT_READ {
                     // we wanna read/write
-                    self.handle_traffic();
+                    if DELIVER {
+                        self.handle_traffic();
+                    }
                     return Err(WriteDataError::WantRead);
                 }
                 if err == boring_sys::SSL_ERROR_WANT_WRITE {
                     // we wanna read/write
-                    self.handle_traffic();
+                    if DELIVER {
+                        self.handle_traffic();
+                    }
                     return Err(WriteDataError::WantWrite);
                 }
                 // some bad error happened here we must close
@@ -943,7 +962,9 @@ pub mod ssl_wrapper {
                 self.trigger_close_callback();
                 return Err(WriteDataError::ConnectionClosed);
             }
-            self.handle_traffic();
+            if DELIVER {
+                self.handle_traffic();
+            }
             Ok(usize::try_from(written).expect("int cast"))
         }
 

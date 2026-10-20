@@ -504,6 +504,20 @@ function onUpgradedConnect(self, connection) {
 function onUpgradedEnd(connection, eof) {
   if (!connection.destroyed) eof();
 }
+// One SSL_write takes at most 2^31 - 1 bytes, and over a stream nothing sends the rest of a longer chunk.
+// Node fails that write: https://github.com/nodejs/node/blob/v26.3.0/src/crypto/crypto_tls.cc#L1105-L1126
+const kMaxTLSWrite = 0x7fffffff;
+function streamEngineWrite(chunk, encoding, callback) {
+  // A string is at most 3 bytes for each UTF-16 unit.
+  if (
+    chunk.length > kMaxTLSWrite / 3 &&
+    (typeof chunk === "string" ? Buffer.byteLength(chunk, encoding) : chunk.length) > kMaxTLSWrite
+  ) {
+    callback(new ErrnoException(uv().UV_EPROTO, "write"));
+    return false;
+  }
+  return Socket.prototype._write.$call(this, chunk, encoding, callback);
+}
 function attachTLSEngine(self, connection, options) {
   const [handle, events] = upgradeDuplexToTLS(connection, options);
   connection.on("data", events[0]);
@@ -513,6 +527,7 @@ function attachTLSEngine(self, connection, options) {
   // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/js_stream_socket.js#L117-L120
   connection.resume();
   self._handle = handle;
+  self._write = streamEngineWrite;
 }
 function adoptTLSPair(self, connection, pair) {
   if (!pair) throw new Error("Invalid socket");

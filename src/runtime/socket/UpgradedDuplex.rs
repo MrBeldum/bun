@@ -566,6 +566,17 @@ impl UpgradedDuplex {
         0
     }
 
+    /// [`Self::encode_and_write`] that leaves the duplex's `write()` to the next [`Self::flush`].
+    #[uws_callback(export = "UpgradedDuplex__seal")]
+    pub(crate) fn seal(&self, data: &[u8]) -> i32 {
+        bun_output::scoped_log!(UpgradedDuplex, "seal (len: {})", data.len());
+        if let Some(w) = self.wrapper_ref() {
+            let written = w.seal(data).unwrap_or(0);
+            return i32::try_from(written).expect("int cast");
+        }
+        0
+    }
+
     #[uws_callback(export = "UpgradedDuplex__raw_write")]
     pub(crate) fn raw_write(&self, encoded_data: &[u8]) -> i32 {
         self.write_encrypted(encoded_data);

@@ -3176,8 +3176,8 @@ impl<const SSL: bool> NewSocket<SSL> {
         // `bytes_written`/`flags`/`buffered_data_for_node_net` across the
         // re-entrant `do_socket_write`) is no longer needed.
         if self.buffered_data_for_node_net.get().len() > 0 {
-            // Neither write call touches `buffered_data_for_node_net`, so a
-            // `JsCell::get()` projection is valid for the duration of the call.
+            // Over a Duplex this only seals the records: the stream's `write()` runs in the
+            // flush below, after the queue is settled.
             // The drain-driven retry must detect a fatal send error the same way
             // the initial write does: once the peer is gone the kernel rejects
             // every retry (EPIPE/ECONNRESET), and treating that as would-block
@@ -3186,10 +3186,13 @@ impl<const SSL: bool> NewSocket<SSL> {
             let res: i32 = if self.flags.get().contains(Flags::BYPASS_TLS) {
                 self.do_socket_write(self.buffered_data_for_node_net.get().slice())
             } else {
-                let (res, fatal_errno) = self
-                    .socket
-                    .get()
-                    .write_check_error(self.buffered_data_for_node_net.get().slice());
+                let socket = self.socket.get();
+                let pending = self.buffered_data_for_node_net.get().slice();
+                let (res, fatal_errno) = if SSL {
+                    socket.write_before_flush(pending)
+                } else {
+                    socket.write_check_error(pending)
+                };
                 if fatal_errno != 0 {
                     // Same rule as write_maybe_corked: drop the undeliverable
                     // buffer, stop re-arming the writable retry, and report the
@@ -4977,7 +4980,7 @@ pub(crate) fn js_upgrade_duplex_to_tls(
 
     let array = JSValue::create_empty_array(global, 2)?;
     array.put_index(global, 0, tls_js_value)?;
-    // data, end, drain and close events must be reported
+    // data, end and close events must be reported
     array.put_index(
         global,
         1,

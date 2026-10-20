@@ -257,6 +257,17 @@ impl<const IS_SSL: bool> NewSocketHandler<IS_SSL> {
         )
     }
 
+    /// [`Self::write_check_error`] for a caller that lends `data` from a buffer it settles before
+    /// it calls [`Self::flush`]: a Duplex's `write()` can re-enter the caller, so it runs in that flush.
+    pub fn write_before_flush(&self, data: &[u8]) -> (i32, i32) {
+        on_socket!(self.socket;
+            connected s => s.write_check_error(data),
+            duplex d => (d.seal(data), 0),
+            pipe p => (p.encode_and_write(data), 0),
+            else => (0, 0),
+        )
+    }
+
     pub fn is_closed(&self) -> bool {
         on_socket!(self.socket;
             connected s => s.is_closed(),
