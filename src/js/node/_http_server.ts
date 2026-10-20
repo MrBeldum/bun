@@ -2227,8 +2227,7 @@ function getNodeHTTPServerSocket() {
           const flushed = handle.write(_chunk, _encoding);
           if (!flushed && handle.ondrain) {
             // Streaming mode (CONNECT tunnels): wait for the native drain
-            // callback before completing the write, in the async context of
-            // this call (see net.Socket's waitedWrite).
+            // callback before completing the write.
             this.#pendingCallback = AsyncContextFrame.runInSameGraph.bind(
               undefined,
               $getInternalField($asyncContext, 0),
@@ -4185,9 +4184,7 @@ function callWriteHeadIfObservable(self, headerState, fromEnd?) {
   }
 }
 
-// The async context of the first write that waited for the socket. Node parks that write on the socket with its
-// context, and what is queued behind it completes there too: the write callbacks, 'drain', and the 'finish' of an end()
-// behind it. Node also corks a response for the rest of the tick, so an end() in that tick sends the write, in its own.
+// The async context of the first write that waited, or of an end() in its tick: what waits behind it runs there.
 const kWaitingWrite = Symbol("kWaitingWrite");
 function noteWaitingWrite(res) {
   if (res[kWaitingWrite] !== undefined) return;

@@ -333,7 +333,7 @@ const kUserUnrefed = Symbol("kUserUnrefed");
 const kPausedUnref = Symbol("kPausedUnref");
 const kOnreadDeliver = Symbol("kOnreadDeliver");
 function noop() {}
-// The held write goes to the handle where it was issued (`frame`): if the handle makes it wait, it waits with that context.
+// The held write goes to the handle in the context it was issued in (`frame`), so a wait there keeps that context.
 function onUpgradeAttachedWrite(chunk, encoding, callback, onClose, frame) {
   this.off("close", onClose);
   if (frame === $getInternalField($asyncContext, 0)) return this._write(chunk, encoding, callback);
@@ -354,11 +354,7 @@ const kOnreadPendingEnd = Symbol("kOnreadPendingEnd");
 const kOnreadReadRequested = Symbol("kOnreadReadRequested");
 const kOnreadEmptyTail = Buffer.alloc(0);
 const kwriteCallback = Symbol("writeCallback");
-// What [kwriteCallback] holds while a write waits for its handle: the stream's callback, bound to the async context
-// `_write` was called in. Node keeps that context in the handle's write request, so whichever event completes the
-// write, its callback and the 'drain' or 'finish' after it run where the write was issued, not where the socket was
-// opened. A write that waits for 'connect' stays the bare callback: Node issues that one from the event.
-// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/stream_base_commons.js#L81-L119
+// A write that waits completes in the async context `_write` was called in, as the write request of Node's handle does.
 function completeWaitedWrite(frame, callback, err?) {
   const eventFrame = $getInternalField($asyncContext, 0);
   // A program with no AsyncLocalStorage is in `frame` already.
@@ -371,10 +367,7 @@ function completeWaitedWrite(frame, callback, err?) {
 function waitedWrite(callback) {
   return completeWaitedWrite.bind(undefined, $getInternalField($asyncContext, 0), callback);
 }
-// Holds the async context of the event that completes a write, while that write completes in its own context.
-// Node emits 'close' from the handle, so it runs where the socket's events do. Here it runs where destroy() was called.
-// When the completion of a write is what destroys the socket (the write failed, or an end() was behind it), that is
-// the context of the write, so 'close' goes back to the event's.
+// The context of the event that completes a write, kept while the write completes in its own: 'close' goes back to it.
 let completingEventFrame;
 function completeWithEventFrame(eventFrame, callback, err) {
   completingEventFrame ??= new (require("node:async_hooks").AsyncLocalStorage)();

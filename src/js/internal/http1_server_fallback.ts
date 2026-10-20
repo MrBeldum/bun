@@ -53,8 +53,7 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
   let chunked = false;
   let noBody = false;
   let closeDelimited = false;
-  // The drain callback of a write() that reported backpressure (native's onwritable slot), and its async context, for
-  // a socket that is another Bun.ModuleGraph's.
+  // The drain callback of a write() that reported backpressure, and its async context (native's onwritable slot).
   let onwritable: ((...args: unknown[]) => void) | null | undefined = null;
   let onwritableFrame;
 
@@ -194,9 +193,7 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
     return length;
   }
 
-  // Runs `fn` once in the place of the waiting callback. The socket's 'drain' and 'finish' are in the async context of
-  // the write that waited, and the response enters that of its first write that waited (runWhereWriteWaited). No event
-  // of a socket of another Bun.ModuleGraph than the response's is, so there `fn` runs in the waiting callback's.
+  // Runs `fn` in the place of the waiting callback: in its async context if the socket is another Bun.ModuleGraph's.
   function settleWaiting(fn) {
     const frame = onwritableFrame;
     onwritable = null;

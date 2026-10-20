@@ -545,8 +545,7 @@ function emitAbortNT(req) {
   req.emit("abort");
 }
 
-// The socket's 'drain' is in the async context of the write that waited, where Node emits the request's. The socket
-// of another Bun.ModuleGraph than the request's does not carry that context (runInSameGraph), so the request's is entered.
+// The socket's 'drain' runs where the write that waited was issued, except on a socket of another Bun.ModuleGraph.
 function ondrain() {
   const frame = this._httpMessage?.[kClientAsyncContext];
   if (AsyncContextFrame.isInAnotherGraph(frame)) return runInFrame(frame, ondrainInner, this);

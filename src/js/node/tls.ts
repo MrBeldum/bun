@@ -802,8 +802,7 @@ TLSSocket.prototype._start = function _start() {
   // Node sends the ClientHello of a constructor wrap here (the mysql driver calls it). Ours went out in the constructor.
 };
 
-// `_final` waited for the handshake. It runs where it was called: the shutdown request of Node's handle keeps that
-// async context, so 'finish' and the end() callback do not run where the socket was opened.
+// A `_final` that waited for the handshake runs in the async context it was called in, as Node's shutdown request does.
 function finalInFrame(callback, frame) {
   if (frame === $getInternalField($asyncContext, 0)) return NetSocket.prototype._final.$call(this, callback);
   return require("internal/async_context_frame").runInSameGraph(frame, NetSocket.prototype._final, this, callback);
