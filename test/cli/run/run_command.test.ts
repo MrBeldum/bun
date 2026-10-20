@@ -282,3 +282,28 @@ describe.concurrent.each([
     expect(exitCode).toBe(0);
   });
 });
+
+describe.concurrent.skipIf(!isLinux)("bun run exits non-zero when a script fails to spawn", () => {
+  test("E2BIG: command line exceeding ARG_MAX", () => {
+    // A script body larger than ARG_MAX makes posix_spawn fail with E2BIG, so
+    // the shell never starts. The run must report failure via a non-zero exit
+    // code instead of silently exiting 0.
+    const big = "a".repeat(3_000_000);
+    using dir = tempDir("run-spawn-failure", {
+      "package.json": JSON.stringify({
+        name: "run-spawn-failure",
+        private: true,
+        scripts: { big: `echo ${big}` },
+      }),
+    });
+    const { exitCode, stderr } = spawnSync({
+      cwd: String(dir),
+      cmd: [bunExe(), "run", "big"],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(stderr.toString()).toMatch(/Failed to run script/);
+    expect(exitCode).not.toBe(0);
+  });
+});
