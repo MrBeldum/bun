@@ -964,6 +964,14 @@ declare module "bun" {
        * (Cannot be used with hostname+port)
        */
       unix?: string;
+
+      /**
+       * Sets the number of seconds to wait before timing out a connection
+       * due to inactivity.
+       *
+       * @default 10
+       */
+      idleTimeout?: number;
     }
 
     /**

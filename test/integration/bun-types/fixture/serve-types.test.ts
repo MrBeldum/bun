@@ -289,6 +289,25 @@ test(
 );
 
 test(
+  "basic unix socket + idleTimeout",
+  {
+    unix: `${tmpdirSync()}/bun.sock`,
+    fetch() {
+      return new Response();
+    },
+    // https://github.com/oven-sh/bun/issues/46138
+    idleTimeout: 30,
+  },
+  {
+    overrideExpectBehavior: server => {
+      expect(server.hostname).toBeUndefined();
+      expect(server.port).toBeUndefined();
+      expect(server.url.toString()).toStartWith("unix://");
+    },
+  },
+);
+
+test(
   "basic unix socket + websocket + upgrade",
   {
     unix: `${tmpdirSync()}/bun.sock`,
