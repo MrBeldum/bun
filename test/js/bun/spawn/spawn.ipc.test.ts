@@ -326,7 +326,7 @@ describe("ipc mode advanced", () => {
           subprocess.kill();
         },
       });
-      process.on("uncaughtException", err => console.log("UNCAUGHT", err.message));
+      process.on("uncaughtException", err => console.log("UNCAUGHT", err.name + ": " + err.message));
       console.log("CHILD_EXIT", await child.exited);
     `;
 
@@ -339,7 +339,10 @@ describe("ipc mode advanced", () => {
 
     const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
 
-    expect(stdout.split("\n").filter(Boolean)).toEqual(["UNCAUGHT Unable to deserialize data.", "CHILD_EXIT 42"]);
+    expect(stdout.split("\n").filter(Boolean)).toEqual([
+      "UNCAUGHT TypeError: Unable to deserialize data.",
+      "CHILD_EXIT 42",
+    ]);
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
   });
