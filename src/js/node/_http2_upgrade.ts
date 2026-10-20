@@ -96,8 +96,14 @@ function tlsSocketWrite(this: TLSProxySocket, chunk: Buffer, encoding: string, c
   if (h.$write(chunk, encoding)) {
     callback();
   } else {
-    // Store callback so drain event can invoke it (backpressure)
-    this._writeCallback = callback;
+    // Store callback so drain event can invoke it (backpressure), in the async
+    // context of this call (see net.Socket's waitedWrite).
+    this._writeCallback = require("internal/async_context_frame").runInSameGraph.bind(
+      undefined,
+      $getInternalField($asyncContext, 0),
+      callback,
+      undefined,
+    );
   }
 }
 

@@ -92,9 +92,10 @@ class HTTPClientAsyncResource {
 // Node's parser AsyncWrap + _http_agent asyncResetHandle() make every socket
 // callback re-enter the current request's async scope; Bun bridges this in
 // JS by snapshotting the frame at tickOnSocket and running each socket
-// listener (data/end/error/close/drain/timeout) inside it.
+// listener (data/end/error/close/timeout) inside it.
 const kClientAsyncContext = Symbol("kClientAsyncContext");
-const runInFrame = require("internal/async_context_frame").run;
+const AsyncContextFrame = require("internal/async_context_frame");
+const runInFrame = AsyncContextFrame.run;
 
 function closeRequest(req) {
   if (req[kClientAsyncContext] !== undefined) req[kClientAsyncContext] = undefined;
@@ -544,8 +545,12 @@ function emitAbortNT(req) {
   req.emit("abort");
 }
 
+// The socket's 'drain' is in the async context of the write that waited, where Node emits the request's. The socket
+// of another Bun.ModuleGraph than the request's does not carry that context (runInSameGraph), so the request's is entered.
 function ondrain() {
-  return runInFrame(this._httpMessage?.[kClientAsyncContext], ondrainInner, this);
+  const frame = this._httpMessage?.[kClientAsyncContext];
+  if (AsyncContextFrame.isInAnotherGraph(frame)) return runInFrame(frame, ondrainInner, this);
+  return ondrainInner.$call(this);
 }
 
 function ondrainInner() {
