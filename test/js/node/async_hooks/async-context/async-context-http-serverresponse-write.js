@@ -3,6 +3,9 @@ const { AsyncLocalStorage } = require("async_hooks");
 const http = require("http");
 const net = require("net");
 
+// Windows takes a write of any size at once: no write waits for its socket there, so there is nothing to check.
+if (process.platform === "win32") process.exit(0);
+
 const asyncLocalStorage = new AsyncLocalStorage();
 let failed = false;
 
@@ -15,7 +18,7 @@ function fail(message) {
 const big = Buffer.alloc(8 * 1024 * 1024);
 
 let client;
-// The scenario that runs: its name, what its callbacks saw, and whether its write waited for the socket.
+// The scenario that runs: its name, what its callbacks saw, and whether its write was seen to wait.
 let current;
 
 function ran(what, expected) {
@@ -23,12 +26,11 @@ function ran(what, expected) {
   current.settle();
 }
 
-// Whether `response` has bytes that wait for the socket, a turn of the loop after its write. Windows takes a write of
-// any size at once, so there is nothing to check there. Anywhere else, a write that did not wait tests nothing.
-function waits(response) {
-  current.waited = response.writableLength > 0;
-  if (!current.waited && process.platform !== "win32") fail(`${current.name}: the write did not wait for the socket`);
-  return current.waited;
+// `response` has bytes that wait for the socket, a turn of the loop after its write. If it had none, the scenario
+// would pass without a test.
+function mustWait(response) {
+  if (response.writableLength === 0) fail(`${current.name}: the write did not wait for the socket`);
+  current.waited = true;
 }
 
 let firstOfTwo;
@@ -47,7 +49,7 @@ const handlers = {
       response.write(big, () => ranThenEnd("the callback of a response write that waited", "first write")),
     );
     setImmediate(() => {
-      if (!waits(response)) return response.end("z");
+      mustWait(response);
       asyncLocalStorage.run("second write", () =>
         response.write("z", () => ranThenEnd("the callback of a response write behind one that waited", "first write")),
       );
@@ -66,7 +68,7 @@ const handlers = {
       ),
     );
     setImmediate(() => {
-      waits(response);
+      mustWait(response);
       asyncLocalStorage.run("end", () =>
         response.end("z", () => ran("the callback of a response end(chunk) behind a write that waited", "write")),
       );
@@ -85,41 +87,8 @@ const handlers = {
       response.end(() => ran("the callback of a response end() in the tick of a write that waited", "end")),
     );
     setImmediate(() => {
-      waits(response);
+      mustWait(response);
       client.resume();
-    });
-  },
-
-  // The socket ends with two write callbacks still waiting. No 'drain' comes: both run where the first write was issued.
-  "/socket-end-behind-write"(response, request) {
-    response.setHeader("Content-Length", big.length + 1);
-    asyncLocalStorage.run("first write", () =>
-      response.write(big, () =>
-        ran("the callback of a response write that waited, when the socket ends", "first write"),
-      ),
-    );
-    setImmediate(() => {
-      if (!waits(response)) return response.end("z");
-      asyncLocalStorage.run("second write", () =>
-        response.write("z", () =>
-          ran("the callback of a response write behind one that waited, when the socket ends", "first write"),
-        ),
-      );
-      request.socket.end();
-      client.resume();
-    });
-  },
-
-  // The client goes away under a write that waits: the write fails where it was issued.
-  "/client-goes-away"(response) {
-    asyncLocalStorage.run("write", () =>
-      response.write(big, () =>
-        ran("the callback of a response write that waited, when the client goes away", "write"),
-      ),
-    );
-    setImmediate(() => {
-      waits(response);
-      client.destroy();
     });
   },
 
@@ -145,8 +114,47 @@ const handlers = {
       );
     });
     setImmediate(() => {
-      waits(firstOfTwo);
+      mustWait(firstOfTwo);
       client.resume();
+    });
+  },
+
+  // The socket ends with two write callbacks still waiting. No 'drain' comes: both run where the first write was issued.
+  "/socket-end-behind-write"(response, request) {
+    response.setHeader("Content-Length", big.length + 1);
+    asyncLocalStorage.run("first write", () =>
+      response.write(big, () =>
+        ran("the callback of a response write that waited, when the socket ends", "first write"),
+      ),
+    );
+    setImmediate(() => {
+      mustWait(response);
+      asyncLocalStorage.run("second write", () =>
+        response.write("z", () =>
+          ran("the callback of a response write behind one that waited, when the socket ends", "first write"),
+        ),
+      );
+      request.socket.end();
+      client.resume();
+    });
+  },
+
+  // The client goes away under a write that waits: that write and the one behind it fail where the first was issued.
+  "/client-goes-away"(response) {
+    response.setHeader("Content-Length", big.length + 1);
+    asyncLocalStorage.run("first write", () =>
+      response.write(big, () =>
+        ran("the callback of a response write that waited, when the client goes away", "first write"),
+      ),
+    );
+    setImmediate(() => {
+      mustWait(response);
+      asyncLocalStorage.run("second write", () =>
+        response.write("z", () =>
+          ran("the callback of a response write behind one that waited, when the client goes away", "first write"),
+        ),
+      );
+      client.destroy();
     });
   },
 };
@@ -158,21 +166,21 @@ const scenarios = [
   ["a response behind one whose write waits", 4, ["/first-of-two", "/second-of-two"]],
   // Only with a connection that the server was handed: that one is the net.Socket the handler ends.
   ["the socket ends behind a write that waits", 2, ["/socket-end-behind-write"], "emit"],
-  ["the client goes away under a write that waits", 1, ["/client-goes-away"]],
+  ["the client goes away under a write that waits", 2, ["/client-goes-away"]],
 ];
 
-// Sends the requests of one scenario on a connection of its own. It is over when the connection closed and, if the
-// write waited, the `count` callbacks ran.
+// Sends the requests of one scenario on a connection of its own. It is over when the connection closed and the
+// `count` callbacks ran.
 function request(entry, port, [name, count, urls]) {
   return new Promise(resolve => {
     let closed = false;
     current = {
       name: `${entry}: ${name}`,
       seen: [],
-      waited: undefined,
+      waited: false,
       settle() {
-        if (!closed || (this.waited && this.seen.length < count)) return;
-        for (const [what, store, expected] of this.waited ? this.seen : []) {
+        if (!closed || this.seen.length < count) return;
+        for (const [what, store, expected] of this.seen) {
           if (store === expected) continue;
           console.error(
             `FAIL: ${this.name}: ${what} ran in ${JSON.stringify(store)}, expected ${JSON.stringify(expected)}`,
@@ -187,7 +195,7 @@ function request(entry, port, [name, count, urls]) {
     client.on("error", err => fail(`${current.name}: the client reported ${err.code}`));
     client.on("data", () => {});
     client.on("close", () => {
-      if (current.waited === undefined) fail(`${current.name}: the connection closed before the response was written`);
+      if (!current.waited) fail(`${current.name}: the connection closed before the response's write was seen to wait`);
       closed = true;
       current.settle();
     });

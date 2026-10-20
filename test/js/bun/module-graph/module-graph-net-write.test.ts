@@ -252,6 +252,44 @@ describe.skipIf(isWindows)("a write that waited for its socket, and Bun.ModuleGr
     }
   });
 
+  test("on an 'upgrade' socket of the host's: 'drain' and the callback of a disposed graph's write run as the host", async () => {
+    const graph = new Bun.ModuleGraph();
+    const seen = Promise.withResolvers<{ waited: boolean; events: string[] }>();
+    let client!: net.Socket;
+    const server = http.createServer();
+    server.on("upgrade", (_request, socket) => {
+      const events: string[] = [];
+      let waited = false;
+      socket.on("error", seen.reject);
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n");
+      socket.once("drain", () => events.push("'drain' as " + contextOf(graph)));
+      graph.run(() =>
+        socket.write(big, () => {
+          events.push("write callback as " + contextOf(graph));
+          seen.resolve({ waited, events });
+        }),
+      );
+      waited = socket.writableLength > 0;
+      graph.dispose();
+      client.resume();
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    client = net.connect((server.address() as net.AddressInfo).port, "127.0.0.1");
+    try {
+      client.on("error", seen.reject);
+      client.pause();
+      client.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n");
+      expect(await seen.promise).toEqual({
+        waited: true,
+        events: ["'drain' as the host", "write callback as the host"],
+      });
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
   // The connection is the host's, so its 'drain' does not carry the graph's write. The response enters the context
   // its write waited in: what the graph's listener starts is the graph's.
   test("on a connection the host hands to an HTTP server: the graph's response write completes as the graph", async () => {

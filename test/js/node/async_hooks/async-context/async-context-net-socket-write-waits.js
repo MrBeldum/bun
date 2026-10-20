@@ -21,12 +21,9 @@ function fail(message) {
   process.exit(1);
 }
 
-// Whether the write `socket` was just given waits for the socket. Windows takes a write of any size at once, so there
-// is nothing to check there. Anywhere else, a write that did not wait would let the scenario pass without a test.
-function waits(socket, scenario) {
-  if (socket.writableLength > 0) return true;
-  if (process.platform !== "win32") fail(`${scenario}: the write did not wait for the socket`);
-  return false;
+// The write `socket` was just given has to wait for the socket, or the scenario would pass without a test.
+function mustWait(socket, scenario) {
+  if (socket.writableLength === 0) fail(`${scenario}: the write did not wait for the socket`);
 }
 
 // A connected pair. listen() and connect() each run in a context of their own: a callback that runs where the socket
@@ -55,7 +52,7 @@ function pair(connectOptions) {
   });
 }
 
-// Runs `start(sockets, done, skip)` on a new pair, until `done` was called `count` times or `skip` once.
+// Runs `start(sockets, done)` on a new pair, until `done` was called `count` times.
 // `sockets.watch(socket)` is for the socket whose write waits: its 'error', or its 'close' with checks still to run,
 // fails the scenario by name. The peer only goes away, so its errors are nothing to report.
 async function scenario(name, count, start, connectOptions) {
@@ -69,7 +66,7 @@ async function scenario(name, count, start, connectOptions) {
     return socket;
   };
   for (const peer of sockets.accepted) peer.on("error", () => {});
-  await new Promise(resolve => start(sockets, () => --count === 0 && resolve(), resolve));
+  await new Promise(resolve => start(sockets, () => --count === 0 && resolve()));
   settled = true;
   sockets.client.destroy();
   for (const socket of sockets.accepted) socket.destroy();
@@ -77,35 +74,50 @@ async function scenario(name, count, start, connectOptions) {
 }
 
 async function writesThatWait() {
-  await scenario("write(big)", 2, ({ client, accepted: [accepted], watch }, done, skip) => {
+  // A socket that is still connecting has nothing to write to: the write is issued from 'connect'.
+  await scenario("write() while connecting", 1, ({ server, watch }, done) => {
+    const connecting = watch(asyncLocalStorage.run("connect", () => net.connect(server.address().port, "127.0.0.1")));
+    asyncLocalStorage.run("write", () =>
+      connecting.write("early", () => {
+        expectStore("the callback of a write issued while connecting", "connect");
+        done();
+        connecting.destroy();
+      }),
+    );
+  });
+
+  // Windows takes a write of any size at once: no write waits for its socket there, and the rest has nothing to check.
+  if (process.platform === "win32") return;
+
+  await scenario("write(big)", 2, ({ client, accepted: [accepted], watch }, done) => {
     watch(client);
+    client.once("drain", () => {
+      expectStore("'drain' after a write that waited", "write");
+      done();
+    });
     asyncLocalStorage.run("write", () =>
       client.write(big, () => {
         expectStore("the callback of a write that waited", "write");
         done();
       }),
     );
-    if (!waits(client, "write(big)")) return skip();
-    client.once("drain", () => {
-      expectStore("'drain' after a write that waited", "write");
-      done();
-    });
+    mustWait(client, "write(big)");
     accepted.resume();
   });
 
-  await scenario("end(big)", 2, ({ client, accepted: [accepted], watch }, done, skip) => {
+  await scenario("end(big)", 2, ({ client, accepted: [accepted], watch }, done) => {
     watch(client);
+    client.once("finish", () => {
+      expectStore("'finish' after an end(chunk) that waited", "end");
+      done();
+    });
     asyncLocalStorage.run("end", () =>
       client.end(big, () => {
         expectStore("the callback of an end(chunk) that waited", "end");
         done();
       }),
     );
-    if (!waits(client, "end(big)")) return skip();
-    client.once("finish", () => {
-      expectStore("'finish' after an end(chunk) that waited", "end");
-      done();
-    });
+    mustWait(client, "end(big)");
     accepted.resume();
   });
 
@@ -118,13 +130,10 @@ async function writesThatWait() {
         done();
       }),
     );
-    const queued = waits(client, "a write behind write(big)");
+    mustWait(client, "a write behind write(big)");
     asyncLocalStorage.run("second write", () =>
       client.write("second", () => {
-        expectStore(
-          `the callback of a write behind one that ${queued ? "waited" : "did not wait"}`,
-          queued ? "first write" : "second write",
-        );
+        expectStore("the callback of a write behind one that waited", "first write");
         done();
       }),
     );
@@ -142,7 +151,7 @@ async function writesThatWait() {
       }),
     );
     asyncLocalStorage.run("uncork", () => client.uncork());
-    waits(client, "a corked write(big)");
+    mustWait(client, "a corked write(big)");
     accepted.resume();
   });
 
@@ -155,7 +164,7 @@ async function writesThatWait() {
         done();
       }),
     );
-    waits(accepted, "write(big) of an accepted socket");
+    mustWait(accepted, "write(big) of an accepted socket");
     client.resume();
   });
 
@@ -165,7 +174,7 @@ async function writesThatWait() {
       expectStore("the callback of a write issued outside any context", undefined);
       done();
     });
-    waits(client, "write(big) outside any context");
+    mustWait(client, "write(big) outside any context");
     accepted.resume();
   });
 
@@ -178,37 +187,25 @@ async function writesThatWait() {
         done();
       }),
     );
-    waits(client, "destroy() under write(big)");
+    mustWait(client, "destroy() under write(big)");
     client.destroy();
-  });
-
-  // A socket that is still connecting has nothing to write to: the write is issued from 'connect'.
-  await scenario("write() while connecting", 1, ({ server, watch }, done) => {
-    const connecting = watch(asyncLocalStorage.run("connect", () => net.connect(server.address().port, "127.0.0.1")));
-    asyncLocalStorage.run("write", () =>
-      connecting.write("early", () => {
-        expectStore("the callback of a write issued while connecting", "connect");
-        done();
-        connecting.destroy();
-      }),
-    );
   });
 
   // 'close' is the handle's event: it runs where the socket was opened, also when a write that waited is what closes
   // the socket from its own context.
-  await scenario("destroySoon() behind write(big)", 2, ({ client, accepted: [accepted], watch }, done, skip) => {
+  await scenario("destroySoon() behind write(big)", 2, ({ client, accepted: [accepted], watch }, done) => {
     watch(client);
+    client.once("close", () => {
+      expectStore("'close' after destroySoon() behind a write that waited", "connect");
+      done();
+    });
     asyncLocalStorage.run("write", () =>
       client.write(big, () => {
         expectStore("the callback of a write that waited, with destroySoon() behind it", "write");
         done();
       }),
     );
-    if (!waits(client, "destroySoon() behind write(big)")) return skip();
-    client.once("close", () => {
-      expectStore("'close' after destroySoon() behind a write that waited", "connect");
-      done();
-    });
+    mustWait(client, "destroySoon() behind write(big)");
     client.destroySoon();
     accepted.resume();
   });
@@ -216,8 +213,16 @@ async function writesThatWait() {
   await scenario(
     "end(big) after the peer's FIN",
     3,
-    ({ client, accepted: [accepted], watch }, done, skip) => {
+    ({ client, accepted: [accepted], watch }, done) => {
       watch(client);
+      client.once("finish", () => {
+        expectStore("'finish' after an end(chunk) that waited, after the peer's FIN", "end");
+        done();
+      });
+      client.once("close", () => {
+        expectStore("'close' of a socket that an end(chunk) that waited closes", "connect");
+        done();
+      });
       client.once("end", () => {
         asyncLocalStorage.run("end", () =>
           client.end(big, () => {
@@ -225,15 +230,7 @@ async function writesThatWait() {
             done();
           }),
         );
-        if (!waits(client, "end(big) after the peer's FIN")) return skip();
-        client.once("finish", () => {
-          expectStore("'finish' after an end(chunk) that waited, after the peer's FIN", "end");
-          done();
-        });
-        client.once("close", () => {
-          expectStore("'close' of a socket that an end(chunk) that waited closes", "connect");
-          done();
-        });
+        mustWait(client, "end(big) after the peer's FIN");
         accepted.resume();
       });
       client.resume();
@@ -242,15 +239,16 @@ async function writesThatWait() {
     { allowHalfOpen: true },
   );
 
-  // Nothing listens for the reset, so it is an uncaught exception. It is the socket's to report, where its events run.
-  // The callbacks of the writes it fails run where the writes were issued. Linux reports the reset through the read;
-  // where another platform reports it is not checked.
-  await scenario("the peer's reset under write(big)", 4, ({ client, accepted: [accepted] }, done, skip) => {
-    const onReset = () => {
-      if (process.platform === "linux") expectStore("the report of a reset under a write that waited", "connect");
-      done();
-    };
+  // Nothing listens for the reset, so it is an uncaught exception. The callbacks of the writes it fails run where the
+  // writes were issued, and 'close' where the socket was opened.
+  await scenario("the peer's reset under write(big)", 3, ({ client, accepted: [accepted] }, done) => {
+    const onReset = () => {};
     process.once("uncaughtException", onReset);
+    client.once("close", () => {
+      process.removeListener("uncaughtException", onReset);
+      expectStore("'close' after the peer's reset under a write that waited", "connect");
+      done();
+    });
     asyncLocalStorage.run("write", () =>
       client.write(big, err => {
         if (!err) fail("the peer's reset under write(big): the write did not fail");
@@ -258,20 +256,13 @@ async function writesThatWait() {
         done();
       }),
     );
-    if (!waits(client, "the peer's reset under write(big)")) {
-      process.removeListener("uncaughtException", onReset);
-      return skip();
-    }
+    mustWait(client, "the peer's reset under write(big)");
     asyncLocalStorage.run("queued write", () =>
       client.write("queued", () => {
         expectStore("the callback of a write behind one that the peer's reset fails", "write");
         done();
       }),
     );
-    client.once("close", () => {
-      expectStore("'close' after the peer's reset under a write that waited", "connect");
-      done();
-    });
     client.resume();
     accepted.resetAndDestroy();
   });

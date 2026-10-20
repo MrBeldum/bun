@@ -54,7 +54,7 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
   let noBody = false;
   let closeDelimited = false;
   // The drain callback of a write() that reported backpressure (native's onwritable slot), and its async context, for
-  // a socket that closes first or is another Bun.ModuleGraph's.
+  // a socket that is another Bun.ModuleGraph's.
   let onwritable: ((...args: unknown[]) => void) | null | undefined = null;
   let onwritableFrame;
 
@@ -195,13 +195,13 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
   }
 
   // Runs `fn` once in the place of the waiting callback. The socket's 'drain' and 'finish' are in the async context of
-  // the write that waited. Its 'close' is not, nor is any event of a socket of another Bun.ModuleGraph than the
-  // response's: there `fn` runs in the waiting callback's.
-  function settleWaiting(fn, closed?) {
+  // the write that waited, and the response enters that of its first write that waited (runWhereWriteWaited). No event
+  // of a socket of another Bun.ModuleGraph than the response's is, so there `fn` runs in the waiting callback's.
+  function settleWaiting(fn) {
     const frame = onwritableFrame;
     onwritable = null;
     onwritableFrame = undefined;
-    if (closed || AsyncContextFrame.isInAnotherGraph(frame)) AsyncContextFrame.run(frame, fn);
+    if (AsyncContextFrame.isInAnotherGraph(frame)) AsyncContextFrame.run(frame, fn);
     else fn();
   }
 
@@ -250,8 +250,8 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
       if (onwritable) settleWaiting(onwritable);
     },
     // The socket finished or closed, so no 'drain' comes: `fn` runs, and the waiting callback never does.
-    socketEnded(fn, closed?) {
-      if (onwritable) settleWaiting(fn, closed);
+    socketEnded(fn) {
+      if (onwritable) settleWaiting(fn);
     },
     // Runs once, from flushed(). ServerResponse#end()'s `onwritable` stays unused: its 'finish' comes a tick later, after a closing socket's 'close'.
     onflushed: null as (() => void) | null,
@@ -371,6 +371,7 @@ function connectionListenerHTTP1(server, socket, options) {
     maybePauseFallbackReads,
     resumeFallbackReadsOnDrain,
     finishDrainedResponse,
+    runWhereWriteWaited,
     kMustCloseConnection,
   } = http1ServerPipeline;
   const { allMethods } = process.binding("http_parser");
@@ -688,9 +689,12 @@ function connectionListenerHTTP1(server, socket, options) {
     connections.delete(socket);
     const inflight = socket._httpMessage;
     // The write callbacks that still wait fail, before the response's 'close', as in Node.
-    inflight?.[kHttp1ResponseHandle]?.socketEnded(
-      () => failPendingWriteCallbacks(inflight, socket.errored ?? inflight.errored ?? $ERR_STREAM_DESTROYED("write")),
-      true,
+    inflight?.[kHttp1ResponseHandle]?.socketEnded(() =>
+      runWhereWriteWaited(
+        inflight,
+        failPendingWriteCallbacks,
+        socket.errored ?? inflight.errored ?? $ERR_STREAM_DESTROYED("write"),
+      ),
     );
     // Like the native socket's close path (Node's socketOnClose ->
     // abortIncoming): abort the in-flight request, then the responses (and

@@ -1678,7 +1678,7 @@ function getNodeHTTPServerSocket() {
     // Node's connectionListener sets socket._paused when it stops reading a
     // connection whose pipelined responses have buffered past the high water mark.
     _paused = false;
-    #pendingCallback = null;
+    #pendingCallback: ((err?: Error | null) => void) | null = null;
     #pendingAbortMessage;
     #closeHandled = false;
     #peer;
@@ -4355,6 +4355,7 @@ http1ServerPipeline.lastPipelinedResponse = lastPipelinedResponse;
 http1ServerPipeline.maybePauseFallbackReads = maybePauseFallbackReads;
 http1ServerPipeline.resumeFallbackReadsOnDrain = resumeFallbackReadsOnDrain;
 http1ServerPipeline.finishDrainedResponse = finishDrainedResponse;
+http1ServerPipeline.runWhereWriteWaited = runWhereWriteWaited;
 http1ServerPipeline.kMustCloseConnection = kMustCloseConnection;
 
 export default {

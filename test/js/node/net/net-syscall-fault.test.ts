@@ -569,8 +569,8 @@ describe.skipIf(skip)("a write that waited for the socket completes in the async
       expect(stores).toEqual({ callback: "write", drain: "write" });
     });
 
-    // The record is the socket's to report: 'error' runs where the socket was opened. This one needs no fault: the
-    // peer does not read, so the kernel takes only part of the write.
+    // The record fails the write, and the failed write is what reports the error and closes the socket. This one needs
+    // no fault: the peer does not read, so the kernel takes only part of the write.
     test("the write callback and 'error', when a record that cannot be decrypted arrives under the write", async () => {
       const { p, writer, reader } = await pair();
       using _ = p;
@@ -590,7 +590,7 @@ describe.skipIf(skip)("a write that waited for the socket completes in the async
       const code = "ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC";
       expect({ close: await closed, events }).toEqual({
         close: "opened",
-        events: [`write ${code} in write`, `error ${code} in opened`],
+        events: [`write ${code} in write`, `error ${code} in write`],
       });
     });
 
