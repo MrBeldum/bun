@@ -366,16 +366,6 @@ fn as_response(value: JSValue) -> Option<*mut Response> {
     response::from_js(value).map(|p| p.cast::<Response>())
 }
 
-/// What [`RequestContext::follow_then`] did with a handler's promise.
-enum Followed {
-    /// Nothing: `then` gave nothing to call, and the state of the promise is its answer.
-    No,
-    /// A promise that settles as that `then()` reports.
-    By(JSValue),
-    /// Nothing is left to do: the request is gone, or the VM is stopping.
-    Gone,
-}
-
 /// Release the body's hold on a stream the sink is done with, and mark a
 /// `Locked` body used. Non-generic and out of line: the eight `RequestContext`
 /// monomorphizations share one copy.
@@ -2807,187 +2797,199 @@ where
         &self,
         this: &ThisServer,
         request_value: JSValue,
-        mut response_value: JSValue,
+        response_value: JSValue,
     ) {
         let ctx = self;
         request_value.ensure_still_alive();
-        // A second turn is for the promise that follows a result through its own `then()`.
-        loop {
-            response_value.ensure_still_alive();
-            if ctx.drain_microtasks().is_err() {
-                return;
-            }
-            if ctx.is_aborted_or_ended() {
-                ctx.discard_handler_result(this.global_this(), response_value);
-                return;
-            }
-            if ctx.resp.get().is_some_and(|resp| resp.is_closed()) {
-                ctx.on_connection_closed_during_dispatch(this, response_value);
-                return;
-            }
-            // if you return a Response object or a Promise<Response>
-            // but you upgraded the connection to a WebSocket
-            // just ignore the Response object. It doesn't do anything.
-            // it's better to do that than to throw an error
-            if ctx.did_upgrade_web_socket() {
-                ctx.discard_handler_result(this.global_this(), response_value);
-                return;
-            }
+        response_value.ensure_still_alive();
+        if ctx.drain_microtasks().is_err() {
+            return;
+        }
+        if ctx.is_aborted_or_ended() {
+            ctx.discard_handler_result(this.global_this(), response_value);
+            return;
+        }
+        if ctx.resp.get().is_some_and(|resp| resp.is_closed()) {
+            ctx.on_connection_closed_during_dispatch(this, response_value);
+            return;
+        }
+        // if you return a Response object or a Promise<Response>
+        // but you upgraded the connection to a WebSocket
+        // just ignore the Response object. It doesn't do anything.
+        // it's better to do that than to throw an error
+        if ctx.did_upgrade_web_socket() {
+            ctx.discard_handler_result(this.global_this(), response_value);
+            return;
+        }
 
-            if response_value.is_empty_or_undefined_or_null() {
-                ctx.render_missing_invalid_response(response_value);
-                return;
-            }
-
-            if let Some(err_value) = response_value.to_error() {
-                ctx.run_error_handler(err_value);
-                return;
-            }
-
-            // `response_value` is rooted via ensure_still_alive() / protect() below
-            // for as long as `response` is used.
-            if let Some(response) = as_response(response_value) {
-                // SAFETY: `response` is the live, rooted cell pointer.
-                if ctx.reject_unsendable_response(unsafe { (*response).status_code() }) {
-                    return;
-                }
-                ctx.response_root.clear();
-                response_value.ensure_still_alive();
-                if ctx.method == Method::HEAD {
-                    if let Some(resp) = ctx.resp.get() {
-                        let mut pair = HeaderResponsePair {
-                            this: ctx,
-                            response,
-                        };
-                        resp.run_corked_with_type(Self::do_render_head_response, &raw mut pair);
-                    }
-                    return;
-                } else {
-                    // SAFETY: `response` is the live, rooted cell pointer.
-                    unsafe { ctx.protect_for_body_and_render(response_value, response) };
-                }
-                return;
-            }
-
-            let vm = this.vm();
-
-            if let Some(promise) = response_value.as_any_promise() {
-                // If we immediately have the value available, we can skip the extra event loop tick
-                match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
-                    jsc::PromiseResult::Pending => {
-                        // A promise with its own `then()` can start its work there (`Bun.$`, a `Bun.SQL` query).
-                        if promise.has_custom_then(this.global_this()) {
-                            match ctx.follow_then(this, response_value) {
-                                Followed::No => {}
-                                Followed::By(follower) => {
-                                    response_value = follower;
-                                    continue;
-                                }
-                                Followed::Gone => return,
-                            }
-                        }
-                        let cell = ctx.create_promise_cell(this.global_this());
-                        response_value.then_with_value(
-                            this.global_this(),
-                            cell,
-                            Self::ON_RESOLVE,
-                            Self::ON_REJECT,
-                        ); // TODO: properly propagate exception upwards
-                        return;
-                    }
-                    jsc::PromiseResult::Fulfilled(fulfilled_value) => {
-                        // if you return a Response object or a Promise<Response>
-                        // but you upgraded the connection to a WebSocket
-                        // just ignore the Response object. It doesn't do anything.
-                        // it's better to do that than to throw an error
-                        if ctx.did_upgrade_web_socket() {
-                            return;
-                        }
-
-                        // `fulfilled_value` is rooted via ensure_still_alive() /
-                        // protect() below for as long as `response` is used.
-                        let response = if fulfilled_value.is_empty_or_undefined_or_null() {
-                            None
-                        } else {
-                            as_response(fulfilled_value)
-                        };
-                        let Some(response) = response else {
-                            // A promise with its own `then()` can hold a placeholder (an SDK's `APIPromise`).
-                            if promise.has_custom_then(this.global_this()) {
-                                match ctx.follow_then(this, response_value) {
-                                    Followed::No => {}
-                                    Followed::By(follower) => {
-                                        response_value = follower;
-                                        continue;
-                                    }
-                                    Followed::Gone => return,
-                                }
-                            }
-                            ctx.render_missing_invalid_response(fulfilled_value);
-                            return;
-                        };
-
-                        // SAFETY: `response` is the live, rooted cell pointer.
-                        if ctx.reject_unsendable_response(unsafe { (*response).status_code() }) {
-                            return;
-                        }
-
-                        ctx.response_root.clear();
-                        fulfilled_value.ensure_still_alive();
-                        if ctx.method == Method::HEAD {
-                            if let Some(resp) = ctx.resp.get() {
-                                let mut pair = HeaderResponsePair {
-                                    this: ctx,
-                                    response,
-                                };
-                                resp.run_corked_with_type(
-                                    Self::do_render_head_response,
-                                    &raw mut pair,
-                                );
-                            }
-                            return;
-                        }
-                        // SAFETY: `response` is the live, rooted cell pointer.
-                        unsafe { ctx.protect_for_body_and_render(fulfilled_value, response) };
-                        return;
-                    }
-                    jsc::PromiseResult::Rejected(err) => {
-                        ctx.handle_reject(err);
-                        return;
-                    }
-                }
-            }
-
-            // A truthy non-Response, non-Error, non-Promise value (object, string,
-            // number, ...). The async twin (`handle_resolve`) reports this via
-            // `render_missing_invalid_response`; do the same on the sync path.
+        if response_value.is_empty_or_undefined_or_null() {
             ctx.render_missing_invalid_response(response_value);
             return;
         }
+
+        if let Some(err_value) = response_value.to_error() {
+            ctx.run_error_handler(err_value);
+            return;
+        }
+
+        // `response_value` is rooted via ensure_still_alive() / protect() below
+        // for as long as `response` is used.
+        if let Some(response) = as_response(response_value) {
+            // SAFETY: `response` is the live, rooted cell pointer.
+            if ctx.reject_unsendable_response(unsafe { (*response).status_code() }) {
+                return;
+            }
+            ctx.response_root.clear();
+            response_value.ensure_still_alive();
+            if ctx.method == Method::HEAD {
+                if let Some(resp) = ctx.resp.get() {
+                    let mut pair = HeaderResponsePair {
+                        this: ctx,
+                        response,
+                    };
+                    resp.run_corked_with_type(Self::do_render_head_response, &raw mut pair);
+                }
+                return;
+            } else {
+                // SAFETY: `response` is the live, rooted cell pointer.
+                unsafe { ctx.protect_for_body_and_render(response_value, response) };
+            }
+            return;
+        }
+
+        let vm = this.vm();
+
+        if let Some(promise) = response_value.as_any_promise() {
+            // If we immediately have the value available, we can skip the extra event loop tick
+            match promise.unwrap(vm.global().vm(), jsc::PromiseUnwrapMode::MarkHandled) {
+                jsc::PromiseResult::Pending => {
+                    // A promise with its own `then()` can start its work there (`Bun.$`, a `Bun.SQL` query).
+                    if promise.has_custom_then(this.global_this())
+                        && ctx.follow_then(this, response_value)
+                    {
+                        return;
+                    }
+                    let cell = ctx.create_promise_cell(this.global_this());
+                    response_value.then_with_value(
+                        this.global_this(),
+                        cell,
+                        Self::ON_RESOLVE,
+                        Self::ON_REJECT,
+                    ); // TODO: properly propagate exception upwards
+                    return;
+                }
+                jsc::PromiseResult::Fulfilled(fulfilled_value) => {
+                    // if you return a Response object or a Promise<Response>
+                    // but you upgraded the connection to a WebSocket
+                    // just ignore the Response object. It doesn't do anything.
+                    // it's better to do that than to throw an error
+                    if ctx.did_upgrade_web_socket() {
+                        return;
+                    }
+
+                    if fulfilled_value.is_empty_or_undefined_or_null() {
+                        ctx.on_promise_without_response(
+                            this,
+                            response_value,
+                            promise,
+                            fulfilled_value,
+                        );
+                        return;
+                    }
+                    // `fulfilled_value` is rooted via ensure_still_alive() /
+                    // protect() below for as long as `response` is used.
+                    let Some(response) = as_response(fulfilled_value) else {
+                        ctx.on_promise_without_response(
+                            this,
+                            response_value,
+                            promise,
+                            fulfilled_value,
+                        );
+                        return;
+                    };
+
+                    // SAFETY: `response` is the live, rooted cell pointer.
+                    if ctx.reject_unsendable_response(unsafe { (*response).status_code() }) {
+                        return;
+                    }
+
+                    ctx.response_root.clear();
+                    fulfilled_value.ensure_still_alive();
+                    if ctx.method == Method::HEAD {
+                        if let Some(resp) = ctx.resp.get() {
+                            let mut pair = HeaderResponsePair {
+                                this: ctx,
+                                response,
+                            };
+                            resp.run_corked_with_type(Self::do_render_head_response, &raw mut pair);
+                        }
+                        return;
+                    }
+                    // SAFETY: `response` is the live, rooted cell pointer.
+                    unsafe { ctx.protect_for_body_and_render(fulfilled_value, response) };
+                    return;
+                }
+                jsc::PromiseResult::Rejected(err) => {
+                    ctx.handle_reject(err);
+                    return;
+                }
+            }
+        }
+
+        // A truthy non-Response, non-Error, non-Promise value (object, string,
+        // number, ...). The async twin (`handle_resolve`) reports this via
+        // `render_missing_invalid_response`; do the same on the sync path.
+        ctx.render_missing_invalid_response(response_value);
     }
 
-    /// Asks a promise that has its own `then()`: the state of such a promise is not its answer.
+    /// A handler's promise holds no Response. One with its own `then()` can hold a placeholder (an SDK's `APIPromise`).
     #[cold]
     #[inline(never)]
-    fn follow_then(&self, this: &ThisServer, promise_value: JSValue) -> Followed {
+    fn on_promise_without_response(
+        &self,
+        this: &ThisServer,
+        promise_value: JSValue,
+        promise: jsc::AnyPromise,
+        fulfilled_value: JSValue,
+    ) {
+        if promise.has_custom_then(this.global_this()) && self.follow_then(this, promise_value) {
+            return;
+        }
+        self.render_missing_invalid_response(fulfilled_value);
+    }
+
+    /// Answers with what the `then()` of a handler's promise reports. `false`: `then` gave nothing to call.
+    #[cold]
+    #[inline(never)]
+    fn follow_then(&self, this: &ThisServer, promise_value: JSValue) -> bool {
         let global = this.global_this();
         let follower = jsc::JSPromise::create(global);
         if follower.resolve(global, promise_value).is_err() {
-            return Followed::Gone;
+            return true;
         }
-        if follower.status() != jsc::PromiseStatus::Fulfilled {
-            return Followed::By(follower.to_js());
-        }
-        // An accessor gave nothing to call. It ran script, so the request can be gone, as after the handler.
+        let nothing_to_call = follower.status() == jsc::PromiseStatus::Fulfilled;
+        let waited_on = if nothing_to_call {
+            promise_value
+        } else {
+            follower.to_js()
+        };
+        // `then` can be an accessor, which ran script: the request can be gone, as after the handler.
         if self.is_aborted_or_ended() || self.did_upgrade_web_socket() {
-            self.discard_handler_result(global, promise_value);
-            return Followed::Gone;
+            self.discard_handler_result(global, waited_on);
+            return true;
         }
         if self.resp.get().is_some_and(|resp| resp.is_closed()) {
-            self.on_connection_closed_during_dispatch(this, promise_value);
-            return Followed::Gone;
+            self.on_connection_closed_during_dispatch(this, waited_on);
+            return true;
         }
-        Followed::No
+        if nothing_to_call {
+            return false;
+        }
+        let cell = self.create_promise_cell(global);
+        waited_on.then_with_value(global, cell, Self::ON_RESOLVE, Self::ON_REJECT);
+        // The microtask that calls `then()` runs here. A `then()` that reports at once is answered in this dispatch.
+        let _ = self.drain_microtasks();
+        true
     }
 
     pub(crate) fn handle_resolve_stream(&self) {

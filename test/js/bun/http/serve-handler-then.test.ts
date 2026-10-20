@@ -644,46 +644,32 @@ describe("a request that is gone", () => {
     ws.close();
   });
 
-  test.concurrent("a then() that upgrades the request and then rejects is reported", async () => {
-    const { stdout, stderr, exitCode } = await run(`
-      const reported = Promise.withResolvers();
-      process.on("unhandledRejection", reason => reported.resolve(reason.message));
-      class Lazy extends Promise {
-        #start;
-        constructor(work) {
-          let start;
-          super((resolve, reject) => { start = () => work(resolve, reject); });
-          this.#start = start;
-        }
-        then(onFulfilled, onRejected) {
-          this.#start();
-          return super.then(onFulfilled, onRejected);
-        }
-        static get [Symbol.species]() { return Promise; }
-      }
-      const server = Bun.serve({
-        port: 0,
-        fetch: (req, server) =>
-          new Lazy((resolve, reject) => {
-            server.upgrade(req);
-            reject(new Error("rejected after the upgrade"));
-          }),
-        websocket: {
-          open(ws) { ws.send("open"); },
-          message() {},
+  test.concurrent("a then() that upgrades the request and then rejects reaches error()", async () => {
+    const { promise: reported, resolve: report } = Promise.withResolvers<string>();
+    await using server = Bun.serve({
+      port: 0,
+      fetch(req, server) {
+        return new LazyPromise<Response>((resolve, reject) => {
+          server.upgrade(req);
+          reject(new Error("rejected after the upgrade"));
+        });
+      },
+      error(error) {
+        report(error.message);
+        return new Response("unused");
+      },
+      websocket: {
+        open(ws) {
+          ws.send("upgraded in then()");
         },
-      });
-      const ws = new WebSocket(server.url.href.replace("http", "ws"));
-      const opened = await new Promise(resolve => { ws.onmessage = event => resolve(event.data); });
-      console.log(opened + ", " + (await reported.promise));
-      ws.close();
-      await server.stop(true);
-    `);
-    expect({ stdout, stderr, exitCode }).toEqual({
-      stdout: "open, rejected after the upgrade\n",
-      stderr: "",
-      exitCode: 0,
+        message() {},
+      },
     });
+    const ws = new WebSocket(server.url.href.replace("http", "ws"));
+    const [message] = await once(ws, "message");
+    expect(message.data).toBe("upgraded in then()");
+    expect(await reported).toBe("rejected after the upgrade");
+    ws.close();
   });
 
   test.concurrent.each(["then()", "the `then` accessor"])("%s can stop the server", async where => {
