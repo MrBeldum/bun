@@ -130,6 +130,15 @@ impl BlockList {
         Ok(JSValue::from(value.as_::<Self>().is_some()))
     }
 
+    fn add_rule(&self, rule: Rule) {
+        let _guard = self.mutex.lock_guard();
+        self.da_rules.with_mut(|rules| rules.push(rule));
+        self.estimated_size.fetch_add(
+            u32::try_from(core::mem::size_of::<Rule>()).expect("int cast"),
+            AtomicOrdering::Relaxed,
+        );
+    }
+
     #[bun_jsc::host_fn(method)]
     pub(crate) fn add_address(
         this: &Self,
@@ -148,12 +157,7 @@ impl BlockList {
             SocketAddress::init_from_addr_family(global, address_js, family_js)?._addr
         };
 
-        let _guard = this.mutex.lock_guard();
-        this.da_rules.with_mut(|r| r.insert(0, Rule::Addr(address)));
-        this.estimated_size.fetch_add(
-            u32::try_from(core::mem::size_of::<Rule>()).expect("int cast"),
-            AtomicOrdering::Relaxed,
-        );
+        this.add_rule(Rule::Addr(address));
         Ok(JSValue::UNDEFINED)
     }
 
@@ -190,13 +194,7 @@ impl BlockList {
                 ));
             }
         }
-        let _guard = this.mutex.lock_guard();
-        this.da_rules
-            .with_mut(|r| r.insert(0, Rule::Range { start, end }));
-        this.estimated_size.fetch_add(
-            u32::try_from(core::mem::size_of::<Rule>()).expect("int cast"),
-            AtomicOrdering::Relaxed,
-        );
+        this.add_rule(Rule::Range { start, end });
         Ok(JSValue::UNDEFINED)
     }
 
@@ -238,13 +236,7 @@ impl BlockList {
             )?)
             .unwrap();
         }
-        let _guard = this.mutex.lock_guard();
-        this.da_rules
-            .with_mut(|r| r.insert(0, Rule::Subnet { network, prefix }));
-        this.estimated_size.fetch_add(
-            u32::try_from(core::mem::size_of::<Rule>()).expect("int cast"),
-            AtomicOrdering::Relaxed,
-        );
+        this.add_rule(Rule::Subnet { network, prefix });
         Ok(JSValue::UNDEFINED)
     }
 
@@ -369,7 +361,8 @@ impl BlockList {
         // GC must be able to visit
         let array = JSValue::create_empty_array(global, rules.len())?;
 
-        for (i, rule) in rules.iter().enumerate() {
+        // Newest first, as Node v26.3.0 lists them.
+        for (i, rule) in rules.iter().rev().enumerate() {
             let s = match rule {
                 Rule::Addr(a) => {
                     let mut buf = [0u8; inet::INET6_ADDRSTRLEN as usize];
