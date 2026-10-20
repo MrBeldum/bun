@@ -2071,14 +2071,10 @@ impl<'a> OpenEntries<'a> {
     }
 
     /// The entries whose name has this hash.
-    fn named(&self, name_hash: u64) -> &[Open<'a>] {
-        if !self.has_name(name_hash) {
-            return &[];
-        }
+    fn named(&self, name_hash: u64) -> impl Iterator<Item = &Open<'a>> {
         let order = Self::order(name_hash);
         let from = self.by_name.partition_point(|open| open.order < order);
-        let named = &self.by_name[from..];
-        &named[..named.iter().take_while(|open| open.order == order).count()]
+        (self.by_name[from..].iter()).take_while(move |open| open.order == order)
     }
 
     /// Drops the bit of this name if each entry that has the bit is live by now.
@@ -2215,14 +2211,13 @@ impl Lookups<'_> {
         let mut found = false;
         for dep_id in list.begin()..list.end() {
             let dep = &self.dependencies[dep_id as usize];
-            let named = open.named(dep.name_hash);
-            if named.is_empty() || self.has_no_entry(dep_id) {
+            if !open.has_name(dep.name_hash) || self.has_no_entry(dep_id) {
                 continue;
             }
             let name = dep.name.slice(self.string_buf);
             let is_stopped = dep.behavior.is_optional_peer() && !is_member;
             let mut is_marked = false;
-            for open in named {
+            for open in open.named(dep.name_hash) {
                 let folder = open.folder;
                 let is_above =
                     folder.is_empty() || key == folder || (!is_member && is_below(key, folder));
@@ -2236,7 +2231,8 @@ impl Lookups<'_> {
             }
             if is_marked {
                 found = true;
-                if named.iter().all(|open| reach.live[open.entry as usize]) {
+                let is_live = |open: &Open<'_>| reach.live[open.entry as usize];
+                if open.named(dep.name_hash).all(is_live) {
                     open.forget(dep.name_hash, &reach.live);
                 }
             }
